@@ -1,0 +1,375 @@
+use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
+
+/// Unified data structure for L2 order book updates
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderBookL2Update {
+    // Common fields (as per project specification)
+    pub timestamp: i64,        // Exchange timestamp (microseconds UTC)
+    pub rcv_timestamp: i64,    // Local receive timestamp (microseconds UTC)
+    pub exchange: ExchangeId,  // Exchange identifier
+    pub ticker: String,        // Instrument symbol (e.g., "BTCUSDT")
+    pub seq_id: i64,          // Local monotonic sequence ID
+    pub packet_id: i64,       // Network packet grouping ID
+    
+    // L2 specific fields
+    pub update_id: i64,       // Exchange-specific update ID (Binance lastUpdateId)
+    pub first_update_id: i64, // First update ID in event (Binance U field)
+    pub action: L2Action,     // Action type (UPDATE for Binance)
+    pub side: OrderSide,      // BID/ASK
+    pub price: f64,           // Price level
+    pub qty: f64,             // Quantity (0 = delete level)
+}
+
+/// L2 order book action types
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum L2Action {
+    Update = 1,
+    Delete = 2,
+}
+
+impl std::fmt::Display for L2Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            L2Action::Update => write!(f, "UPDATE"),
+            L2Action::Delete => write!(f, "DELETE"),
+        }
+    }
+}
+
+/// Order book side enumeration
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum OrderSide {
+    Bid = 1,
+    Ask = -1,
+}
+
+impl std::fmt::Display for OrderSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OrderSide::Bid => write!(f, "BID"),
+            OrderSide::Ask => write!(f, "ASK"),
+        }
+    }
+}
+
+/// Exchange identifier enumeration
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum ExchangeId {
+    BinanceFutures = 1,
+    OkxSwap = 2,
+    OkxSpot = 3,
+}
+
+impl std::fmt::Display for ExchangeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExchangeId::BinanceFutures => write!(f, "BINANCE_FUTURES"),
+            ExchangeId::OkxSwap => write!(f, "OKX_SWAP"),
+            ExchangeId::OkxSpot => write!(f, "OKX_SPOT"),
+        }
+    }
+}
+
+/// Connection status enumeration
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConnectionStatus {
+    Disconnected,
+    Connecting,
+    Connected,
+    Reconnecting,
+    Error,
+    Failed,
+}
+
+/// Raw message from exchange WebSocket
+#[derive(Debug, Clone)]
+pub struct RawMessage {
+    pub exchange_id: ExchangeId,
+    pub data: String,
+    pub timestamp: SystemTime,
+}
+
+/// Order book snapshot from REST API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderBookSnapshot {
+    pub exchange_id: ExchangeId,
+    pub symbol: String,
+    pub last_update_id: i64,
+    pub timestamp: i64,
+    pub sequence: i64,
+    pub bids: Vec<PriceLevel>,
+    pub asks: Vec<PriceLevel>,
+}
+
+/// Price level in order book
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceLevel {
+    pub price: f64,
+    pub qty: f64,
+}
+
+/// Metrics for performance monitoring
+#[derive(Debug, Clone, Default)]
+pub struct Metrics {
+    pub messages_received: u64,
+    pub messages_processed: u64,
+    pub connection_attempts: u64,
+    pub reconnections: u64,
+    pub parse_errors: u64,
+    pub last_code_latency_us: Option<u64>,     // Time from packet arrival to processing complete
+    pub avg_code_latency_us: Option<f64>,
+    pub last_overall_latency_us: Option<u64>,  // Local time vs exchange timestamp difference  
+    pub avg_overall_latency_us: Option<f64>,
+    pub throughput_msgs_per_sec: Option<f64>,
+    
+    // Message complexity metrics
+    pub total_bids_processed: u64,
+    pub total_asks_processed: u64,
+    pub last_bid_count: u32,
+    pub last_ask_count: u32,
+    pub avg_bid_count: f64,
+    pub avg_ask_count: f64,
+    
+    // Message size metrics
+    pub last_message_bytes: u32,
+    pub avg_message_bytes: f64,
+    pub total_message_bytes: u64,
+    
+    // Timing breakdown metrics
+    pub last_parse_time_us: Option<u64>,       // JSON parsing only
+    pub avg_parse_time_us: Option<f64>,
+    pub last_transform_time_us: Option<u64>,   // Business logic transformation
+    pub avg_transform_time_us: Option<f64>,
+    pub last_overhead_time_us: Option<u64>,    // Time between parse and transform
+    pub avg_overhead_time_us: Option<f64>,
+    
+    // Running averages counters
+    code_latency_count: u64,
+    overall_latency_count: u64,
+    parse_time_count: u64,
+    transform_time_count: u64,
+    overhead_time_count: u64,
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    pub fn increment_received(&mut self) {
+        self.messages_received += 1;
+    }
+    
+    pub fn increment_processed(&mut self) {
+        self.messages_processed += 1;
+    }
+    
+    pub fn increment_connection_attempts(&mut self) {
+        self.connection_attempts += 1;
+    }
+    
+    pub fn increment_reconnections(&mut self) {
+        self.reconnections += 1;
+    }
+    
+    pub fn increment_parse_errors(&mut self) {
+        self.parse_errors += 1;
+    }
+    
+    pub fn update_code_latency(&mut self, latency_us: u64) {
+        self.last_code_latency_us = Some(latency_us);
+        self.code_latency_count += 1;
+        
+        // Update rolling average (simple moving average with weight 0.1 for new values)
+        match self.avg_code_latency_us {
+            Some(avg) => self.avg_code_latency_us = Some(avg * 0.9 + latency_us as f64 * 0.1),
+            None => self.avg_code_latency_us = Some(latency_us as f64),
+        }
+    }
+    
+    pub fn update_overall_latency(&mut self, latency_us: u64) {
+        self.last_overall_latency_us = Some(latency_us);
+        self.overall_latency_count += 1;
+        
+        // Update rolling average (simple moving average with weight 0.1 for new values)
+        match self.avg_overall_latency_us {
+            Some(avg) => self.avg_overall_latency_us = Some(avg * 0.9 + latency_us as f64 * 0.1),
+            None => self.avg_overall_latency_us = Some(latency_us as f64),
+        }
+    }
+    
+    pub fn update_parse_time(&mut self, parse_time_us: u64) {
+        self.last_parse_time_us = Some(parse_time_us);
+        self.parse_time_count += 1;
+        
+        match self.avg_parse_time_us {
+            Some(avg) => self.avg_parse_time_us = Some(avg * 0.9 + parse_time_us as f64 * 0.1),
+            None => self.avg_parse_time_us = Some(parse_time_us as f64),
+        }
+    }
+    
+    pub fn update_transform_time(&mut self, transform_time_us: u64) {
+        self.last_transform_time_us = Some(transform_time_us);
+        self.transform_time_count += 1;
+        
+        match self.avg_transform_time_us {
+            Some(avg) => self.avg_transform_time_us = Some(avg * 0.9 + transform_time_us as f64 * 0.1),
+            None => self.avg_transform_time_us = Some(transform_time_us as f64),
+        }
+    }
+    
+    pub fn update_overhead_time(&mut self, overhead_time_us: u64) {
+        self.last_overhead_time_us = Some(overhead_time_us);
+        self.overhead_time_count += 1;
+        
+        match self.avg_overhead_time_us {
+            Some(avg) => self.avg_overhead_time_us = Some(avg * 0.9 + overhead_time_us as f64 * 0.1),
+            None => self.avg_overhead_time_us = Some(overhead_time_us as f64),
+        }
+    }
+    
+    pub fn update_message_complexity(&mut self, bid_count: u32, ask_count: u32, message_bytes: u32) {
+        // Update counts
+        self.last_bid_count = bid_count;
+        self.last_ask_count = ask_count;
+        self.total_bids_processed += bid_count as u64;
+        self.total_asks_processed += ask_count as u64;
+        
+        // Update averages
+        let total_messages = self.messages_processed as f64;
+        if total_messages > 0.0 {
+            self.avg_bid_count = (self.avg_bid_count * (total_messages - 1.0) + bid_count as f64) / total_messages;
+            self.avg_ask_count = (self.avg_ask_count * (total_messages - 1.0) + ask_count as f64) / total_messages;
+        } else {
+            self.avg_bid_count = bid_count as f64;
+            self.avg_ask_count = ask_count as f64;
+        }
+        
+        // Update message size metrics
+        self.last_message_bytes = message_bytes;
+        self.total_message_bytes += message_bytes as u64;
+        if total_messages > 0.0 {
+            self.avg_message_bytes = (self.avg_message_bytes * (total_messages - 1.0) + message_bytes as f64) / total_messages;
+        } else {
+            self.avg_message_bytes = message_bytes as f64;
+        }
+    }
+
+    pub fn update_message_bytes(&mut self, bytes: u32) {
+        self.last_message_bytes = bytes;
+        self.total_message_bytes += bytes as u64;
+        self.avg_message_bytes = self.total_message_bytes as f64 / self.messages_received as f64;
+    }
+    
+    pub fn update_throughput(&mut self, msgs_per_sec: f64) {
+        self.throughput_msgs_per_sec = Some(msgs_per_sec);
+    }
+    
+    pub fn increment_messages_processed(&mut self) {
+        self.messages_processed += 1;
+    }
+    
+    pub fn increment_batches_written(&mut self) {
+        // This is a helper for tracking batches written
+        self.messages_processed += 1; // Use existing counter for now
+    }
+}
+
+impl std::fmt::Display for Metrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "received: {}, processed: {}, errors: {}, connections: {}, reconnections: {}", 
+               self.messages_received, self.messages_processed, self.parse_errors, 
+               self.connection_attempts, self.reconnections)?;
+        
+        if let Some(code_latency) = self.last_code_latency_us {
+            write!(f, ", code_latency: {}μs", code_latency)?;
+        }
+        
+        if let Some(overall_latency) = self.last_overall_latency_us {
+            write!(f, ", overall_latency: {}μs", overall_latency)?;
+        }
+        
+        if let Some(avg_code) = self.avg_code_latency_us {
+            write!(f, ", avg_code: {:.1}μs", avg_code)?;
+        }
+        
+        if let Some(avg_overall) = self.avg_overall_latency_us {
+            write!(f, ", avg_overall: {:.1}μs", avg_overall)?;
+        }
+        
+        if let Some(throughput) = self.throughput_msgs_per_sec {
+            write!(f, ", throughput: {:.1}msg/s", throughput)?;
+        }
+        
+        Ok(())
+    }
+}
+
+/// Utility functions for timestamp handling
+pub mod time {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    /// Get current timestamp in microseconds since Unix epoch
+    pub fn now_micros() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_micros() as i64
+    }
+    
+    /// Get current timestamp in milliseconds since Unix epoch
+    pub fn now_millis() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as i64
+    }
+    
+    /// Convert milliseconds to microseconds
+    pub fn millis_to_micros(millis: i64) -> i64 {
+        millis * 1000
+    }
+    
+    /// Calculate latency in microseconds between two timestamps
+    pub fn latency_micros(start: SystemTime, end: SystemTime) -> u64 {
+        end.duration_since(start)
+            .unwrap_or_default()
+            .as_micros() as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_metrics_update() {
+        let mut metrics = Metrics::new();
+        
+        assert_eq!(metrics.messages_received, 0);
+        
+        metrics.increment_received();
+        assert_eq!(metrics.messages_received, 1);
+        
+        metrics.update_code_latency(100);
+        assert_eq!(metrics.last_code_latency_us, Some(100));
+        assert_eq!(metrics.avg_code_latency_us, Some(100.0));
+        
+        metrics.update_code_latency(200);
+        assert_eq!(metrics.last_code_latency_us, Some(200));
+        // Should be weighted average: 100 * 0.9 + 200 * 0.1 = 110
+        assert_eq!(metrics.avg_code_latency_us, Some(110.0));
+    }
+    
+    #[test]
+    fn test_time_functions() {
+        let now = time::now_micros();
+        assert!(now > 0);
+        
+        let millis = time::now_millis();
+        assert!(millis > 0);
+        
+        assert_eq!(time::millis_to_micros(1000), 1_000_000);
+    }
+}

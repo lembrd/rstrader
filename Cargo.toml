@@ -1,0 +1,39 @@
+[package]
+name = "xtrader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Async runtime and WebSocket client
+tokio = { version = "1.37", features = ["full"] }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3.31"
+tokio-stream = "0.1.17"
+async-trait = "0.1"
+
+# HTTP client for REST API calls  
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# CLI argument parsing
+clap = { version = "4.0", features = ["derive"] }
+
+# Data serialization and storage
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+simd-json = "0.14"
+fast-float = "0.2"
+arrow = "53.0"
+parquet = "53.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging and configuration
+log = "0.4"
+env_logger = "0.10"
+dotenv = "0.15.0"
+chrono = { version = "0.4", features = ["serde"] }
+
+# TLS and crypto
+rustls = { version = "0.23.29", features = ["ring"] }
