@@ -1,1 +1,7 @@
 /target
+/.claude/
+/.serena/
+/.mcp.json
+*.parquet
+/.env
+/.idea/
