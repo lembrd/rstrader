@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::SystemTime;
 use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream, MaybeTlsStream};
 use tokio::net::TcpStream;
@@ -82,6 +83,183 @@ pub struct OkxInstrumentInfo {
     pub inst_type: String,
     #[serde(rename = "state")]
     pub state: String,
+    // NEW FIELDS FOR UNIT CONVERSION
+    #[serde(rename = "lotSz")]
+    pub lot_size: String,
+    #[serde(rename = "minSz", default)]
+    pub min_size: Option<String>,
+    #[serde(rename = "ctMult", default)]
+    pub contract_multiplier: Option<String>,
+    #[serde(rename = "ctVal", default)]
+    pub contract_value: Option<String>,
+    #[serde(rename = "tickSz")]
+    pub tick_size: String,
+    // Additional useful fields
+    #[serde(rename = "baseCcy", default)]
+    pub base_currency: Option<String>,
+    #[serde(rename = "quoteCcy", default)]
+    pub quote_currency: Option<String>,
+}
+
+/// Error types specific to unit conversion
+#[derive(Debug, thiserror::Error)]
+pub enum ConversionError {
+    #[error("Instrument metadata not found for {0}")]
+    MetadataNotFound(String),
+    #[error("Invalid contract multiplier for {0}: {1}")]
+    InvalidMultiplier(String, String),
+    #[error("Failed to parse instrument metadata: {0}")]
+    ParseError(String),
+}
+
+/// Processed instrument metadata for unit conversion
+#[derive(Debug, Clone)]
+pub struct InstrumentMetadata {
+    pub inst_id: String,
+    pub inst_type: String,
+    pub lot_size: f64,
+    pub contract_multiplier: Option<f64>,
+    pub contract_value: Option<f64>,
+    pub tick_size: f64,
+    pub base_currency: Option<String>,
+    pub quote_currency: Option<String>,
+    pub last_updated: std::time::Instant,
+}
+
+/// Registry for caching instrument metadata with singleton pattern support
+#[derive(Debug)]
+pub struct InstrumentRegistry {
+    cache: std::collections::HashMap<String, InstrumentMetadata>,
+}
+
+impl InstrumentRegistry {
+    /// Create new empty registry
+    pub fn new() -> Self {
+        Self {
+            cache: std::collections::HashMap::new(),
+        }
+    }
+    
+    /// Initialize registry with instruments from OKX API (singleton initialization)
+    pub async fn initialize_with_instruments(client: &reqwest::Client, base_url: &str, inst_type: &str) -> Result<Self> {
+        let url = format!("{}/api/v5/public/instruments?instType={}", base_url, inst_type);
+        
+        log::info!("Loading {} instruments for unit conversion cache", inst_type);
+        
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AppError::connection(format!("Failed to get instruments: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Err(AppError::connection(format!(
+                "HTTP error getting instruments: {}", 
+                response.status()
+            )));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct InstrumentResponse {
+            code: String,
+            msg: String,
+            data: Vec<OkxInstrumentInfo>,
+        }
+
+        let data: InstrumentResponse = response
+            .json()
+            .await
+            .map_err(|e| AppError::parse(format!("Failed to parse instruments response: {}", e)))?;
+
+        if data.code != "0" {
+            return Err(AppError::connection(format!(
+                "OKX API error getting instruments: {} - {}",
+                data.code, data.msg
+            )));
+        }
+
+        let mut cache = std::collections::HashMap::new();
+        for info in data.data {
+            // Only cache active instruments
+            if info.state == "live" {
+                let metadata = InstrumentMetadata::from_okx_info(&info)?;
+                log::debug!("Cached metadata for {}: lot_size={}, tick_size={}, multiplier={:?}", 
+                    metadata.inst_id, metadata.lot_size, metadata.tick_size, metadata.contract_multiplier);
+                cache.insert(info.inst_id.clone(), metadata);
+            }
+        }
+        
+        log::info!("Loaded {} active {} instruments into cache", cache.len(), inst_type);
+        
+        Ok(Self { cache })
+    }
+
+    /// Get metadata for an instrument (fails fast if not found)
+    pub fn get_metadata(&self, inst_id: &str) -> Result<&InstrumentMetadata> {
+        self.cache.get(inst_id)
+            .ok_or_else(|| AppError::parse(format!("Instrument metadata not found for {}", inst_id)))
+    }
+    
+    /// Check if instrument exists in cache
+    pub fn contains(&self, inst_id: &str) -> bool {
+        self.cache.contains_key(inst_id)
+    }
+    
+    /// Get number of cached instruments
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+impl InstrumentMetadata {
+    /// Convert from OkxInstrumentInfo to processed metadata
+    pub fn from_okx_info(info: &OkxInstrumentInfo) -> Result<Self> {
+        let lot_size = fast_float::parse::<f64, _>(&info.lot_size)
+            .map_err(|e| AppError::parse(format!("Invalid lot size '{}': {}", info.lot_size, e)))?;
+        
+        let tick_size = fast_float::parse::<f64, _>(&info.tick_size)
+            .map_err(|e| AppError::parse(format!("Invalid tick size '{}': {}", info.tick_size, e)))?;
+        
+        // Parse contract multiplier (ctMult) - always present  
+        let contract_multiplier = if let Some(ref mult_str) = info.contract_multiplier {
+            Some(fast_float::parse::<f64, _>(mult_str)
+                .map_err(|e| AppError::parse(format!("Invalid contract multiplier '{}': {}", mult_str, e)))?)
+        } else {
+            None
+        };
+        
+        // Parse contract value (ctVal) - present for derivatives like SWAP
+        let contract_value = if let Some(ref val_str) = info.contract_value {
+            Some(fast_float::parse::<f64, _>(val_str)
+                .map_err(|e| AppError::parse(format!("Invalid contract value '{}': {}", val_str, e)))?)
+        } else {
+            None
+        };
+        
+        Ok(InstrumentMetadata {
+            inst_id: info.inst_id.clone(),
+            inst_type: info.inst_type.clone(),
+            lot_size,
+            contract_multiplier,
+            contract_value,
+            tick_size,
+            base_currency: info.base_currency.clone(),
+            quote_currency: info.quote_currency.clone(),
+            last_updated: std::time::Instant::now(),
+        })
+    }
+    
+    /// Normalize quantity using correct OKX formula: normal_qty = contractValue * contractMultiplier * qty
+    pub fn normalize_quantity(&self, raw_qty: f64) -> f64 {
+        let multiplier = self.contract_multiplier.unwrap_or(1.0);
+        let value = self.contract_value.unwrap_or(1.0);
+        raw_qty * value * multiplier
+    }
+    
+    /// Get contract multiplier (1.0 if not present)
+    pub fn get_contract_multiplier(&self) -> f64 {
+        self.contract_multiplier.unwrap_or(1.0)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,10 +279,11 @@ pub struct OkxConnector {
     base_url: String,
     ws_url: String,
     buffer: VecDeque<OkxDepthUpdate>,
+    instrument_registry: std::sync::Arc<InstrumentRegistry>,
 }
 
 impl OkxConnector {
-    pub fn new_swap() -> Self {
+    pub fn new_swap(instrument_registry: Arc<InstrumentRegistry>) -> Self {
         Self {
             client: Client::new(),
             ws_stream: None,
@@ -113,10 +292,11 @@ impl OkxConnector {
             base_url: "https://www.okx.com".to_string(),
             ws_url: "wss://ws.okx.com:8443/ws/v5/public".to_string(),
             buffer: VecDeque::new(),
+            instrument_registry,
         }
     }
 
-    pub fn new_spot() -> Self {
+    pub fn new_spot(instrument_registry: Arc<InstrumentRegistry>) -> Self {
         Self {
             client: Client::new(),
             ws_stream: None,
@@ -125,8 +305,11 @@ impl OkxConnector {
             base_url: "https://www.okx.com".to_string(),
             ws_url: "wss://ws.okx.com:8443/ws/v5/public".to_string(),
             buffer: VecDeque::new(),
+            instrument_registry,
         }
     }
+
+    
 
     fn get_inst_type(&self) -> &str {
         match self.exchange_id {
@@ -167,43 +350,7 @@ impl OkxConnector {
         }
     }
 
-    async fn get_instruments(&self, inst_type: &str) -> Result<Vec<OkxInstrumentInfo>> {
-        let url = format!("{}/api/v5/public/instruments?instType={}", self.base_url, inst_type);
-        
-        let response = self.client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| AppError::connection(format!("Failed to get instruments: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(AppError::connection(format!(
-                "HTTP error getting instruments: {}", 
-                response.status()
-            )));
-        }
-
-        #[derive(Deserialize)]
-        struct InstrumentResponse {
-            code: String,
-            msg: String,
-            data: Vec<OkxInstrumentInfo>,
-        }
-
-        let data: InstrumentResponse = response
-            .json()
-            .await
-            .map_err(|e| AppError::parse(format!("Failed to parse instruments response: {}", e)))?;
-
-        if data.code != "0" {
-            return Err(AppError::connection(format!(
-                "OKX API error getting instruments: {} - {}",
-                data.code, data.msg
-            )));
-        }
-
-        Ok(data.data)
-    }
+    
 
     async fn get_depth_snapshot(&self, symbol: &str) -> Result<OrderBookSnapshot> {
         let okx_symbol = self.convert_symbol(symbol);
@@ -244,30 +391,39 @@ impl OkxConnector {
         let depth_data = data.data.into_iter().next()
             .ok_or_else(|| AppError::parse("No depth data in response".to_string()))?;
 
+        // Get instrument metadata for unit conversion
+        let metadata = self.instrument_registry.get_metadata(&okx_symbol)?;
+        
         let mut bids = Vec::new();
         let mut asks = Vec::new();
 
-        // Parse bids
+        // Parse bids with unit conversion
         for bid_entry in depth_data.bids {
             if bid_entry.len() >= 2 {
                 let price = fast_float::parse::<f64, _>(&bid_entry[0])
                         .map_err(|e| AppError::parse(format!("Invalid bid price '{}': {}", bid_entry[0], e)))?;
-                let size = fast_float::parse::<f64, _>(&bid_entry[1])
+                let raw_size = fast_float::parse::<f64, _>(&bid_entry[1])
                         .map_err(|e| AppError::parse(format!("Invalid bid size '{}': {}", bid_entry[1], e)))?;
                 
-                bids.push(PriceLevel { price, qty: size });
+                // Apply unit conversion using contract multiplier
+                let normalized_size = metadata.normalize_quantity(raw_size);
+                
+                bids.push(PriceLevel { price, qty: normalized_size });
             }
         }
 
-        // Parse asks
+        // Parse asks with unit conversion
         for ask_entry in depth_data.asks {
             if ask_entry.len() >= 2 {
                 let price = fast_float::parse::<f64, _>(&ask_entry[0])
                         .map_err(|e| AppError::parse(format!("Invalid ask price '{}': {}", ask_entry[0], e)))?;
-                let size = fast_float::parse::<f64, _>(&ask_entry[1])
+                let raw_size = fast_float::parse::<f64, _>(&ask_entry[1])
                         .map_err(|e| AppError::parse(format!("Invalid ask size '{}': {}", ask_entry[1], e)))?;
                 
-                asks.push(PriceLevel { price, qty: size });
+                // Apply unit conversion using contract multiplier
+                let normalized_size = metadata.normalize_quantity(raw_size);
+                
+                asks.push(PriceLevel { price, qty: normalized_size });
             }
         }
 
@@ -288,6 +444,10 @@ impl OkxConnector {
     fn parse_depth_update(&self, update: &OkxDepthUpdate, symbol: &str, packet_id: u64, rcv_timestamp: i64) -> Result<Vec<OrderBookL2Update>> {
         let mut updates = Vec::new();
         
+        // Get OKX symbol format for metadata lookup
+        let okx_symbol = self.convert_symbol(symbol);
+        let metadata = self.instrument_registry.get_metadata(&okx_symbol)?;
+        
         for data in &update.data {
             let timestamp = data.timestamp.parse::<i64>()
                 .map_err(|e| AppError::parse(format!("Invalid timestamp '{}': {}", data.timestamp, e)))?;
@@ -296,13 +456,16 @@ impl OkxConnector {
             let seq_id = data.seq_id.unwrap_or(0);
             let first_update_id = data.prev_seq_id.unwrap_or(seq_id);
 
-            // Process bids
+            // Process bids with unit conversion
             for bid_entry in &data.bids {
                 if bid_entry.len() >= 2 {
                     let price = fast_float::parse::<f64, _>(&bid_entry[0])
                         .map_err(|e| AppError::parse(format!("Invalid bid price '{}': {}", bid_entry[0], e)))?;
-                    let size = fast_float::parse::<f64, _>(&bid_entry[1])
+                    let raw_size = fast_float::parse::<f64, _>(&bid_entry[1])
                         .map_err(|e| AppError::parse(format!("Invalid bid size '{}': {}", bid_entry[1], e)))?;
+
+                    // Apply unit conversion using contract multiplier
+                    let normalized_size = metadata.normalize_quantity(raw_size);
 
                     let builder = OrderBookL2UpdateBuilder::new(
                         timestamp_micros,
@@ -315,17 +478,20 @@ impl OkxConnector {
                         first_update_id,
                     );
                     
-                    updates.push(builder.build_bid(price, size));
+                    updates.push(builder.build_bid(price, normalized_size));
                 }
             }
 
-            // Process asks
+            // Process asks with unit conversion
             for ask_entry in &data.asks {
                 if ask_entry.len() >= 2 {
                     let price = fast_float::parse::<f64, _>(&ask_entry[0])
                         .map_err(|e| AppError::parse(format!("Invalid ask price '{}': {}", ask_entry[0], e)))?;
-                    let size = fast_float::parse::<f64, _>(&ask_entry[1])
+                    let raw_size = fast_float::parse::<f64, _>(&ask_entry[1])
                         .map_err(|e| AppError::parse(format!("Invalid ask size '{}': {}", ask_entry[1], e)))?;
+
+                    // Apply unit conversion using contract multiplier
+                    let normalized_size = metadata.normalize_quantity(raw_size);
 
                     let builder = OrderBookL2UpdateBuilder::new(
                         timestamp_micros,
@@ -338,7 +504,7 @@ impl OkxConnector {
                         first_update_id,
                     );
                     
-                    updates.push(builder.build_ask(price, size));
+                    updates.push(builder.build_ask(price, normalized_size));
                 }
             }
         }
@@ -441,18 +607,11 @@ impl ExchangeConnector for OkxConnector {
     }
 
     async fn validate_symbol(&self, symbol: &str) -> Result<()> {
-        let inst_type = self.get_inst_type();
-        let instruments = self.get_instruments(inst_type)
-            .await
-            .map_err(|e| AppError::connection(format!("Failed to get instruments: {}", e)))?;
-
         let okx_symbol = self.convert_symbol(symbol);
-        let found = instruments.iter().any(|inst| {
-            inst.inst_id == okx_symbol && inst.state == "live"
-        });
+        let found = self.instrument_registry.contains(&okx_symbol);
 
         if !found {
-            return Err(AppError::validation(format!("Symbol {} not found or not active on OKX {}", symbol, inst_type)));
+            return Err(AppError::validation(format!("Symbol {} not found or not active on OKX", symbol)));
         }
 
         Ok(())
@@ -504,10 +663,12 @@ pub fn parse_okx_message(raw_message: &RawMessage, symbol: &str, packet_id: u64,
     match message {
         OkxMessage::Data(update) => {
             // Create temporary connector to use parsing logic
+            // Create empty registry for parsing (tests don't need actual metadata)
+            let registry = Arc::new(InstrumentRegistry::new());
             let connector = if raw_message.exchange_id == ExchangeId::OkxSwap {
-                OkxConnector::new_swap()
+                OkxConnector::new_swap(registry)
             } else {
-                OkxConnector::new_spot()
+                OkxConnector::new_spot(registry)
             };
             connector.parse_depth_update(&update, symbol, packet_id, rcv_timestamp)
         }
@@ -522,11 +683,13 @@ pub fn parse_okx_message(raw_message: &RawMessage, symbol: &str, packet_id: u64,
 }
 
 pub fn create_okx_swap_connector() -> OkxConnector {
-    OkxConnector::new_swap()
+    let registry = Arc::new(InstrumentRegistry::new());
+    OkxConnector::new_swap(registry)
 }
 
 pub fn create_okx_spot_connector() -> OkxConnector {
-    OkxConnector::new_spot()
+    let registry = Arc::new(InstrumentRegistry::new());
+    OkxConnector::new_spot(registry)
 }
 
 #[cfg(test)]
@@ -535,24 +698,109 @@ mod tests {
 
     #[test]
     fn test_symbol_conversion_swap() {
-        let connector = OkxConnector::new_swap();
+        let registry = Arc::new(InstrumentRegistry::new());
+        let connector = OkxConnector::new_swap(registry);
         assert_eq!(connector.convert_symbol("BTCUSDT"), "BTC-USDT-SWAP");
         assert_eq!(connector.convert_symbol("ETHUSD"), "ETH-USD-SWAP");
     }
 
     #[test]
     fn test_symbol_conversion_spot() {
-        let connector = OkxConnector::new_spot();
+        let registry = Arc::new(InstrumentRegistry::new());
+        let connector = OkxConnector::new_spot(registry);
         assert_eq!(connector.convert_symbol("BTCUSDT"), "BTC-USDT");
         assert_eq!(connector.convert_symbol("ETHUSD"), "ETH-USD");
     }
 
     #[test]
     fn test_exchange_ids() {
-        let swap_connector = OkxConnector::new_swap();
-        let spot_connector = OkxConnector::new_spot();
+        let registry = Arc::new(InstrumentRegistry::new());
+        let swap_connector = OkxConnector::new_swap(registry.clone());
+        let spot_connector = OkxConnector::new_spot(registry);
         
         assert_eq!(swap_connector.exchange_id(), ExchangeId::OkxSwap);
         assert_eq!(spot_connector.exchange_id(), ExchangeId::OkxSpot);
+    }
+
+    #[test]
+    fn test_instrument_metadata_creation() {
+        let info = OkxInstrumentInfo {
+            inst_id: "BTC-USDT-SWAP".to_string(),
+            inst_type: "SWAP".to_string(),
+            state: "live".to_string(),
+            lot_size: "1".to_string(),
+            min_size: Some("1".to_string()),
+            contract_multiplier: Some("0.01".to_string()),
+            tick_size: "0.1".to_string(),
+            base_currency: Some("BTC".to_string()),
+            quote_currency: Some("USDT".to_string()),
+        };
+        
+        let metadata = InstrumentMetadata::from_okx_info(&info).unwrap();
+        assert_eq!(metadata.inst_id, "BTC-USDT-SWAP");
+        assert_eq!(metadata.lot_size, 1.0);
+        assert_eq!(metadata.contract_multiplier, Some(0.01));
+        assert_eq!(metadata.tick_size, 0.1);
+    }
+
+    #[test]
+    fn test_quantity_normalization_with_multiplier() {
+        let metadata = InstrumentMetadata {
+            inst_id: "BTC-USDT-SWAP".to_string(),
+            inst_type: "SWAP".to_string(),
+            lot_size: 1.0,
+            contract_multiplier: Some(0.01),
+            tick_size: 0.1,
+            base_currency: Some("BTC".to_string()),
+            quote_currency: Some("USDT".to_string()),
+            last_updated: std::time::Instant::now(),
+        };
+        
+        // 100 contracts * 0.01 multiplier = 1.0 BTC
+        assert_eq!(metadata.normalize_quantity(100.0), 1.0);
+        assert_eq!(metadata.normalize_quantity(1000.0), 10.0);
+    }
+    
+    #[test]
+    fn test_quantity_normalization_without_multiplier() {
+        let metadata = InstrumentMetadata {
+            inst_id: "BTC-USDT".to_string(),
+            inst_type: "SPOT".to_string(),
+            lot_size: 0.001,
+            contract_multiplier: None,
+            tick_size: 0.01,
+            base_currency: Some("BTC".to_string()),
+            quote_currency: Some("USDT".to_string()),
+            last_updated: std::time::Instant::now(),
+        };
+        
+        // No multiplier, should return same value
+        assert_eq!(metadata.normalize_quantity(1.5), 1.5);
+        assert_eq!(metadata.normalize_quantity(0.001), 0.001);
+    }
+    
+    #[test]
+    fn test_instrument_registry() {
+        let mut registry = InstrumentRegistry::new();
+        
+        let metadata = InstrumentMetadata {
+            inst_id: "BTC-USDT-SWAP".to_string(),
+            inst_type: "SWAP".to_string(),
+            lot_size: 1.0,
+            contract_multiplier: Some(0.01),
+            tick_size: 0.1,
+            base_currency: Some("BTC".to_string()),
+            quote_currency: Some("USDT".to_string()),
+            last_updated: std::time::Instant::now(),
+        };
+        
+        registry.cache.insert("BTC-USDT-SWAP".to_string(), metadata);
+        
+        assert!(registry.contains("BTC-USDT-SWAP"));
+        assert!(!registry.contains("ETH-USDT-SWAP"));
+        assert_eq!(registry.len(), 1);
+        
+        let retrieved = registry.get_metadata("BTC-USDT-SWAP").unwrap();
+        assert_eq!(retrieved.contract_multiplier, Some(0.01));
     }
 }
