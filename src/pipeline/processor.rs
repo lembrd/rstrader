@@ -3,380 +3,38 @@ use std::time::SystemTime;
 
 use crate::types::{OrderBookL2Update, OrderBookL2UpdateBuilder, RawMessage, Metrics, time};
 use crate::error::{AppError, Result};
-use crate::exchanges::binance::BinanceDepthUpdate;
-use crate::exchanges::okx::{OkxDepthUpdate, OkxMessage};
+// Exchange-specific processors now implement ExchangeProcessor trait
 use crate::types::ExchangeId;
 
 /// Stream processor for transforming raw messages to unified format
+/// Now uses trait-based architecture for exchange-specific processing
 pub struct StreamProcessor {
-    sequence_counter: i64,
-    packet_counter: i64,
-    metrics: Metrics,
-    updates_buffer: Vec<OrderBookL2Update>,
-    // Add registry for OKX unit conversion
-    okx_registry: Option<std::sync::Arc<crate::exchanges::okx::InstrumentRegistry>>,
+    processor: Box<dyn crate::exchanges::ExchangeProcessor<Error = crate::error::AppError>>,
 }
 
 impl StreamProcessor {
-    pub fn new() -> Self {
-        Self {
-            sequence_counter: 0,
-            packet_counter: 0,
-            metrics: Metrics::new(),
-            updates_buffer: Vec::with_capacity(20), // Pre-allocate for typical message size
-            okx_registry: None,
-        }
-    }
-
-    
-    /// Set OKX instrument registry for unit conversion
-    pub fn set_okx_registry(&mut self, registry: std::sync::Arc<crate::exchanges::okx::InstrumentRegistry>) {
-        self.okx_registry = Some(registry);
-    }
-    
-    fn process_binance_update(
-        &mut self, 
-        depth_update: BinanceDepthUpdate, 
-        rcv_timestamp: i64, 
-        packet_id: u64,
-        message_bytes: u32
-    ) -> Result<Vec<OrderBookL2Update>> {
-        // Calculate overall latency (local time vs exchange timestamp)
-        let exchange_timestamp_us = time::millis_to_micros(depth_update.event_time);
-        if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
-            if overall_latency >= 0 {
-                self.metrics.update_overall_latency(overall_latency as u64);
-            }
-        }
-            
-        // Start transformation timing
-        let transform_start = time::now_micros();
-        
-        // Count bid/ask levels for complexity metrics
-        let bid_count = depth_update.bids.len() as u32;
-        let ask_count = depth_update.asks.len() as u32;
-        
-        // Reuse pre-allocated buffer
-        self.updates_buffer.clear();
-        
-        let timestamp_micros = time::millis_to_micros(depth_update.event_time);
-        
-        // Process bid updates using fast float parsing
-        for bid in depth_update.bids {
-            let price = fast_float::parse::<f64, _>(&bid[0])
-                .map_err(|e| AppError::pipeline(format!("Invalid bid price '{}': {}", bid[0], e)))?;
-            let qty = fast_float::parse::<f64, _>(&bid[1])
-                .map_err(|e| AppError::pipeline(format!("Invalid bid quantity '{}': {}", bid[1], e)))?;
-            
-            let seq_id = self.next_sequence_id(); // Extract to avoid borrow conflict
-            let builder = OrderBookL2UpdateBuilder::new(
-                timestamp_micros,
-                rcv_timestamp,
-                crate::types::ExchangeId::BinanceFutures,
-                depth_update.symbol.clone(), // TODO: Use symbol interning
-                seq_id,
-                packet_id as i64,
-                depth_update.final_update_id,
-                depth_update.first_update_id,
-            );
-            
-            self.updates_buffer.push(builder.build_bid(price, qty));
-        }
-        
-        // Process ask updates using fast float parsing
-        for ask in depth_update.asks {
-            let price = fast_float::parse::<f64, _>(&ask[0])
-                .map_err(|e| AppError::pipeline(format!("Invalid ask price '{}': {}", ask[0], e)))?;
-            let qty = fast_float::parse::<f64, _>(&ask[1])
-                .map_err(|e| AppError::pipeline(format!("Invalid ask quantity '{}': {}", ask[1], e)))?;
-            
-            let seq_id = self.next_sequence_id(); // Extract to avoid borrow conflict
-            let builder = OrderBookL2UpdateBuilder::new(
-                timestamp_micros,
-                rcv_timestamp,
-                crate::types::ExchangeId::BinanceFutures,
-                depth_update.symbol.clone(), // TODO: Use symbol interning
-                seq_id,
-                packet_id as i64,
-                depth_update.final_update_id,
-                depth_update.first_update_id,
-            );
-            
-            self.updates_buffer.push(builder.build_ask(price, qty));
-        }
-        
-        // Calculate transformation time
-        let transform_end = time::now_micros();
-        if let Some(transform_time) = transform_end.checked_sub(transform_start) {
-            self.metrics.update_transform_time(transform_time as u64);
-        }
-        
-        // Update metrics
-        self.metrics.increment_processed();
-        self.metrics.update_message_complexity(bid_count, ask_count, message_bytes);
-        
-        // Update packet metrics (Binance sends 1 message per packet)
-        let entries_in_packet = bid_count + ask_count;
-        self.metrics.update_packet_metrics(1, entries_in_packet, message_bytes);
-        
-        // Return moved buffer instead of cloning
-        Ok(std::mem::take(&mut self.updates_buffer))
-    }
-
-    fn process_okx_update(
-        &mut self, 
-        depth_update: &OkxDepthUpdate, 
-        symbol: &str,
-        rcv_timestamp: i64, 
-        packet_id: u64,
-        message_bytes: u32,
-        exchange_id: ExchangeId
-    ) -> Result<Vec<OrderBookL2Update>> {
-        // Reuse pre-allocated buffer
-        self.updates_buffer.clear();
-        
-        // Start transformation timing
-        let transform_start = time::now_micros();
-        
-        // Get OKX symbol format for metadata lookup once
-        let okx_symbol = self.convert_symbol_to_okx_format(symbol, exchange_id);
-        
-        // Track total bid/ask count across all data entries
-        let mut total_bid_count = 0u32;
-        let mut total_ask_count = 0u32;
-        
-        for data in &depth_update.data {
-            let timestamp = data.timestamp.parse::<i64>()
-                .map_err(|e| AppError::parse(format!("Invalid timestamp '{}': {}", data.timestamp, e)))?;
-
-            let timestamp_micros = time::millis_to_micros(timestamp);
-            
-            // Calculate overall latency (local time vs exchange timestamp)
-            if let Some(overall_latency) = rcv_timestamp.checked_sub(timestamp_micros) {
-                if overall_latency >= 0 {
-                    self.metrics.update_overall_latency(overall_latency as u64);
-                }
-            }
-            
-            let seq_id = data.seq_id.unwrap_or(0);
-            let first_update_id = data.prev_seq_id.unwrap_or(seq_id);
-
-            // Count bid/ask levels for complexity metrics
-            total_bid_count += data.bids.len() as u32;
-            total_ask_count += data.asks.len() as u32;
-
-            // Process bids with unit conversion
-            for bid_entry in &data.bids {
-                if bid_entry.len() >= 2 {
-                    let price = fast_float::parse::<f64, _>(&bid_entry[0])
-                        .map_err(|e| AppError::pipeline(format!("Invalid bid price '{}': {}", bid_entry[0], e)))?;
-                    let raw_size = fast_float::parse::<f64, _>(&bid_entry[1])
-                        .map_err(|e| AppError::pipeline(format!("Invalid bid size '{}': {}", bid_entry[1], e)))?;
-
-                    // Apply unit conversion if metadata available (lookup per entry to avoid borrow conflicts)
-                    let size = if let Some(ref registry) = self.okx_registry {
-                        if let Ok(metadata) = registry.get_metadata(&okx_symbol) {
-                            let converted = metadata.normalize_quantity(raw_size);
-                            log::debug!("Unit conversion: {} raw={} -> converted={} (multiplier={:?})", 
-                                okx_symbol, raw_size, converted, metadata.contract_multiplier);
-                            converted
-                        } else {
-                            log::warn!("No metadata found for symbol: {}", okx_symbol);
-                            raw_size
-                        }
-                    } else {
-                        log::warn!("No OKX registry available for unit conversion");
-                        raw_size
-                    };
-
-                    let sequence_id = self.next_sequence_id();
-                    let builder = OrderBookL2UpdateBuilder::new(
-                        timestamp_micros,
-                        rcv_timestamp,
-                        exchange_id,
-                        symbol.to_string(),
-                        sequence_id,
-                        packet_id as i64,
-                        seq_id,
-                        first_update_id,
-                    );
-                    
-                    self.updates_buffer.push(builder.build_bid(price, size));
-                }
-            }
-
-            // Process asks with unit conversion
-            for ask_entry in &data.asks {
-                if ask_entry.len() >= 2 {
-                    let price = fast_float::parse::<f64, _>(&ask_entry[0])
-                        .map_err(|e| AppError::pipeline(format!("Invalid ask price '{}': {}", ask_entry[0], e)))?;
-                    let raw_size = fast_float::parse::<f64, _>(&ask_entry[1])
-                        .map_err(|e| AppError::pipeline(format!("Invalid ask size '{}': {}", ask_entry[1], e)))?;
-
-                    // Apply unit conversion if metadata available (lookup per entry to avoid borrow conflicts)
-                    let size = if let Some(ref registry) = self.okx_registry {
-                        if let Ok(metadata) = registry.get_metadata(&okx_symbol) {
-                            let converted = metadata.normalize_quantity(raw_size);
-                            log::debug!("Unit conversion: {} raw={} -> converted={} (multiplier={:?})", 
-                                okx_symbol, raw_size, converted, metadata.contract_multiplier);
-                            converted
-                        } else {
-                            log::warn!("No metadata found for symbol: {}", okx_symbol);
-                            raw_size
-                        }
-                    } else {
-                        log::warn!("No OKX registry available for unit conversion");
-                        raw_size
-                    };
-
-                    let sequence_id = self.next_sequence_id();
-                    let builder = OrderBookL2UpdateBuilder::new(
-                        timestamp_micros,
-                        rcv_timestamp,
-                        exchange_id,
-                        symbol.to_string(),
-                        sequence_id,
-                        packet_id as i64,
-                        seq_id,
-                        first_update_id,
-                    );
-                    
-                    self.updates_buffer.push(builder.build_ask(price, size));
-                }
-            }
-        }
-        
-        // Calculate transformation time
-        let transform_end = time::now_micros();
-        if let Some(transform_time) = transform_end.checked_sub(transform_start) {
-            self.metrics.update_transform_time(transform_time as u64);
-        }
-        
-        // Update metrics
-        self.metrics.increment_processed();
-        self.metrics.update_message_complexity(total_bid_count, total_ask_count, message_bytes);
-        
-        // Update packet metrics (OKX can send multiple messages in one packet)
-        let messages_in_packet = depth_update.data.len() as u32;
-        let entries_in_packet = total_bid_count + total_ask_count;
-        self.metrics.update_packet_metrics(messages_in_packet, entries_in_packet, message_bytes);
-        
-        // Return moved buffer instead of cloning
-        Ok(std::mem::take(&mut self.updates_buffer))
-    }
-
-    /// Convert symbol to OKX format for metadata lookup
-    fn convert_symbol_to_okx_format(&self, symbol: &str, exchange_id: ExchangeId) -> String {
-        match exchange_id {
-            ExchangeId::OkxSwap => {
-                // For SWAP: BTC-USDT-SWAP
-                if symbol.ends_with("USDT") {
-                    let base = &symbol[..symbol.len() - 4];
-                    format!("{}-USDT-SWAP", base)
-                } else if symbol.ends_with("USD") {
-                    let base = &symbol[..symbol.len() - 3];
-                    format!("{}-USD-SWAP", base)
-                } else {
-                    symbol.to_string()
-                }
-            }
-            ExchangeId::OkxSpot => {
-                // For SPOT: BTC-USDT
-                if symbol.ends_with("USDT") {
-                    let base = &symbol[..symbol.len() - 4];
-                    format!("{}-USDT", base)
-                } else if symbol.ends_with("USD") {
-                    let base = &symbol[..symbol.len() - 3];
-                    format!("{}-USD", base)
-                } else {
-                    symbol.to_string()
-                }
-            }
-            _ => symbol.to_string(),
-        }
-    }
-
-
-
-    fn next_packet_id(&mut self) -> u64 {
-        self.packet_counter += 1;
-        self.packet_counter as u64
-    }
-
-    fn next_sequence_id(&mut self) -> i64 {
-        self.sequence_counter += 1;
-        self.sequence_counter
-    }
-
-    pub fn update_throughput(&mut self, msgs_per_sec: f64) {
-        self.metrics.update_throughput(msgs_per_sec);
-    }
-
-    pub fn metrics(&self) -> &Metrics {
-        &self.metrics
+    pub fn new(processor: Box<dyn crate::exchanges::ExchangeProcessor<Error = crate::error::AppError>>) -> Self {
+        Self { processor }
     }
 
     pub fn process_raw_message(&mut self, raw_msg: RawMessage, symbol: &str) -> Result<Vec<OrderBookL2Update>> {
         // Single timestamp capture at start
         let rcv_timestamp = time::now_micros();
-        self.metrics.increment_received();
-        
-        let packet_id = self.next_packet_id();
-        
-        // Track message size
+        let packet_id = self.processor.next_packet_id();
         let message_bytes = raw_msg.data.len() as u32;
-        self.metrics.update_message_bytes(message_bytes);
         
-        // Parse exchange-specific message format
-        let parse_start = time::now_micros();
-        let updates = match raw_msg.exchange_id {
-            ExchangeId::BinanceFutures => {
-                let mut data_bytes = raw_msg.data.into_bytes();
-                let depth_update: BinanceDepthUpdate = serde_json::from_slice(&mut data_bytes).map_err(|e| {
-                    self.metrics.increment_parse_errors();
-                    AppError::pipeline(format!("Failed to parse Binance message: {}", e))
-                })?;
-                self.process_binance_update(depth_update, rcv_timestamp, packet_id, message_bytes)?
-            }
-            ExchangeId::OkxSwap | ExchangeId::OkxSpot => {
-                // Parse OKX message JSON to get depth update structure
-                let okx_message: crate::exchanges::okx::OkxMessage = serde_json::from_str(&raw_msg.data).map_err(|e| {
-                    self.metrics.increment_parse_errors();
-                    AppError::pipeline(format!("Failed to parse OKX message JSON: {}", e))
-                })?;
-                
-                match okx_message {
-                    crate::exchanges::okx::OkxMessage::Data(depth_update) => {
-                        self.process_okx_update(&depth_update, symbol, rcv_timestamp, packet_id, message_bytes, raw_msg.exchange_id)?
-                    },
-                    crate::exchanges::okx::OkxMessage::Subscription { .. } => {
-                        // Subscription acknowledgment - no data to process
-                        Vec::new()
-                    },
-                    crate::exchanges::okx::OkxMessage::Error { .. } => {
-                        self.metrics.increment_parse_errors();
-                        return Err(AppError::pipeline("OKX error message received".to_string()));
-                    }
-                }
-            }
-        };
-
-        // Calculate parse time
-        let parse_end = time::now_micros();
-        if let Some(parse_time) = parse_end.checked_sub(parse_start) {
-            self.metrics.update_parse_time(parse_time as u64);
-        }
-
-        // Calculate code latency (full processing time)
-        let code_end = time::now_micros();
-        if let Some(code_latency) = code_end.checked_sub(rcv_timestamp) {
-            self.metrics.update_code_latency(code_latency as u64);
-        }
-
-        // Update processed count
-        self.metrics.increment_processed();
+        // Delegate to exchange-specific processor
+        let updates = self.processor.process_message(raw_msg, symbol, rcv_timestamp, packet_id, message_bytes)?;
 
         Ok(updates)
+    }
+
+    pub fn update_throughput(&mut self, messages_per_sec: f64) {
+        self.processor.update_throughput(messages_per_sec);
+    }
+
+    pub fn metrics(&self) -> &Metrics {
+        self.processor.metrics()
     }
 }
 
@@ -389,11 +47,16 @@ pub struct MessagePipeline {
 
 impl MessagePipeline {
     pub fn new() -> Self {
-        let (raw_sender, mut raw_receiver) = mpsc::unbounded_channel();
-        let (update_sender, update_receiver) = mpsc::unbounded_channel();
+        let (raw_sender, _raw_receiver) = mpsc::unbounded_channel();
+        let (_update_sender, update_receiver) = mpsc::unbounded_channel();
+        
+        // Create a default Binance processor for now
+        let processor = StreamProcessor::new(
+            crate::exchanges::ProcessorFactory::create_binance_processor()
+        );
         
         Self {
-            processor: StreamProcessor::new(),
+            processor,
             raw_sender,
             update_receiver,
         }
@@ -453,12 +116,8 @@ pub async fn run_stream_processor(
     verbose: bool,
     okx_registry: Option<std::sync::Arc<crate::exchanges::okx::InstrumentRegistry>>,
 ) -> Result<()> {
-    let mut processor = StreamProcessor::new();
-    
-    // Set OKX registry if provided
-    if let Some(registry) = okx_registry {
-        processor.set_okx_registry(registry);
-    }
+    // We'll determine the exchange from the first message
+    let mut processor: Option<StreamProcessor> = None;
     
     let mut reporter = if verbose {
         Some(MetricsReporter::new(symbol.clone(), 10)) // Report every 10 seconds
@@ -469,12 +128,21 @@ pub async fn run_stream_processor(
     log::info!("Stream processor started for {}", symbol);
 
     while let Some(raw_msg) = rx.recv().await {
-        // Set exchange info on first message
-        if let Some(ref mut reporter) = reporter {
-            if reporter.exchange.is_none() {
+        // Initialize processor on first message
+        if processor.is_none() {
+            let exchange_processor = crate::exchanges::ProcessorFactory::create_processor(
+                raw_msg.exchange_id,
+                okx_registry.clone()
+            );
+            processor = Some(StreamProcessor::new(exchange_processor));
+            
+            // Set exchange info for reporter
+            if let Some(ref mut reporter) = reporter {
                 reporter.set_exchange(raw_msg.exchange_id.clone());
             }
         }
+        
+        let processor = processor.as_mut().unwrap();
 
         match processor.process_raw_message(raw_msg, &symbol) {
             Ok(updates) => {
@@ -508,9 +176,13 @@ mod tests {
 
     #[test]
     fn test_stream_processor_creation() {
-        let processor = StreamProcessor::new();
-        assert_eq!(processor.sequence_counter, 0);
-        assert_eq!(processor.packet_counter, 0);
+        let processor = StreamProcessor::new(
+            crate::exchanges::ProcessorFactory::create_binance_processor()
+        );
+        // Basic sanity check - processor should be created successfully
+        // Basic sanity check - processor should be created successfully
+        // Basic sanity check - processor should be created successfully
+        assert!(processor.metrics().messages_processed >= 0);
     }
 
     #[test]

@@ -692,6 +692,241 @@ pub fn create_okx_spot_connector() -> OkxConnector {
     OkxConnector::new_spot(registry)
 }
 
+/// OKX-specific message processor  
+pub struct OkxProcessor {
+    sequence_counter: i64,
+    packet_counter: i64,
+    metrics: crate::types::Metrics,
+    updates_buffer: Vec<crate::types::OrderBookL2Update>,
+    okx_registry: Option<std::sync::Arc<InstrumentRegistry>>,
+    exchange_id: crate::types::ExchangeId,
+}
+
+impl OkxProcessor {
+    pub fn new(exchange_id: crate::types::ExchangeId, registry: Option<std::sync::Arc<InstrumentRegistry>>) -> Self {
+        Self {
+            sequence_counter: 0,
+            packet_counter: 0,
+            metrics: crate::types::Metrics::new(),
+            updates_buffer: Vec::with_capacity(20),
+            okx_registry: registry,
+            exchange_id,
+        }
+    }
+
+    /// Convert symbol to OKX format for metadata lookup
+    fn convert_symbol_to_okx_format(&self, symbol: &str) -> String {
+        match self.exchange_id {
+            crate::types::ExchangeId::OkxSwap => {
+                // For SWAP: BTC-USDT-SWAP
+                if symbol.ends_with("USDT") {
+                    let base = &symbol[..symbol.len() - 4];
+                    format!("{}-USDT-SWAP", base)
+                } else if symbol.ends_with("USD") {
+                    let base = &symbol[..symbol.len() - 3];
+                    format!("{}-USD-SWAP", base)
+                } else {
+                    symbol.to_string()
+                }
+            }
+            crate::types::ExchangeId::OkxSpot => {
+                // For SPOT: BTC-USDT
+                if symbol.ends_with("USDT") {
+                    let base = &symbol[..symbol.len() - 4];
+                    format!("{}-USDT", base)
+                } else if symbol.ends_with("USD") {
+                    let base = &symbol[..symbol.len() - 3];
+                    format!("{}-USD", base)
+                } else {
+                    symbol.to_string()
+                }
+            }
+            _ => symbol.to_string(),
+        }
+    }
+}
+
+impl crate::exchanges::ExchangeProcessor for OkxProcessor {
+    type Error = crate::error::AppError;
+
+    fn process_message(
+        &mut self,
+        raw_msg: crate::types::RawMessage,
+        symbol: &str,
+        rcv_timestamp: i64,
+        packet_id: u64,
+        message_bytes: u32,
+    ) -> std::result::Result<Vec<crate::types::OrderBookL2Update>, Self::Error> {
+        // Parse OKX message JSON
+        let okx_message: OkxMessage = serde_json::from_str(&raw_msg.data).map_err(|e| {
+            self.metrics.increment_parse_errors();
+            crate::error::AppError::pipeline(format!("Failed to parse OKX message JSON: {}", e))
+        })?;
+        
+        let depth_update = match okx_message {
+            OkxMessage::Data(depth_update) => depth_update,
+            OkxMessage::Subscription { .. } => {
+                // Subscription acknowledgment - no data to process
+                return Ok(Vec::new());
+            },
+            OkxMessage::Error { .. } => {
+                self.metrics.increment_parse_errors();
+                return Err(crate::error::AppError::pipeline("OKX error message received".to_string()));
+            }
+        };
+
+        // Reuse pre-allocated buffer
+        self.updates_buffer.clear();
+        
+        // Start transformation timing
+        let transform_start = crate::types::time::now_micros();
+        
+        // Get OKX symbol format for metadata lookup once
+        let okx_symbol = self.convert_symbol_to_okx_format(symbol);
+        
+        // Track total bid/ask count across all data entries
+        let mut total_bid_count = 0u32;
+        let mut total_ask_count = 0u32;
+        
+        for data in &depth_update.data {
+            let timestamp = data.timestamp.parse::<i64>()
+                .map_err(|e| crate::error::AppError::parse(format!("Invalid timestamp '{}': {}", data.timestamp, e)))?;
+
+            let timestamp_micros = crate::types::time::millis_to_micros(timestamp);
+            
+            // Calculate overall latency (local time vs exchange timestamp)
+            if let Some(overall_latency) = rcv_timestamp.checked_sub(timestamp_micros) {
+                if overall_latency >= 0 {
+                    self.metrics.update_overall_latency(overall_latency as u64);
+                }
+            }
+            
+            let seq_id = data.seq_id.unwrap_or(0);
+            let first_update_id = data.prev_seq_id.unwrap_or(seq_id);
+
+            // Count bid/ask levels for complexity metrics
+            total_bid_count += data.bids.len() as u32;
+            total_ask_count += data.asks.len() as u32;
+
+            // Process bids with unit conversion
+            for bid_entry in &data.bids {
+                if bid_entry.len() >= 2 {
+                    let price = fast_float::parse::<f64, _>(&bid_entry[0])
+                        .map_err(|e| crate::error::AppError::pipeline(format!("Invalid bid price '{}': {}", bid_entry[0], e)))?;
+                    let raw_size = fast_float::parse::<f64, _>(&bid_entry[1])
+                        .map_err(|e| crate::error::AppError::pipeline(format!("Invalid bid size '{}': {}", bid_entry[1], e)))?;
+
+                    // Apply unit conversion if metadata available
+                    let size = if let Some(ref registry) = self.okx_registry {
+                        if let Ok(metadata) = registry.get_metadata(&okx_symbol) {
+                            let converted = metadata.normalize_quantity(raw_size);
+                            log::debug!("Unit conversion: {} raw={} -> converted={} (multiplier={:?})", 
+                                okx_symbol, raw_size, converted, metadata.contract_multiplier);
+                            converted
+                        } else {
+                            log::warn!("No metadata found for symbol: {}", okx_symbol);
+                            raw_size
+                        }
+                    } else {
+                        log::warn!("No OKX registry available for unit conversion");
+                        raw_size
+                    };
+
+                    let sequence_id = self.next_sequence_id();
+                    let builder = crate::types::OrderBookL2UpdateBuilder::new(
+                        timestamp_micros,
+                        rcv_timestamp,
+                        self.exchange_id,
+                        symbol.to_string(),
+                        sequence_id,
+                        packet_id as i64,
+                        seq_id,
+                        first_update_id,
+                    );
+                    
+                    self.updates_buffer.push(builder.build_bid(price, size));
+                }
+            }
+
+            // Process asks with unit conversion
+            for ask_entry in &data.asks {
+                if ask_entry.len() >= 2 {
+                    let price = fast_float::parse::<f64, _>(&ask_entry[0])
+                        .map_err(|e| crate::error::AppError::pipeline(format!("Invalid ask price '{}': {}", ask_entry[0], e)))?;
+                    let raw_size = fast_float::parse::<f64, _>(&ask_entry[1])
+                        .map_err(|e| crate::error::AppError::pipeline(format!("Invalid ask size '{}': {}", ask_entry[1], e)))?;
+
+                    // Apply unit conversion if metadata available
+                    let size = if let Some(ref registry) = self.okx_registry {
+                        if let Ok(metadata) = registry.get_metadata(&okx_symbol) {
+                            let converted = metadata.normalize_quantity(raw_size);
+                            log::debug!("Unit conversion: {} raw={} -> converted={} (multiplier={:?})", 
+                                okx_symbol, raw_size, converted, metadata.contract_multiplier);
+                            converted
+                        } else {
+                            log::warn!("No metadata found for symbol: {}", okx_symbol);
+                            raw_size
+                        }
+                    } else {
+                        log::warn!("No OKX registry available for unit conversion");
+                        raw_size
+                    };
+
+                    let sequence_id = self.next_sequence_id();
+                    let builder = crate::types::OrderBookL2UpdateBuilder::new(
+                        timestamp_micros,
+                        rcv_timestamp,
+                        self.exchange_id,
+                        symbol.to_string(),
+                        sequence_id,
+                        packet_id as i64,
+                        seq_id,
+                        first_update_id,
+                    );
+                    
+                    self.updates_buffer.push(builder.build_ask(price, size));
+                }
+            }
+        }
+        
+        // Calculate transformation time
+        let transform_end = crate::types::time::now_micros();
+        if let Some(transform_time) = transform_end.checked_sub(transform_start) {
+            self.metrics.update_transform_time(transform_time as u64);
+        }
+        
+        // Update metrics
+        self.metrics.increment_processed();
+        self.metrics.update_message_complexity(total_bid_count, total_ask_count, message_bytes);
+        
+        // Update packet metrics (OKX can send multiple messages in one packet)
+        let messages_in_packet = depth_update.data.len() as u32;
+        let entries_in_packet = total_bid_count + total_ask_count;
+        self.metrics.update_packet_metrics(messages_in_packet, entries_in_packet, message_bytes);
+        
+        // Return moved buffer instead of cloning
+        Ok(std::mem::take(&mut self.updates_buffer))
+    }
+
+    fn metrics(&self) -> &crate::types::Metrics {
+        &self.metrics
+    }
+
+    fn next_sequence_id(&mut self) -> i64 {
+        self.sequence_counter += 1;
+        self.sequence_counter
+    }
+
+    fn next_packet_id(&mut self) -> u64 {
+        self.packet_counter += 1;
+        self.packet_counter as u64
+    }
+
+    fn update_throughput(&mut self, messages_per_sec: f64) {
+        self.metrics.update_throughput(messages_per_sec);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,6 +966,7 @@ mod tests {
             lot_size: "1".to_string(),
             min_size: Some("1".to_string()),
             contract_multiplier: Some("0.01".to_string()),
+            contract_value: Some("100".to_string()),
             tick_size: "0.1".to_string(),
             base_currency: Some("BTC".to_string()),
             quote_currency: Some("USDT".to_string()),
@@ -750,6 +986,7 @@ mod tests {
             inst_type: "SWAP".to_string(),
             lot_size: 1.0,
             contract_multiplier: Some(0.01),
+            contract_value: Some(1.0),
             tick_size: 0.1,
             base_currency: Some("BTC".to_string()),
             quote_currency: Some("USDT".to_string()),
@@ -768,6 +1005,7 @@ mod tests {
             inst_type: "SPOT".to_string(),
             lot_size: 0.001,
             contract_multiplier: None,
+            contract_value: None,
             tick_size: 0.01,
             base_currency: Some("BTC".to_string()),
             quote_currency: Some("USDT".to_string()),
@@ -788,6 +1026,7 @@ mod tests {
             inst_type: "SWAP".to_string(),
             lot_size: 1.0,
             contract_multiplier: Some(0.01),
+            contract_value: Some(100.0),
             tick_size: 0.1,
             base_currency: Some("BTC".to_string()),
             quote_currency: Some("USDT".to_string()),

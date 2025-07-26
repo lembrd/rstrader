@@ -435,6 +435,173 @@ pub fn create_binance_connector() -> BinanceFuturesConnector {
     BinanceFuturesConnector::new()
 }
 
+/// Binance-specific message processor
+pub struct BinanceProcessor {
+    sequence_counter: i64,
+    packet_counter: i64,
+    metrics: crate::types::Metrics,
+    updates_buffer: Vec<crate::types::OrderBookL2Update>,
+}
+
+impl BinanceProcessor {
+    pub fn new() -> Self {
+        Self {
+            sequence_counter: 0,
+            packet_counter: 0,
+            metrics: crate::types::Metrics::new(),
+            updates_buffer: Vec::with_capacity(20),
+        }
+    }
+}
+
+impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
+    type Error = crate::error::AppError;
+
+    fn process_message(
+        &mut self,
+        raw_msg: crate::types::RawMessage,
+        _symbol: &str,
+        rcv_timestamp: i64,
+        packet_id: u64,
+        message_bytes: u32,
+    ) -> std::result::Result<Vec<crate::types::OrderBookL2Update>, Self::Error> {
+        // Track message received
+        self.metrics.increment_received();
+        
+        // Calculate packet arrival timestamp (when network packet was received)
+        let packet_arrival_us = raw_msg.timestamp.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+        
+        // Parse Binance message with timing
+        let parse_start = crate::types::time::now_micros();
+        let mut data_bytes = raw_msg.data.into_bytes();
+        let depth_update: BinanceDepthUpdate = serde_json::from_slice(&mut data_bytes).map_err(|e| {
+            self.metrics.increment_parse_errors();
+            crate::error::AppError::pipeline(format!("Failed to parse Binance message: {}", e))
+        })?;
+        
+        // Calculate parse time
+        let parse_end = crate::types::time::now_micros();
+        if let Some(parse_time) = parse_end.checked_sub(parse_start) {
+            self.metrics.update_parse_time(parse_time as u64);
+        }
+
+        // Calculate overall latency (local time vs exchange timestamp)
+        let exchange_timestamp_us = crate::types::time::millis_to_micros(depth_update.event_time);
+        if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
+            if overall_latency >= 0 {
+                self.metrics.update_overall_latency(overall_latency as u64);
+            }
+        }
+            
+        // Start transformation timing
+        let transform_start = crate::types::time::now_micros();
+        
+        // Calculate overhead time (time between parse end and transform start)
+        if let Some(overhead_time) = transform_start.checked_sub(parse_end) {
+            self.metrics.update_overhead_time(overhead_time as u64);
+        }
+        
+        // Count bid/ask levels for complexity metrics
+        let bid_count = depth_update.bids.len() as u32;
+        let ask_count = depth_update.asks.len() as u32;
+        
+        // Reuse pre-allocated buffer
+        self.updates_buffer.clear();
+        
+        let timestamp_micros = crate::types::time::millis_to_micros(depth_update.event_time);
+        
+        // Process bid updates using fast float parsing
+        for bid in depth_update.bids {
+            let price = fast_float::parse::<f64, _>(&bid[0])
+                .map_err(|e| crate::error::AppError::pipeline(format!("Invalid bid price '{}': {}", bid[0], e)))?;
+            let qty = fast_float::parse::<f64, _>(&bid[1])
+                .map_err(|e| crate::error::AppError::pipeline(format!("Invalid bid quantity '{}': {}", bid[1], e)))?;
+            
+            let seq_id = self.next_sequence_id();
+            let builder = crate::types::OrderBookL2UpdateBuilder::new(
+                timestamp_micros,
+                rcv_timestamp,
+                crate::types::ExchangeId::BinanceFutures,
+                depth_update.symbol.clone(),
+                seq_id,
+                packet_id as i64,
+                depth_update.final_update_id,
+                depth_update.first_update_id,
+            );
+            
+            self.updates_buffer.push(builder.build_bid(price, qty));
+        }
+        
+        // Process ask updates using fast float parsing
+        for ask in depth_update.asks {
+            let price = fast_float::parse::<f64, _>(&ask[0])
+                .map_err(|e| crate::error::AppError::pipeline(format!("Invalid ask price '{}': {}", ask[0], e)))?;
+            let qty = fast_float::parse::<f64, _>(&ask[1])
+                .map_err(|e| crate::error::AppError::pipeline(format!("Invalid ask quantity '{}': {}", ask[1], e)))?;
+            
+            let seq_id = self.next_sequence_id();
+            let builder = crate::types::OrderBookL2UpdateBuilder::new(
+                timestamp_micros,
+                rcv_timestamp,
+                crate::types::ExchangeId::BinanceFutures,
+                depth_update.symbol.clone(),
+                seq_id,
+                packet_id as i64,
+                depth_update.final_update_id,
+                depth_update.first_update_id,
+            );
+            
+            self.updates_buffer.push(builder.build_ask(price, qty));
+        }
+        
+        // Calculate transformation time
+        let transform_end = crate::types::time::now_micros();
+        if let Some(transform_time) = transform_end.checked_sub(transform_start) {
+            self.metrics.update_transform_time(transform_time as u64);
+        }
+        
+        // Update metrics
+        self.metrics.increment_processed();
+        self.metrics.update_message_complexity(bid_count, ask_count, message_bytes);
+        
+        // Update packet metrics (Binance sends 1 message per packet)
+        let entries_in_packet = bid_count + ask_count;
+        self.metrics.update_packet_metrics(1, entries_in_packet, message_bytes);
+        
+        // Calculate CODE LATENCY: From network packet arrival to business logic ready
+        // This measures the FULL time spent in Rust code processing
+        let processing_complete = crate::types::time::now_micros();
+        if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
+            if code_latency >= 0 {
+                self.metrics.update_code_latency(code_latency as u64);
+            }
+        }
+        
+        // Return moved buffer instead of cloning
+        Ok(std::mem::take(&mut self.updates_buffer))
+    }
+
+    fn metrics(&self) -> &crate::types::Metrics {
+        &self.metrics
+    }
+
+    fn next_sequence_id(&mut self) -> i64 {
+        self.sequence_counter += 1;
+        self.sequence_counter
+    }
+
+    fn next_packet_id(&mut self) -> u64 {
+        self.packet_counter += 1;
+        self.packet_counter as u64
+    }
+
+    fn update_throughput(&mut self, messages_per_sec: f64) {
+        self.metrics.update_throughput(messages_per_sec);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
