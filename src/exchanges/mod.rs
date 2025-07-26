@@ -82,6 +82,33 @@ pub trait ExchangeConnector: Send + Sync {
     async fn start_trade_stream(&mut self, symbol: &str, tx: tokio::sync::mpsc::Sender<RawMessage>) -> Result<(), Self::Error>;
 }
 
+/// Base processor containing common fields shared by all exchange processors
+#[derive(Debug)]
+pub struct BaseProcessor {
+    pub sequence_counter: i64,
+    pub packet_counter: i64,
+    pub metrics: crate::types::Metrics,
+    pub updates_buffer: Vec<crate::types::OrderBookL2Update>,
+}
+
+impl BaseProcessor {
+    /// Create new base processor with default values
+    pub fn new() -> Self {
+        Self {
+            sequence_counter: 0,
+            packet_counter: 0,
+            metrics: crate::types::Metrics::new(),
+            updates_buffer: Vec::with_capacity(20),
+        }
+    }
+}
+
+impl Default for BaseProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Trait for exchange-specific message processing
 /// Separates exchange-specific logic from core stream processing
 pub trait ExchangeProcessor: Send + Sync {
@@ -97,17 +124,35 @@ pub trait ExchangeProcessor: Send + Sync {
         message_bytes: u32,
     ) -> Result<Vec<crate::types::OrderBookL2Update>, Self::Error>;
     
+    /// Get mutable reference to base processor for shared functionality
+    fn base_processor(&mut self) -> &mut BaseProcessor;
+    
+    /// Get immutable reference to base processor for shared functionality
+    fn base_processor_ref(&self) -> &BaseProcessor;
+    
     /// Get processor metrics
-    fn metrics(&self) -> &crate::types::Metrics;
+    fn metrics(&self) -> &crate::types::Metrics {
+        &self.base_processor_ref().metrics
+    }
     
     /// Get next sequence ID
-    fn next_sequence_id(&mut self) -> i64;
+    fn next_sequence_id(&mut self) -> i64 {
+        let base = self.base_processor();
+        base.sequence_counter += 1;
+        base.sequence_counter
+    }
     
     /// Get next packet ID  
-    fn next_packet_id(&mut self) -> u64;
+    fn next_packet_id(&mut self) -> u64 {
+        let base = self.base_processor();
+        base.packet_counter += 1;
+        base.packet_counter as u64
+    }
     
     /// Update throughput metrics
-    fn update_throughput(&mut self, messages_per_sec: f64);
+    fn update_throughput(&mut self, messages_per_sec: f64) {
+        self.base_processor().metrics.update_throughput(messages_per_sec);
+    }
 }
 
 /// Factory for creating exchange-specific processors

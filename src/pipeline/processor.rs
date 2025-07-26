@@ -38,43 +38,7 @@ impl StreamProcessor {
     }
 }
 
-/// Alternative pipeline design (not currently used in main execution path)
-pub struct MessagePipeline {
-    processor: StreamProcessor,
-    raw_sender: mpsc::UnboundedSender<RawMessage>,
-    update_receiver: mpsc::UnboundedReceiver<OrderBookL2Update>,
-}
 
-impl MessagePipeline {
-    pub fn new() -> Self {
-        let (raw_sender, _raw_receiver) = mpsc::unbounded_channel();
-        let (_update_sender, update_receiver) = mpsc::unbounded_channel();
-        
-        // Create a default Binance processor for now
-        let processor = StreamProcessor::new(
-            crate::exchanges::ProcessorFactory::create_binance_processor()
-        );
-        
-        Self {
-            processor,
-            raw_sender,
-            update_receiver,
-        }
-    }
-
-    pub fn raw_sender(&self) -> mpsc::UnboundedSender<RawMessage> {
-        self.raw_sender.clone()
-    }
-
-    pub fn update_receiver(&mut self) -> &mut mpsc::UnboundedReceiver<OrderBookL2Update> {
-        &mut self.update_receiver
-    }
-
-    pub async fn run(&mut self) -> Result<()> {
-        // This would be the implementation for the alternative pipeline design
-        Ok(())
-    }
-}
 
 pub struct MetricsReporter {
     symbol: String,

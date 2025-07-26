@@ -694,10 +694,7 @@ pub fn create_okx_spot_connector() -> OkxConnector {
 
 /// OKX-specific message processor  
 pub struct OkxProcessor {
-    sequence_counter: i64,
-    packet_counter: i64,
-    metrics: crate::types::Metrics,
-    updates_buffer: Vec<crate::types::OrderBookL2Update>,
+    base: crate::exchanges::BaseProcessor,
     okx_registry: Option<std::sync::Arc<InstrumentRegistry>>,
     exchange_id: crate::types::ExchangeId,
 }
@@ -705,10 +702,7 @@ pub struct OkxProcessor {
 impl OkxProcessor {
     pub fn new(exchange_id: crate::types::ExchangeId, registry: Option<std::sync::Arc<InstrumentRegistry>>) -> Self {
         Self {
-            sequence_counter: 0,
-            packet_counter: 0,
-            metrics: crate::types::Metrics::new(),
-            updates_buffer: Vec::with_capacity(20),
+            base: crate::exchanges::BaseProcessor::new(),
             okx_registry: registry,
             exchange_id,
         }
@@ -749,6 +743,14 @@ impl OkxProcessor {
 impl crate::exchanges::ExchangeProcessor for OkxProcessor {
     type Error = crate::error::AppError;
 
+    fn base_processor(&mut self) -> &mut crate::exchanges::BaseProcessor {
+        &mut self.base
+    }
+
+    fn base_processor_ref(&self) -> &crate::exchanges::BaseProcessor {
+        &self.base
+    }
+
     fn process_message(
         &mut self,
         raw_msg: crate::types::RawMessage,
@@ -757,9 +759,17 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         packet_id: u64,
         message_bytes: u32,
     ) -> std::result::Result<Vec<crate::types::OrderBookL2Update>, Self::Error> {
+        // Track message received
+        self.base.metrics.increment_received();
+        
+        // Calculate packet arrival timestamp (when network packet was received)
+        let packet_arrival_us = raw_msg.timestamp.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+        
         // Parse OKX message JSON
         let okx_message: OkxMessage = serde_json::from_str(&raw_msg.data).map_err(|e| {
-            self.metrics.increment_parse_errors();
+            self.base.metrics.increment_parse_errors();
             crate::error::AppError::pipeline(format!("Failed to parse OKX message JSON: {}", e))
         })?;
         
@@ -770,13 +780,13 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
                 return Ok(Vec::new());
             },
             OkxMessage::Error { .. } => {
-                self.metrics.increment_parse_errors();
+                self.base.metrics.increment_parse_errors();
                 return Err(crate::error::AppError::pipeline("OKX error message received".to_string()));
             }
         };
 
         // Reuse pre-allocated buffer
-        self.updates_buffer.clear();
+        self.base.updates_buffer.clear();
         
         // Start transformation timing
         let transform_start = crate::types::time::now_micros();
@@ -797,7 +807,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             // Calculate overall latency (local time vs exchange timestamp)
             if let Some(overall_latency) = rcv_timestamp.checked_sub(timestamp_micros) {
                 if overall_latency >= 0 {
-                    self.metrics.update_overall_latency(overall_latency as u64);
+                    self.base.metrics.update_overall_latency(overall_latency as u64);
                 }
             }
             
@@ -844,7 +854,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
                         first_update_id,
                     );
                     
-                    self.updates_buffer.push(builder.build_bid(price, size));
+                    self.base.updates_buffer.push(builder.build_bid(price, size));
                 }
             }
 
@@ -884,7 +894,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
                         first_update_id,
                     );
                     
-                    self.updates_buffer.push(builder.build_ask(price, size));
+                    self.base.updates_buffer.push(builder.build_ask(price, size));
                 }
             }
         }
@@ -892,39 +902,32 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         // Calculate transformation time
         let transform_end = crate::types::time::now_micros();
         if let Some(transform_time) = transform_end.checked_sub(transform_start) {
-            self.metrics.update_transform_time(transform_time as u64);
+            self.base.metrics.update_transform_time(transform_time as u64);
         }
         
         // Update metrics
-        self.metrics.increment_processed();
-        self.metrics.update_message_complexity(total_bid_count, total_ask_count, message_bytes);
+        self.base.metrics.increment_processed();
+        self.base.metrics.update_message_complexity(total_bid_count, total_ask_count, message_bytes);
         
         // Update packet metrics (OKX can send multiple messages in one packet)
         let messages_in_packet = depth_update.data.len() as u32;
         let entries_in_packet = total_bid_count + total_ask_count;
-        self.metrics.update_packet_metrics(messages_in_packet, entries_in_packet, message_bytes);
+        self.base.metrics.update_packet_metrics(messages_in_packet, entries_in_packet, message_bytes);
+        
+        // Calculate CODE LATENCY: From network packet arrival to business logic ready
+        // This measures the FULL time spent in Rust code processing
+        let processing_complete = crate::types::time::now_micros();
+        if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
+            if code_latency >= 0 {
+                self.base.metrics.update_code_latency(code_latency as u64);
+            }
+        }
         
         // Return moved buffer instead of cloning
-        Ok(std::mem::take(&mut self.updates_buffer))
+        Ok(std::mem::take(&mut self.base.updates_buffer))
     }
 
-    fn metrics(&self) -> &crate::types::Metrics {
-        &self.metrics
-    }
-
-    fn next_sequence_id(&mut self) -> i64 {
-        self.sequence_counter += 1;
-        self.sequence_counter
-    }
-
-    fn next_packet_id(&mut self) -> u64 {
-        self.packet_counter += 1;
-        self.packet_counter as u64
-    }
-
-    fn update_throughput(&mut self, messages_per_sec: f64) {
-        self.metrics.update_throughput(messages_per_sec);
-    }
+    // Default implementations from trait are used
 }
 
 #[cfg(test)]
