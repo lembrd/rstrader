@@ -1,6 +1,15 @@
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## 🚨 CRITICAL PERFORMANCE REQUIREMENTS
+**XTrader is a LOW LATENCY PRODUCTION TRADING SYSTEM**
+- Every microsecond matters - optimize for minimal latency
+- Code must be elegant, error-free, and performance-optimized
+- Avoid unnecessary allocations, string conversions, and JSON manipulations
+- Process data once at the right place in the pipeline
+- Apply transformations on parsed native types (f64), not JSON strings
+- Use zero-copy approaches and in-place operations where possible
 ## System prompt
 - Always start with `/mcp__serena__initial_instructions`
 - Always use `/mcp__serena__initial_instructions` after context compaction

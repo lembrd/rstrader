@@ -13,6 +13,8 @@ pub struct StreamProcessor {
     packet_counter: i64,
     metrics: Metrics,
     updates_buffer: Vec<OrderBookL2Update>,
+    // Add registry for OKX unit conversion
+    okx_registry: Option<std::sync::Arc<crate::exchanges::okx::InstrumentRegistry>>,
 }
 
 impl StreamProcessor {
@@ -22,7 +24,14 @@ impl StreamProcessor {
             packet_counter: 0,
             metrics: Metrics::new(),
             updates_buffer: Vec::with_capacity(20), // Pre-allocate for typical message size
+            okx_registry: None,
         }
+    }
+
+    
+    /// Set OKX instrument registry for unit conversion
+    pub fn set_okx_registry(&mut self, registry: std::sync::Arc<crate::exchanges::okx::InstrumentRegistry>) {
+        self.okx_registry = Some(registry);
     }
     
     fn process_binance_update(
@@ -129,6 +138,9 @@ impl StreamProcessor {
         // Start transformation timing
         let transform_start = time::now_micros();
         
+        // Get OKX symbol format for metadata lookup once
+        let okx_symbol = self.convert_symbol_to_okx_format(symbol, exchange_id);
+        
         // Track total bid/ask count across all data entries
         let mut total_bid_count = 0u32;
         let mut total_ask_count = 0u32;
@@ -153,20 +165,37 @@ impl StreamProcessor {
             total_bid_count += data.bids.len() as u32;
             total_ask_count += data.asks.len() as u32;
 
-            // Process bids
+            // Process bids with unit conversion
             for bid_entry in &data.bids {
                 if bid_entry.len() >= 2 {
                     let price = fast_float::parse::<f64, _>(&bid_entry[0])
                         .map_err(|e| AppError::pipeline(format!("Invalid bid price '{}': {}", bid_entry[0], e)))?;
-                    let size = fast_float::parse::<f64, _>(&bid_entry[1])
+                    let raw_size = fast_float::parse::<f64, _>(&bid_entry[1])
                         .map_err(|e| AppError::pipeline(format!("Invalid bid size '{}': {}", bid_entry[1], e)))?;
 
+                    // Apply unit conversion if metadata available (lookup per entry to avoid borrow conflicts)
+                    let size = if let Some(ref registry) = self.okx_registry {
+                        if let Ok(metadata) = registry.get_metadata(&okx_symbol) {
+                            let converted = metadata.normalize_quantity(raw_size);
+                            log::debug!("Unit conversion: {} raw={} -> converted={} (multiplier={:?})", 
+                                okx_symbol, raw_size, converted, metadata.contract_multiplier);
+                            converted
+                        } else {
+                            log::warn!("No metadata found for symbol: {}", okx_symbol);
+                            raw_size
+                        }
+                    } else {
+                        log::warn!("No OKX registry available for unit conversion");
+                        raw_size
+                    };
+
+                    let sequence_id = self.next_sequence_id();
                     let builder = OrderBookL2UpdateBuilder::new(
                         timestamp_micros,
                         rcv_timestamp,
                         exchange_id,
                         symbol.to_string(),
-                        self.next_sequence_id(),
+                        sequence_id,
                         packet_id as i64,
                         seq_id,
                         first_update_id,
@@ -176,20 +205,37 @@ impl StreamProcessor {
                 }
             }
 
-            // Process asks
+            // Process asks with unit conversion
             for ask_entry in &data.asks {
                 if ask_entry.len() >= 2 {
                     let price = fast_float::parse::<f64, _>(&ask_entry[0])
                         .map_err(|e| AppError::pipeline(format!("Invalid ask price '{}': {}", ask_entry[0], e)))?;
-                    let size = fast_float::parse::<f64, _>(&ask_entry[1])
+                    let raw_size = fast_float::parse::<f64, _>(&ask_entry[1])
                         .map_err(|e| AppError::pipeline(format!("Invalid ask size '{}': {}", ask_entry[1], e)))?;
 
+                    // Apply unit conversion if metadata available (lookup per entry to avoid borrow conflicts)
+                    let size = if let Some(ref registry) = self.okx_registry {
+                        if let Ok(metadata) = registry.get_metadata(&okx_symbol) {
+                            let converted = metadata.normalize_quantity(raw_size);
+                            log::debug!("Unit conversion: {} raw={} -> converted={} (multiplier={:?})", 
+                                okx_symbol, raw_size, converted, metadata.contract_multiplier);
+                            converted
+                        } else {
+                            log::warn!("No metadata found for symbol: {}", okx_symbol);
+                            raw_size
+                        }
+                    } else {
+                        log::warn!("No OKX registry available for unit conversion");
+                        raw_size
+                    };
+
+                    let sequence_id = self.next_sequence_id();
                     let builder = OrderBookL2UpdateBuilder::new(
                         timestamp_micros,
                         rcv_timestamp,
                         exchange_id,
                         symbol.to_string(),
-                        self.next_sequence_id(),
+                        sequence_id,
                         packet_id as i64,
                         seq_id,
                         first_update_id,
@@ -217,6 +263,37 @@ impl StreamProcessor {
         
         // Return moved buffer instead of cloning
         Ok(std::mem::take(&mut self.updates_buffer))
+    }
+
+    /// Convert symbol to OKX format for metadata lookup
+    fn convert_symbol_to_okx_format(&self, symbol: &str, exchange_id: ExchangeId) -> String {
+        match exchange_id {
+            ExchangeId::OkxSwap => {
+                // For SWAP: BTC-USDT-SWAP
+                if symbol.ends_with("USDT") {
+                    let base = &symbol[..symbol.len() - 4];
+                    format!("{}-USDT-SWAP", base)
+                } else if symbol.ends_with("USD") {
+                    let base = &symbol[..symbol.len() - 3];
+                    format!("{}-USD-SWAP", base)
+                } else {
+                    symbol.to_string()
+                }
+            }
+            ExchangeId::OkxSpot => {
+                // For SPOT: BTC-USDT
+                if symbol.ends_with("USDT") {
+                    let base = &symbol[..symbol.len() - 4];
+                    format!("{}-USDT", base)
+                } else if symbol.ends_with("USD") {
+                    let base = &symbol[..symbol.len() - 3];
+                    format!("{}-USD", base)
+                } else {
+                    symbol.to_string()
+                }
+            }
+            _ => symbol.to_string(),
+        }
     }
 
 
@@ -369,14 +446,20 @@ impl MetricsReporter {
     }
 }
 
-/// Main stream processor task
 pub async fn run_stream_processor(
     mut rx: mpsc::Receiver<RawMessage>,
     tx: mpsc::Sender<OrderBookL2Update>,
     symbol: String,
     verbose: bool,
+    okx_registry: Option<std::sync::Arc<crate::exchanges::okx::InstrumentRegistry>>,
 ) -> Result<()> {
     let mut processor = StreamProcessor::new();
+    
+    // Set OKX registry if provided
+    if let Some(registry) = okx_registry {
+        processor.set_okx_registry(registry);
+    }
+    
     let mut reporter = if verbose {
         Some(MetricsReporter::new(symbol.clone(), 10)) // Report every 10 seconds
     } else {

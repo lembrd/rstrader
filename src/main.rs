@@ -32,9 +32,37 @@ impl MultiSubscriptionManager {
     /// Spawn per-subscription connector and processor pairs
     pub async fn spawn_all_subscriptions(&mut self, processed_tx: mpsc::Sender<OrderBookL2Update>, verbose: bool) -> Result<()> {
         use exchanges::binance::BinanceFuturesConnector;
-        use exchanges::okx::OkxConnector;
+        use exchanges::okx::{OkxConnector, InstrumentRegistry};
         use cli::{Exchange, StreamType};
         use pipeline::processor::run_stream_processor;
+        use std::sync::Arc;
+        use reqwest::Client;
+        
+        // Initialize singleton registries for OKX exchanges once
+        let mut okx_swap_registry: Option<Arc<InstrumentRegistry>> = None;
+        let mut okx_spot_registry: Option<Arc<InstrumentRegistry>> = None;
+        
+        // Pre-initialize registries based on subscriptions
+        let needs_swap = self.subscriptions.iter().any(|s| matches!(s.exchange, Exchange::OkxSwap));
+        let needs_spot = self.subscriptions.iter().any(|s| matches!(s.exchange, Exchange::OkxSpot));
+        
+        if needs_swap {
+            log::info!("Initializing OKX SWAP instrument registry");
+            let client = Client::new();
+            let registry = InstrumentRegistry::initialize_with_instruments(&client, "https://www.okx.com", "SWAP")
+                .await
+                .map_err(|e| AppError::connection(format!("Failed to initialize SWAP registry: {}", e)))?;
+            okx_swap_registry = Some(Arc::new(registry));
+        }
+        
+        if needs_spot {
+            log::info!("Initializing OKX SPOT instrument registry");
+            let client = Client::new();
+            let registry = InstrumentRegistry::initialize_with_instruments(&client, "https://www.okx.com", "SPOT")
+                .await
+                .map_err(|e| AppError::connection(format!("Failed to initialize SPOT registry: {}", e)))?;
+            okx_spot_registry = Some(Arc::new(registry));
+        }
         
         for (index, subscription) in self.subscriptions.iter().enumerate() {
             // Create dedicated channels for this subscription
@@ -48,11 +76,11 @@ impl MultiSubscriptionManager {
                 }
                 Exchange::OkxSwap => {
                     log::info!("[{}] Creating OKX SWAP connector for {}", index, subscription.instrument);
-                    Box::new(OkxConnector::new_swap())
+                    Box::new(OkxConnector::new_swap(okx_swap_registry.as_ref().unwrap().clone()))
                 }
                 Exchange::OkxSpot => {
                     log::info!("[{}] Creating OKX SPOT connector for {}", index, subscription.instrument);
-                    Box::new(OkxConnector::new_spot())
+                    Box::new(OkxConnector::new_spot(okx_spot_registry.as_ref().unwrap().clone()))
                 }
             };
             
@@ -80,9 +108,18 @@ impl MultiSubscriptionManager {
             let processor_index = index;
             let processor_exchange = subscription.exchange.clone();
             
+            // Get appropriate OKX registry for this exchange (clone outside async block)
+            let processor_registry = match subscription.exchange {
+                Exchange::OkxSwap => okx_swap_registry.as_ref().map(|r| r.clone()),
+                Exchange::OkxSpot => okx_spot_registry.as_ref().map(|r| r.clone()),
+                _ => None,
+            };
+            
             let processor_handle = tokio::spawn(async move {
                 log::info!("[{}] Starting StreamProcessor for {:?}@{}", processor_index, processor_exchange, processor_symbol);
-                run_stream_processor(raw_rx, processor_tx, processor_symbol, verbose).await
+                // Registry was already cloned outside the closure
+                // processor_registry is captured from outer scope
+                run_stream_processor(raw_rx, processor_tx, processor_symbol, verbose, processor_registry).await
             });
             
             self.connector_handles.push(processor_handle);
@@ -214,6 +251,27 @@ async fn run_application(args: Args) -> Result<()> {
             log::info!("  Output: {}", args.output_parquet.display());
         }
         
+        // Initialize singleton registries for OKX exchanges if needed
+        let okx_registry = match exchange {
+            Exchange::OkxSwap => {
+                log::info!("Initializing OKX SWAP instrument registry");
+                let client = reqwest::Client::new();
+                let registry = exchanges::okx::InstrumentRegistry::initialize_with_instruments(&client, "https://www.okx.com", "SWAP")
+                    .await
+                    .map_err(|e| AppError::connection(format!("Failed to initialize SWAP registry: {}", e)))?;
+                Some(std::sync::Arc::new(registry))
+            }
+            Exchange::OkxSpot => {
+                log::info!("Initializing OKX SPOT instrument registry");
+                let client = reqwest::Client::new();
+                let registry = exchanges::okx::InstrumentRegistry::initialize_with_instruments(&client, "https://www.okx.com", "SPOT")
+                    .await
+                    .map_err(|e| AppError::connection(format!("Failed to initialize SPOT registry: {}", e)))?;
+                Some(std::sync::Arc::new(registry))
+            }
+            Exchange::BinanceFutures => None,
+        };
+        
         // Initialize exchange connector based on CLI args
         let mut connector: Box<dyn ExchangeConnector<Error = AppError>> = match exchange {
             Exchange::BinanceFutures => {
@@ -222,11 +280,11 @@ async fn run_application(args: Args) -> Result<()> {
             }
             Exchange::OkxSwap => {
                 log::info!("Initializing OKX SWAP connector");
-                Box::new(exchanges::okx::OkxConnector::new_swap())
+                Box::new(exchanges::okx::OkxConnector::new_swap(okx_registry.as_ref().unwrap().clone()))
             }
             Exchange::OkxSpot => {
                 log::info!("Initializing OKX SPOT connector");
-                Box::new(exchanges::okx::OkxConnector::new_spot())
+                Box::new(exchanges::okx::OkxConnector::new_spot(okx_registry.as_ref().unwrap().clone()))
             }
         };
 
@@ -274,7 +332,7 @@ async fn run_application(args: Args) -> Result<()> {
             let verbose = args.verbose;
             tokio::spawn(async move {
                 log::info!("Starting stream processor");
-                run_stream_processor(raw_rx, processed_tx, symbol_clone, verbose).await
+                run_stream_processor(raw_rx, processed_tx, symbol_clone, verbose, okx_registry.clone()).await
             })
         };
 
