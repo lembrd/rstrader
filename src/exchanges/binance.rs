@@ -9,6 +9,7 @@ use reqwest::Client;
 
 use crate::exchanges::ExchangeConnector;
 use crate::error::{AppError, Result};
+use fast_float;
 use crate::types::{
     ConnectionStatus, ExchangeId, OrderBookSnapshot, PriceLevel, RawMessage
 };
@@ -102,10 +103,10 @@ impl BinanceFuturesConnector {
     
     /// Parse price level from string array
     fn parse_price_level(level: &[String; 2]) -> Result<PriceLevel> {
-        let price = level[0].parse::<f64>()
+        let price = fast_float::parse::<f64, _>(&level[0])
             .map_err(|e| AppError::parse(format!("Invalid price '{}': {}", level[0], e)))?;
             
-        let qty = level[1].parse::<f64>()
+        let qty = fast_float::parse::<f64, _>(&level[1])
             .map_err(|e| AppError::parse(format!("Invalid quantity '{}': {}", level[1], e)))?;
             
         Ok(PriceLevel { price, qty })

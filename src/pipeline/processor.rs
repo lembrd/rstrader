@@ -1,10 +1,10 @@
 use tokio::sync::mpsc;
 use std::time::SystemTime;
 
-use crate::types::{OrderBookL2Update, RawMessage, Metrics, time};
+use crate::types::{OrderBookL2Update, OrderBookL2UpdateBuilder, RawMessage, Metrics, time};
 use crate::error::{AppError, Result};
 use crate::exchanges::binance::BinanceDepthUpdate;
-use crate::exchanges::okx::parse_okx_message;
+use crate::exchanges::okx::{OkxDepthUpdate, OkxMessage};
 use crate::types::ExchangeId;
 
 /// Stream processor for transforming raw messages to unified format
@@ -50,6 +50,8 @@ impl StreamProcessor {
         // Reuse pre-allocated buffer
         self.updates_buffer.clear();
         
+        let timestamp_micros = time::millis_to_micros(depth_update.event_time);
+        
         // Process bid updates using fast float parsing
         for bid in depth_update.bids {
             let price = fast_float::parse::<f64, _>(&bid[0])
@@ -58,20 +60,18 @@ impl StreamProcessor {
                 .map_err(|e| AppError::pipeline(format!("Invalid bid quantity '{}': {}", bid[1], e)))?;
             
             let seq_id = self.next_sequence_id(); // Extract to avoid borrow conflict
-            self.updates_buffer.push(OrderBookL2Update {
-                timestamp: time::millis_to_micros(depth_update.event_time),
+            let builder = OrderBookL2UpdateBuilder::new(
+                timestamp_micros,
                 rcv_timestamp,
-                exchange: crate::types::ExchangeId::BinanceFutures,
-                ticker: depth_update.symbol.clone(), // TODO: Use symbol interning
+                crate::types::ExchangeId::BinanceFutures,
+                depth_update.symbol.clone(), // TODO: Use symbol interning
                 seq_id,
-                packet_id: packet_id as i64,
-                update_id: depth_update.final_update_id,
-                first_update_id: depth_update.first_update_id,
-                action: crate::types::L2Action::Update,
-                side: crate::types::OrderSide::Bid,
-                price,
-                qty,
-            });
+                packet_id as i64,
+                depth_update.final_update_id,
+                depth_update.first_update_id,
+            );
+            
+            self.updates_buffer.push(builder.build_bid(price, qty));
         }
         
         // Process ask updates using fast float parsing
@@ -82,20 +82,18 @@ impl StreamProcessor {
                 .map_err(|e| AppError::pipeline(format!("Invalid ask quantity '{}': {}", ask[1], e)))?;
             
             let seq_id = self.next_sequence_id(); // Extract to avoid borrow conflict
-            self.updates_buffer.push(OrderBookL2Update {
-                timestamp: time::millis_to_micros(depth_update.event_time),
+            let builder = OrderBookL2UpdateBuilder::new(
+                timestamp_micros,
                 rcv_timestamp,
-                exchange: crate::types::ExchangeId::BinanceFutures,
-                ticker: depth_update.symbol.clone(), // TODO: Use symbol interning
+                crate::types::ExchangeId::BinanceFutures,
+                depth_update.symbol.clone(), // TODO: Use symbol interning
                 seq_id,
-                packet_id: packet_id as i64,
-                update_id: depth_update.final_update_id,
-                first_update_id: depth_update.first_update_id,
-                action: crate::types::L2Action::Update,
-                side: crate::types::OrderSide::Ask,
-                price,
-                qty,
-            });
+                packet_id as i64,
+                depth_update.final_update_id,
+                depth_update.first_update_id,
+            );
+            
+            self.updates_buffer.push(builder.build_ask(price, qty));
         }
         
         // Calculate transformation time
@@ -108,8 +106,120 @@ impl StreamProcessor {
         self.metrics.increment_processed();
         self.metrics.update_message_complexity(bid_count, ask_count, message_bytes);
         
-        Ok(self.updates_buffer.clone())
+        // Update packet metrics (Binance sends 1 message per packet)
+        let entries_in_packet = bid_count + ask_count;
+        self.metrics.update_packet_metrics(1, entries_in_packet, message_bytes);
+        
+        // Return moved buffer instead of cloning
+        Ok(std::mem::take(&mut self.updates_buffer))
     }
+
+    fn process_okx_update(
+        &mut self, 
+        depth_update: &OkxDepthUpdate, 
+        symbol: &str,
+        rcv_timestamp: i64, 
+        packet_id: u64,
+        message_bytes: u32,
+        exchange_id: ExchangeId
+    ) -> Result<Vec<OrderBookL2Update>> {
+        // Reuse pre-allocated buffer
+        self.updates_buffer.clear();
+        
+        // Start transformation timing
+        let transform_start = time::now_micros();
+        
+        // Track total bid/ask count across all data entries
+        let mut total_bid_count = 0u32;
+        let mut total_ask_count = 0u32;
+        
+        for data in &depth_update.data {
+            let timestamp = data.timestamp.parse::<i64>()
+                .map_err(|e| AppError::parse(format!("Invalid timestamp '{}': {}", data.timestamp, e)))?;
+
+            let timestamp_micros = time::millis_to_micros(timestamp);
+            
+            // Calculate overall latency (local time vs exchange timestamp)
+            if let Some(overall_latency) = rcv_timestamp.checked_sub(timestamp_micros) {
+                if overall_latency >= 0 {
+                    self.metrics.update_overall_latency(overall_latency as u64);
+                }
+            }
+            
+            let seq_id = data.seq_id.unwrap_or(0);
+            let first_update_id = data.prev_seq_id.unwrap_or(seq_id);
+
+            // Count bid/ask levels for complexity metrics
+            total_bid_count += data.bids.len() as u32;
+            total_ask_count += data.asks.len() as u32;
+
+            // Process bids
+            for bid_entry in &data.bids {
+                if bid_entry.len() >= 2 {
+                    let price = fast_float::parse::<f64, _>(&bid_entry[0])
+                        .map_err(|e| AppError::pipeline(format!("Invalid bid price '{}': {}", bid_entry[0], e)))?;
+                    let size = fast_float::parse::<f64, _>(&bid_entry[1])
+                        .map_err(|e| AppError::pipeline(format!("Invalid bid size '{}': {}", bid_entry[1], e)))?;
+
+                    let builder = OrderBookL2UpdateBuilder::new(
+                        timestamp_micros,
+                        rcv_timestamp,
+                        exchange_id,
+                        symbol.to_string(),
+                        self.next_sequence_id(),
+                        packet_id as i64,
+                        seq_id,
+                        first_update_id,
+                    );
+                    
+                    self.updates_buffer.push(builder.build_bid(price, size));
+                }
+            }
+
+            // Process asks
+            for ask_entry in &data.asks {
+                if ask_entry.len() >= 2 {
+                    let price = fast_float::parse::<f64, _>(&ask_entry[0])
+                        .map_err(|e| AppError::pipeline(format!("Invalid ask price '{}': {}", ask_entry[0], e)))?;
+                    let size = fast_float::parse::<f64, _>(&ask_entry[1])
+                        .map_err(|e| AppError::pipeline(format!("Invalid ask size '{}': {}", ask_entry[1], e)))?;
+
+                    let builder = OrderBookL2UpdateBuilder::new(
+                        timestamp_micros,
+                        rcv_timestamp,
+                        exchange_id,
+                        symbol.to_string(),
+                        self.next_sequence_id(),
+                        packet_id as i64,
+                        seq_id,
+                        first_update_id,
+                    );
+                    
+                    self.updates_buffer.push(builder.build_ask(price, size));
+                }
+            }
+        }
+        
+        // Calculate transformation time
+        let transform_end = time::now_micros();
+        if let Some(transform_time) = transform_end.checked_sub(transform_start) {
+            self.metrics.update_transform_time(transform_time as u64);
+        }
+        
+        // Update metrics
+        self.metrics.increment_processed();
+        self.metrics.update_message_complexity(total_bid_count, total_ask_count, message_bytes);
+        
+        // Update packet metrics (OKX can send multiple messages in one packet)
+        let messages_in_packet = depth_update.data.len() as u32;
+        let entries_in_packet = total_bid_count + total_ask_count;
+        self.metrics.update_packet_metrics(messages_in_packet, entries_in_packet, message_bytes);
+        
+        // Return moved buffer instead of cloning
+        Ok(std::mem::take(&mut self.updates_buffer))
+    }
+
+
 
     fn next_packet_id(&mut self) -> u64 {
         self.packet_counter += 1;
@@ -152,12 +262,25 @@ impl StreamProcessor {
                 self.process_binance_update(depth_update, rcv_timestamp, packet_id, message_bytes)?
             }
             ExchangeId::OkxSwap | ExchangeId::OkxSpot => {
-                // Parse OKX message
-                parse_okx_message(&raw_msg, symbol, packet_id, rcv_timestamp)
-                    .map_err(|e| {
+                // Parse OKX message JSON to get depth update structure
+                let okx_message: crate::exchanges::okx::OkxMessage = serde_json::from_str(&raw_msg.data).map_err(|e| {
+                    self.metrics.increment_parse_errors();
+                    AppError::pipeline(format!("Failed to parse OKX message JSON: {}", e))
+                })?;
+                
+                match okx_message {
+                    crate::exchanges::okx::OkxMessage::Data(depth_update) => {
+                        self.process_okx_update(&depth_update, symbol, rcv_timestamp, packet_id, message_bytes, raw_msg.exchange_id)?
+                    },
+                    crate::exchanges::okx::OkxMessage::Subscription { .. } => {
+                        // Subscription acknowledgment - no data to process
+                        Vec::new()
+                    },
+                    crate::exchanges::okx::OkxMessage::Error { .. } => {
                         self.metrics.increment_parse_errors();
-                        AppError::pipeline(format!("Failed to parse OKX message: {}", e))
-                    })?
+                        return Err(AppError::pipeline("OKX error message received".to_string()));
+                    }
+                }
             }
         };
 
@@ -213,23 +336,34 @@ impl MessagePipeline {
     }
 }
 
-/// Metrics reporting for verbose output
 pub struct MetricsReporter {
+    symbol: String,
+    exchange: Option<ExchangeId>,
     last_report: std::time::Instant,
     report_interval: std::time::Duration,
 }
 
 impl MetricsReporter {
-    pub fn new(interval_seconds: u64) -> Self {
+    pub fn new(symbol: String, interval_seconds: u64) -> Self {
         Self {
+            symbol,
+            exchange: None,
             last_report: std::time::Instant::now(),
             report_interval: std::time::Duration::from_secs(interval_seconds),
         }
     }
 
+    pub fn set_exchange(&mut self, exchange_id: ExchangeId) {
+        self.exchange = Some(exchange_id);
+    }
+
     pub fn maybe_report(&mut self, metrics: &Metrics) {
         if self.last_report.elapsed() >= self.report_interval {
-            log::info!("📊 Stream Metrics: {}", metrics);
+            let exchange_str = match self.exchange {
+                Some(ref exchange) => format!("{:?}", exchange),
+                None => "Unknown".to_string(),
+            };
+            log::info!("📊 Stream Metrics [{}@{}]: {}", self.symbol, exchange_str, metrics);
             self.last_report = std::time::Instant::now();
         }
     }
@@ -244,7 +378,7 @@ pub async fn run_stream_processor(
 ) -> Result<()> {
     let mut processor = StreamProcessor::new();
     let mut reporter = if verbose {
-        Some(MetricsReporter::new(10)) // Report every 10 seconds
+        Some(MetricsReporter::new(symbol.clone(), 10)) // Report every 10 seconds
     } else {
         None
     };
@@ -252,6 +386,13 @@ pub async fn run_stream_processor(
     log::info!("Stream processor started for {}", symbol);
 
     while let Some(raw_msg) = rx.recv().await {
+        // Set exchange info on first message
+        if let Some(ref mut reporter) = reporter {
+            if reporter.exchange.is_none() {
+                reporter.set_exchange(raw_msg.exchange_id.clone());
+            }
+        }
+
         match processor.process_raw_message(raw_msg, &symbol) {
             Ok(updates) => {
                 for update in updates {
@@ -291,7 +432,7 @@ mod tests {
 
     #[test]
     fn test_metrics_reporter() {
-        let mut reporter = MetricsReporter::new(1);
+        let mut reporter = MetricsReporter::new("TESTBTC".to_string(), 1);
         let metrics = Metrics::default();
         
         // Should not report immediately

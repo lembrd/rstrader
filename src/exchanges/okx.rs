@@ -8,9 +8,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream, Ma
 use tokio::net::TcpStream;
 
 use crate::error::{AppError, Result};
+use fast_float;
 use crate::exchanges::ExchangeConnector;
 use crate::types::{
-    ConnectionStatus, ExchangeId, L2Action, OrderBookL2Update, 
+    ConnectionStatus, ExchangeId, L2Action, OrderBookL2Update, OrderBookL2UpdateBuilder,
     OrderBookSnapshot, OrderSide, PriceLevel, RawMessage
 };
 
@@ -249,10 +250,10 @@ impl OkxConnector {
         // Parse bids
         for bid_entry in depth_data.bids {
             if bid_entry.len() >= 2 {
-                let price = bid_entry[0].parse::<f64>()
-                    .map_err(|e| AppError::parse(format!("Invalid bid price: {}", e)))?;
-                let size = bid_entry[1].parse::<f64>()
-                    .map_err(|e| AppError::parse(format!("Invalid bid size: {}", e)))?;
+                let price = fast_float::parse::<f64, _>(&bid_entry[0])
+                        .map_err(|e| AppError::parse(format!("Invalid bid price '{}': {}", bid_entry[0], e)))?;
+                let size = fast_float::parse::<f64, _>(&bid_entry[1])
+                        .map_err(|e| AppError::parse(format!("Invalid bid size '{}': {}", bid_entry[1], e)))?;
                 
                 bids.push(PriceLevel { price, qty: size });
             }
@@ -261,10 +262,10 @@ impl OkxConnector {
         // Parse asks
         for ask_entry in depth_data.asks {
             if ask_entry.len() >= 2 {
-                let price = ask_entry[0].parse::<f64>()
-                    .map_err(|e| AppError::parse(format!("Invalid ask price: {}", e)))?;
-                let size = ask_entry[1].parse::<f64>()
-                    .map_err(|e| AppError::parse(format!("Invalid ask size: {}", e)))?;
+                let price = fast_float::parse::<f64, _>(&ask_entry[0])
+                        .map_err(|e| AppError::parse(format!("Invalid ask price '{}': {}", ask_entry[0], e)))?;
+                let size = fast_float::parse::<f64, _>(&ask_entry[1])
+                        .map_err(|e| AppError::parse(format!("Invalid ask size '{}': {}", ask_entry[1], e)))?;
                 
                 asks.push(PriceLevel { price, qty: size });
             }
@@ -289,59 +290,55 @@ impl OkxConnector {
         
         for data in &update.data {
             let timestamp = data.timestamp.parse::<i64>()
-                .map_err(|e| AppError::parse(format!("Invalid timestamp: {}", e)))?;
+                .map_err(|e| AppError::parse(format!("Invalid timestamp '{}': {}", data.timestamp, e)))?;
+
+            let timestamp_micros = crate::types::time::millis_to_micros(timestamp);
+            let seq_id = data.seq_id.unwrap_or(0);
+            let first_update_id = data.prev_seq_id.unwrap_or(seq_id);
 
             // Process bids
             for bid_entry in &data.bids {
                 if bid_entry.len() >= 2 {
-                    let price = bid_entry[0].parse::<f64>()
-                        .map_err(|e| AppError::parse(format!("Invalid bid price: {}", e)))?;
-                    let size = bid_entry[1].parse::<f64>()
-                        .map_err(|e| AppError::parse(format!("Invalid bid size: {}", e)))?;
+                    let price = fast_float::parse::<f64, _>(&bid_entry[0])
+                        .map_err(|e| AppError::parse(format!("Invalid bid price '{}': {}", bid_entry[0], e)))?;
+                    let size = fast_float::parse::<f64, _>(&bid_entry[1])
+                        .map_err(|e| AppError::parse(format!("Invalid bid size '{}': {}", bid_entry[1], e)))?;
 
-                    let action = if size == 0.0 { L2Action::Delete } else { L2Action::Update };
-
-                    updates.push(OrderBookL2Update {
-                        timestamp: crate::types::time::millis_to_micros(timestamp),
+                    let builder = OrderBookL2UpdateBuilder::new(
+                        timestamp_micros,
                         rcv_timestamp,
-                        exchange: self.exchange_id,
-                        ticker: symbol.to_string(),
-                        seq_id: data.seq_id.unwrap_or(0),
-                        packet_id: packet_id as i64,
-                        update_id: data.seq_id.unwrap_or(0),
-                        first_update_id: data.prev_seq_id.unwrap_or(data.seq_id.unwrap_or(0)),
-                        action,
-                        side: OrderSide::Bid,
-                        price,
-                        qty: size,
-                    });
+                        self.exchange_id,
+                        symbol.to_string(),
+                        seq_id,
+                        packet_id as i64,
+                        seq_id,
+                        first_update_id,
+                    );
+                    
+                    updates.push(builder.build_bid(price, size));
                 }
             }
 
             // Process asks
             for ask_entry in &data.asks {
                 if ask_entry.len() >= 2 {
-                    let price = ask_entry[0].parse::<f64>()
-                        .map_err(|e| AppError::parse(format!("Invalid ask price: {}", e)))?;
-                    let size = ask_entry[1].parse::<f64>()
-                        .map_err(|e| AppError::parse(format!("Invalid ask size: {}", e)))?;
+                    let price = fast_float::parse::<f64, _>(&ask_entry[0])
+                        .map_err(|e| AppError::parse(format!("Invalid ask price '{}': {}", ask_entry[0], e)))?;
+                    let size = fast_float::parse::<f64, _>(&ask_entry[1])
+                        .map_err(|e| AppError::parse(format!("Invalid ask size '{}': {}", ask_entry[1], e)))?;
 
-                    let action = if size == 0.0 { L2Action::Delete } else { L2Action::Update };
-
-                    updates.push(OrderBookL2Update {
-                        timestamp: crate::types::time::millis_to_micros(timestamp),
+                    let builder = OrderBookL2UpdateBuilder::new(
+                        timestamp_micros,
                         rcv_timestamp,
-                        exchange: self.exchange_id,
-                        ticker: symbol.to_string(),
-                        seq_id: data.seq_id.unwrap_or(0),
-                        packet_id: packet_id as i64,
-                        update_id: data.seq_id.unwrap_or(0),
-                        first_update_id: data.prev_seq_id.unwrap_or(data.seq_id.unwrap_or(0)),
-                        action,
-                        side: OrderSide::Ask,
-                        price,
-                        qty: size,
-                    });
+                        self.exchange_id,
+                        symbol.to_string(),
+                        seq_id,
+                        packet_id as i64,
+                        seq_id,
+                        first_update_id,
+                    );
+                    
+                    updates.push(builder.build_ask(price, size));
                 }
             }
         }

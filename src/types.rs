@@ -21,6 +21,79 @@ pub struct OrderBookL2Update {
     pub qty: f64,             // Quantity (0 = delete level)
 }
 
+/// Builder for OrderBookL2Update to eliminate code duplication
+pub struct OrderBookL2UpdateBuilder {
+    timestamp: i64,
+    rcv_timestamp: i64,
+    exchange: ExchangeId,
+    ticker: String,
+    seq_id: i64,
+    packet_id: i64,
+    update_id: i64,
+    first_update_id: i64,
+}
+
+impl OrderBookL2UpdateBuilder {
+    /// Create a new builder with required common fields
+    pub fn new(
+        timestamp: i64,
+        rcv_timestamp: i64,
+        exchange: ExchangeId,
+        ticker: String,
+        seq_id: i64,
+        packet_id: i64,
+        update_id: i64,
+        first_update_id: i64,
+    ) -> Self {
+        Self {
+            timestamp,
+            rcv_timestamp,
+            exchange,
+            ticker,
+            seq_id,
+            packet_id,
+            update_id,
+            first_update_id,
+        }
+    }
+
+    /// Build a bid update
+    pub fn build_bid(self, price: f64, qty: f64) -> OrderBookL2Update {
+        OrderBookL2Update {
+            timestamp: self.timestamp,
+            rcv_timestamp: self.rcv_timestamp,
+            exchange: self.exchange,
+            ticker: self.ticker,
+            seq_id: self.seq_id,
+            packet_id: self.packet_id,
+            update_id: self.update_id,
+            first_update_id: self.first_update_id,
+            action: if qty == 0.0 { L2Action::Delete } else { L2Action::Update },
+            side: OrderSide::Bid,
+            price,
+            qty,
+        }
+    }
+
+    /// Build an ask update
+    pub fn build_ask(self, price: f64, qty: f64) -> OrderBookL2Update {
+        OrderBookL2Update {
+            timestamp: self.timestamp,
+            rcv_timestamp: self.rcv_timestamp,
+            exchange: self.exchange,
+            ticker: self.ticker,
+            seq_id: self.seq_id,
+            packet_id: self.packet_id,
+            update_id: self.update_id,
+            first_update_id: self.first_update_id,
+            action: if qty == 0.0 { L2Action::Delete } else { L2Action::Update },
+            side: OrderSide::Ask,
+            price,
+            qty,
+        }
+    }
+}
+
 /// L2 order book action types
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum L2Action {
@@ -136,6 +209,11 @@ pub struct Metrics {
     pub avg_message_bytes: f64,
     pub total_message_bytes: u64,
     
+    // Packet aggregation metrics
+    pub messages_per_packet: f64,           // Average messages per packet
+    pub market_data_entries_per_packet: f64, // Average bid/ask entries per packet
+    pub avg_packet_size_bytes: f64,          // Average packet size in bytes
+    
     // Timing breakdown metrics
     pub last_parse_time_us: Option<u64>,       // JSON parsing only
     pub avg_parse_time_us: Option<f64>,
@@ -150,6 +228,7 @@ pub struct Metrics {
     parse_time_count: u64,
     transform_time_count: u64,
     overhead_time_count: u64,
+    packet_count: u64,
 }
 
 impl Metrics {
@@ -256,6 +335,20 @@ impl Metrics {
         }
     }
 
+    pub fn update_packet_metrics(&mut self, messages_in_packet: u32, entries_in_packet: u32, packet_size_bytes: u32) {
+        self.packet_count += 1;
+        
+        // Update messages per packet average
+        let packet_count_f64 = self.packet_count as f64;
+        self.messages_per_packet = (self.messages_per_packet * (packet_count_f64 - 1.0) + messages_in_packet as f64) / packet_count_f64;
+        
+        // Update market data entries per packet average  
+        self.market_data_entries_per_packet = (self.market_data_entries_per_packet * (packet_count_f64 - 1.0) + entries_in_packet as f64) / packet_count_f64;
+        
+        // Update average packet size
+        self.avg_packet_size_bytes = (self.avg_packet_size_bytes * (packet_count_f64 - 1.0) + packet_size_bytes as f64) / packet_count_f64;
+    }
+
     pub fn update_message_bytes(&mut self, bytes: u32) {
         self.last_message_bytes = bytes;
         self.total_message_bytes += bytes as u64;
@@ -278,7 +371,7 @@ impl Metrics {
 
 impl std::fmt::Display for Metrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "received: {}, processed: {}, errors: {}, connections: {}, reconnections: {}", 
+        write!(f, "packets_received: {}, orderbook_updates: {}, errors: {}, connections: {}, reconnections: {}", 
                self.messages_received, self.messages_processed, self.parse_errors, 
                self.connection_attempts, self.reconnections)?;
         
@@ -296,6 +389,13 @@ impl std::fmt::Display for Metrics {
         
         if let Some(avg_overall) = self.avg_overall_latency_us {
             write!(f, ", avg_overall: {:.1}μs", avg_overall)?;
+        }
+        
+        // Add new packet metrics
+        if self.packet_count > 0 {
+            write!(f, ", avg_packet_size: {:.0}B", self.avg_packet_size_bytes)?;
+            write!(f, ", avg_md_entries: {:.1}/pkt", self.market_data_entries_per_packet)?;
+            write!(f, ", avg_msgs: {:.1}/pkt", self.messages_per_packet)?;
         }
         
         if let Some(throughput) = self.throughput_msgs_per_sec {
