@@ -12,7 +12,7 @@ use crate::error::{AppError, Result};
 use crate::exchanges::ExchangeConnector;
 use crate::types::{
     ConnectionStatus, ExchangeId, L2Action, OrderBookL2Update, OrderBookL2UpdateBuilder,
-    OrderBookSnapshot, OrderSide, PriceLevel, RawMessage,
+    OrderBookSnapshot, OrderSide, PriceLevel, RawMessage, TradeUpdate, TradeSide,
 };
 use fast_float;
 
@@ -73,6 +73,31 @@ pub struct OkxDepthData {
     pub prev_seq_id: Option<i64>,
     #[serde(rename = "seqId")]
     pub seq_id: Option<i64>,
+}
+
+/// OKX trade update structure
+#[derive(Debug, Clone, Deserialize)]
+pub struct OkxTradeUpdate {
+    #[serde(rename = "arg")]
+    pub arg: OkxChannelArg,
+    #[serde(rename = "data")]
+    pub data: Vec<OkxTradeData>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OkxTradeData {
+    #[serde(rename = "instId")]
+    pub inst_id: String, // Instrument ID (e.g., "BTC-USDT-SWAP")
+    #[serde(rename = "tradeId")]
+    pub trade_id: String, // Trade ID
+    #[serde(rename = "px")]
+    pub price: String, // Trade price
+    #[serde(rename = "sz")]
+    pub size: String, // Trade size
+    #[serde(rename = "side")]
+    pub side: String, // Trade side: "buy" or "sell"
+    #[serde(rename = "ts")]
+    pub timestamp: String, // Trade timestamp
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -558,6 +583,71 @@ impl OkxConnector {
 
         Ok(updates)
     }
+
+    /// Parse trade update from OKX WebSocket message
+    fn parse_trade_update(&self, text: &str) -> Result<OkxTradeUpdate> {
+        serde_json::from_str(text)
+            .map_err(|e| AppError::parse(format!("Failed to parse OKX trade update: {}", e)))
+    }
+
+    /// Convert OKX trade update to internal TradeUpdate format
+    fn convert_trade_update(&self, trade_data: &OkxTradeData, rcv_timestamp: i64, packet_id: i64) -> Result<TradeUpdate> {
+        let price = fast_float::parse::<f64, _>(&trade_data.price)
+            .map_err(|e| AppError::parse(format!("Invalid trade price '{}': {}", trade_data.price, e)))?;
+        
+        let raw_size = fast_float::parse::<f64, _>(&trade_data.size)
+            .map_err(|e| AppError::parse(format!("Invalid trade size '{}': {}", trade_data.size, e)))?;
+
+        // Get instrument metadata for unit conversion
+        let metadata = self.instrument_registry.get_metadata(&trade_data.inst_id)?;
+        let qty = metadata.normalize_quantity(raw_size);
+
+        let trade_side = match trade_data.side.as_str() {
+            "buy" => TradeSide::Buy,
+            "sell" => TradeSide::Sell,
+            _ => return Err(AppError::parse(format!("Invalid trade side: {}", trade_data.side))),
+        };
+
+        let timestamp = trade_data.timestamp.parse::<i64>()
+            .map_err(|e| AppError::parse(format!("Invalid timestamp '{}': {}", trade_data.timestamp, e)))?;
+
+        // Convert symbol back to standard format (BTC-USDT-SWAP -> BTCUSDT)
+        let ticker = self.convert_symbol_from_okx(&trade_data.inst_id);
+
+        Ok(TradeUpdate {
+            timestamp: crate::types::time::millis_to_micros(timestamp),
+            rcv_timestamp,
+            exchange: self.exchange_id,
+            ticker,
+            seq_id: trade_data.trade_id.parse().unwrap_or(0),
+            packet_id,
+            trade_id: trade_data.trade_id.clone(),
+            order_id: None, // OKX doesn't provide order ID in trade stream
+            side: trade_side,
+            price,
+            qty,
+            is_buyer_maker: trade_data.side == "sell", // In OKX, "sell" means seller was maker
+        })
+    }
+
+    /// Convert OKX symbol format back to standard format
+    fn convert_symbol_from_okx(&self, okx_symbol: &str) -> String {
+        match self.exchange_id {
+            ExchangeId::OkxSwap => {
+                // Convert BTC-USDT-SWAP -> BTCUSDT
+                if let Some(base_part) = okx_symbol.strip_suffix("-SWAP") {
+                    base_part.replace('-', "")
+                } else {
+                    okx_symbol.replace('-', "")
+                }
+            }
+            ExchangeId::OkxSpot => {
+                // Convert BTC-USDT -> BTCUSDT
+                okx_symbol.replace('-', "")
+            }
+            _ => okx_symbol.to_string(),
+        }
+    }
 }
 
 #[async_trait]
@@ -606,6 +696,12 @@ impl ExchangeConnector for OkxConnector {
 
         self.sync_state = OkxSyncState::Subscribed;
         Ok(())
+    }
+
+    async fn subscribe_trades(&mut self, symbol: &str) -> Result<()> {
+        // For OKX, trades and L2 use the same connection mechanism
+        // Delegate to the existing subscribe_l2 method
+        self.subscribe_l2(symbol).await
     }
 
     async fn next_message(&mut self) -> Result<Option<RawMessage>> {
@@ -713,12 +809,62 @@ impl ExchangeConnector for OkxConnector {
 
     async fn start_trade_stream(
         &mut self,
-        _symbol: &str,
-        _tx: tokio::sync::mpsc::Sender<RawMessage>,
+        symbol: &str,
+        tx: tokio::sync::mpsc::Sender<RawMessage>,
     ) -> Result<()> {
-        Err(AppError::connection(
-            "Trade streams not implemented for OKX yet".to_string(),
-        ))
+        self.connect().await?;
+        
+        let okx_symbol = self.convert_symbol(symbol);
+        let ws_stream = self
+            .ws_stream
+            .as_mut()
+            .ok_or_else(|| AppError::connection("WebSocket not connected".to_string()))?;
+
+        // Subscribe to trades channel
+        let subscribe_msg = serde_json::json!({
+            "op": "subscribe",
+            "args": [{
+                "channel": "trades",
+                "instId": okx_symbol
+            }]
+        });
+
+        let message = Message::Text(subscribe_msg.to_string());
+        ws_stream
+            .send(message)
+            .await
+            .map_err(|e| AppError::connection(format!("Failed to send trade subscription: {}", e)))?;
+
+        log::info!("OKX trade stream subscribed for {}", symbol);
+
+        // Message forwarding loop
+        while let Some(message_result) = ws_stream.next().await {
+            match message_result {
+                Ok(Message::Text(text)) => {
+                    let raw_message = RawMessage {
+                        exchange_id: self.exchange_id,
+                        data: text,
+                        timestamp: SystemTime::now(),
+                    };
+
+                    if tx.send(raw_message).await.is_err() {
+                        log::info!("OKX trade stream channel closed, stopping");
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) => {
+                    log::warn!("OKX trade WebSocket connection closed");
+                    break;
+                }
+                Ok(_) => continue, // Ignore other message types
+                Err(e) => {
+                    log::error!("OKX trade WebSocket error: {}", e);
+                    return Err(AppError::connection(format!("WebSocket error: {}", e)));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -854,6 +1000,25 @@ impl OkxProcessor {
                 }
             }
             _ => symbol.to_string(),
+        }
+    }
+
+    /// Convert OKX symbol format back to standard format
+    fn convert_symbol_from_okx(&self, okx_symbol: &str) -> String {
+        match self.exchange_id {
+            crate::types::ExchangeId::OkxSwap => {
+                // Convert BTC-USDT-SWAP -> BTCUSDT
+                if let Some(base_part) = okx_symbol.strip_suffix("-SWAP") {
+                    base_part.replace('-', "")
+                } else {
+                    okx_symbol.replace('-', "")
+                }
+            }
+            crate::types::ExchangeId::OkxSpot => {
+                // Convert BTC-USDT -> BTCUSDT
+                okx_symbol.replace('-', "")
+            }
+            _ => okx_symbol.to_string(),
         }
     }
 }
@@ -1095,7 +1260,129 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         Ok(std::mem::take(&mut self.base.updates_buffer))
     }
 
-    // Default implementations from trait are used
+    fn process_trade_message(
+        &mut self,
+        raw_msg: crate::types::RawMessage,
+        _symbol: &str,
+        rcv_timestamp: i64,
+        packet_id: u64,
+        message_bytes: u32,
+    ) -> std::result::Result<Vec<crate::types::TradeUpdate>, Self::Error> {
+        // Track message received
+        self.base.metrics.increment_received();
+
+        // Calculate packet arrival timestamp (when network packet was received)
+        let packet_arrival_us = raw_msg
+            .timestamp
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+
+        // Parse OKX trade message with timing
+        let parse_start = crate::types::time::now_micros();
+        let mut data_bytes = raw_msg.data.into_bytes();
+        let trade_message: OkxTradeUpdate =
+            serde_json::from_slice(&mut data_bytes).map_err(|e| {
+                self.base.metrics.increment_parse_errors();
+                crate::error::AppError::pipeline(format!("Failed to parse OKX trade message: {}", e))
+            })?;
+
+        // Calculate parse time
+        let parse_end = crate::types::time::now_micros();
+        if let Some(parse_time) = parse_end.checked_sub(parse_start) {
+            self.base.metrics.update_parse_time(parse_time as u64);
+        }
+
+        // Start transformation timing
+        let transform_start = crate::types::time::now_micros();
+
+        // Calculate overhead time (time between parse end and transform start)
+        if let Some(overhead_time) = transform_start.checked_sub(parse_end) {
+            self.base.metrics.update_overhead_time(overhead_time as u64);
+        }
+
+        let mut trades = Vec::new();
+
+        // Process each trade in the data array
+        for trade_data in trade_message.data {
+            // Parse timestamp
+            let timestamp_millis = trade_data.timestamp.parse::<i64>().map_err(|e| {
+                crate::error::AppError::pipeline(format!("Invalid trade timestamp '{}': {}", trade_data.timestamp, e))
+            })?;
+
+            // Calculate overall latency (local time vs exchange timestamp)
+            let exchange_timestamp_us = crate::types::time::millis_to_micros(timestamp_millis);
+            if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
+                if overall_latency >= 0 {
+                    self.base
+                        .metrics
+                        .update_overall_latency(overall_latency as u64);
+                }
+            }
+
+            // Parse price and quantity
+            let price = fast_float::parse::<f64, _>(&trade_data.price).map_err(|e| {
+                crate::error::AppError::pipeline(format!("Invalid trade price '{}': {}", trade_data.price, e))
+            })?;
+            
+            let qty = fast_float::parse::<f64, _>(&trade_data.size).map_err(|e| {
+                crate::error::AppError::pipeline(format!("Invalid trade quantity '{}': {}", trade_data.size, e))
+            })?;
+
+            let trade_side = match trade_data.side.as_str() {
+                "buy" => crate::types::TradeSide::Buy,
+                "sell" => crate::types::TradeSide::Sell,
+                _ => return Err(crate::error::AppError::pipeline(format!("Invalid trade side: {}", trade_data.side))),
+            };
+
+            // Convert OKX symbol to standard format
+            let converted_symbol = self.convert_symbol_from_okx(&trade_data.inst_id);
+
+            let seq_id = self.next_sequence_id();
+            let trade = crate::types::TradeUpdate {
+                timestamp: crate::types::time::millis_to_micros(timestamp_millis),
+                rcv_timestamp,
+                exchange: self.exchange_id,
+                ticker: converted_symbol,
+                seq_id,
+                packet_id: packet_id as i64,
+                trade_id: trade_data.trade_id,
+                order_id: None, // OKX doesn't provide order IDs in public trade stream
+                side: trade_side,
+                price,
+                qty,
+                is_buyer_maker: false, // OKX doesn't provide maker/taker info in public trade stream
+            };
+
+            trades.push(trade);
+        }
+
+        // Calculate transformation time
+        let transform_end = crate::types::time::now_micros();
+        if let Some(transform_time) = transform_end.checked_sub(transform_start) {
+            self.base
+                .metrics
+                .update_transform_time(transform_time as u64);
+        }
+
+        // Update metrics
+        self.base.metrics.increment_processed();
+        self.base.metrics.update_message_complexity(0, 0, message_bytes); // Trade message has no bid/ask levels
+
+        // Update packet metrics
+        let trade_count = trades.len() as u32;
+        self.base.metrics.update_packet_metrics(1, trade_count, message_bytes);
+
+        // Calculate CODE LATENCY: From network packet arrival to business logic ready
+        let processing_complete = crate::types::time::now_micros();
+        if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
+            if code_latency >= 0 {
+                self.base.metrics.update_code_latency(code_latency as u64);
+            }
+        }
+
+        Ok(trades)
+    }
 }
 
 #[cfg(test)]

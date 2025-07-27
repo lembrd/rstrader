@@ -108,6 +108,21 @@ struct DeribitOrderBookData {
     timestamp: u64,
 }
 
+// Trade data structures for Deribit
+#[derive(Debug, Deserialize)]
+pub struct DeribitTradeData {
+    pub trade_seq: u64,
+    pub trade_id: String,
+    pub timestamp: u64,
+    pub tick_direction: i32, // 0 = uptick, 1 = zerouptickreule, 2 = downtick, 3 = zerodowntickreule
+    pub price: f64,
+    pub mark_price: Option<f64>,
+    pub instrument_name: String,
+    pub index_price: Option<f64>,
+    pub direction: String, // "buy" or "sell"
+    pub amount: f64,
+}
+
 #[derive(Debug)]
 struct DeribitLevel {
     action: String,  // "new", "change", "delete"
@@ -491,6 +506,52 @@ impl DeribitConnector {
 
         Ok(())
     }
+
+    /// Subscribe to trade stream for the given instrument
+    async fn subscribe_trades_internal(&mut self, instrument: &str) -> Result<(), AppError> {
+        let channel = format!("trades.{}.raw", instrument);
+
+        let params = json!({
+            "channels": [&channel]
+        });
+
+        let _: Value = self
+            .send_rpc_request("public/subscribe", Some(params))
+            .await?;
+
+        // Track subscription for fast message routing
+        self.active_subscriptions
+            .insert(channel, instrument.to_string());
+
+        Ok(())
+    }
+
+    /// Convert Deribit trade data to internal TradeUpdate format
+    fn convert_trade_update(&self, trade: &DeribitTradeData, rcv_timestamp: i64, packet_id: i64) -> Result<TradeUpdate, AppError> {
+        let trade_side = match trade.direction.as_str() {
+            "buy" => TradeSide::Buy,
+            "sell" => TradeSide::Sell,
+            _ => return Err(AppError::parse(format!("Invalid trade direction: {}", trade.direction))),
+        };
+
+        // Convert symbol format (BTC-PERPETUAL -> BTCPERP)
+        let ticker = trade.instrument_name.replace('-', "");
+
+        Ok(TradeUpdate {
+            timestamp: crate::types::time::millis_to_micros(trade.timestamp as i64),
+            rcv_timestamp,
+            exchange: ExchangeId::Deribit,
+            ticker,
+            seq_id: trade.trade_seq as i64,
+            packet_id,
+            trade_id: trade.trade_id.clone(),
+            order_id: None, // Deribit doesn't provide order ID in trade stream
+            side: trade_side,
+            price: trade.price,
+            qty: trade.amount,
+            is_buyer_maker: trade.direction == "sell", // Sell orders are typically from makers
+        })
+    }
 }
 
 #[async_trait]
@@ -535,6 +596,12 @@ impl ExchangeConnector for DeribitConnector {
         self.subscribe_l2_internal(symbol)
             .await
             .map_err(|e| AppError::stream(format!("L2 subscription failed: {}", e)))
+    }
+
+    async fn subscribe_trades(&mut self, symbol: &str) -> Result<(), Self::Error> {
+        // For Deribit, trades and L2 use the same connection mechanism
+        // Delegate to the existing subscribe_l2 method
+        self.subscribe_l2(symbol).await
     }
 
     async fn next_message(&mut self) -> Result<Option<RawMessage>, Self::Error> {
@@ -606,8 +673,18 @@ impl ExchangeConnector for DeribitConnector {
         symbol: &str,
         tx: tokio::sync::mpsc::Sender<RawMessage>,
     ) -> Result<(), Self::Error> {
-        // Similar to depth stream but for trades
-        // TODO: Implement trade subscription
+        self.subscribe_trades_internal(symbol).await?;
+
+        log::info!("Deribit trade stream subscribed for {}", symbol);
+
+        // Message forwarding loop (this would typically run in a separate task)
+        while let Some(message) = self.next_message().await? {
+            if tx.send(message).await.is_err() {
+                log::info!("Deribit trade stream channel closed, stopping");
+                break; // Channel closed
+            }
+        }
+
         Ok(())
     }
 
@@ -805,6 +882,121 @@ impl ExchangeProcessor for DeribitProcessor {
                 }
 
                 return Ok(updates);
+            }
+        }
+
+        Ok(vec![])
+    }
+
+    fn process_trade_message(
+        &mut self,
+        raw_msg: crate::types::RawMessage,
+        _symbol: &str,
+        rcv_timestamp: i64,
+        packet_id: u64,
+        message_bytes: u32,
+    ) -> Result<Vec<crate::types::TradeUpdate>, Self::Error> {
+        // Track message received
+        self.base_processor.metrics.increment_received();
+
+        let packet_arrival_us = rcv_timestamp;
+
+        // Start parsing timer
+        let parse_start = crate::types::time::now_micros();
+
+        // Parse the notification
+        let notification: DeribitNotification =
+            serde_json::from_str(&raw_msg.data).map_err(|e| crate::error::AppError::Pipeline {
+                message: format!("Failed to parse Deribit trade message: {}", e),
+            })?;
+
+        // Calculate parse time
+        let parse_end = crate::types::time::now_micros();
+        if let Some(parse_time) = parse_end.checked_sub(parse_start) {
+            self.base_processor.metrics.update_parse_time(parse_time as u64);
+        }
+
+        if notification.method == "subscription" {
+            // Check if this is a trade update
+            if notification.params.channel.starts_with("trades.") {
+                // Start transformation timer
+                let transform_start = crate::types::time::now_micros();
+
+                // Parse trade data - it comes as an array
+                let trade_data_array: Vec<DeribitTradeData> =
+                    serde_json::from_value(notification.params.data).map_err(|e| {
+                        crate::error::AppError::Pipeline {
+                            message: format!("Failed to parse Deribit trade data: {}", e),
+                        }
+                    })?;
+
+                let mut trades = Vec::new();
+
+                // Process each trade in the array
+                for trade_data in trade_data_array {
+                    // Calculate overall latency (exchange timestamp to receive timestamp)
+                    let exchange_timestamp_us = crate::types::time::millis_to_micros(trade_data.timestamp as i64);
+                    if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
+                        if overall_latency >= 0 {
+                            self.base_processor.metrics.update_overall_latency(overall_latency as u64);
+                        }
+                    }
+
+                    let trade_side = match trade_data.direction.as_str() {
+                        "buy" => crate::types::TradeSide::Buy,
+                        "sell" => crate::types::TradeSide::Sell,
+                        _ => return Err(crate::error::AppError::Pipeline {
+                            message: format!("Invalid trade direction: {}", trade_data.direction),
+                        }),
+                    };
+
+                    // Convert symbol format (BTC-PERPETUAL -> BTCPERP)
+                    let ticker = trade_data.instrument_name.replace('-', "");
+
+                    let seq_id = self.next_sequence_id();
+                    let trade = crate::types::TradeUpdate {
+                        timestamp: crate::types::time::millis_to_micros(trade_data.timestamp as i64),
+                        rcv_timestamp,
+                        exchange: crate::types::ExchangeId::Deribit,
+                        ticker,
+                        seq_id,
+                        packet_id: packet_id as i64,
+                        trade_id: trade_data.trade_id,
+                        order_id: None, // Deribit doesn't provide order ID in trade stream
+                        side: trade_side,
+                        price: trade_data.price,
+                        qty: trade_data.amount,
+                        is_buyer_maker: trade_data.direction == "sell", // Sell orders are typically from makers
+                    };
+
+                    trades.push(trade);
+                }
+
+                // Calculate transformation time
+                let transform_end = crate::types::time::now_micros();
+                if let Some(transform_time) = transform_end.checked_sub(transform_start) {
+                    self.base_processor
+                        .metrics
+                        .update_transform_time(transform_time as u64);
+                }
+
+                // Update metrics
+                self.base_processor.metrics.increment_processed();
+                self.base_processor.metrics.update_message_complexity(0, 0, message_bytes); // Trade message has no bid/ask levels
+
+                // Update packet metrics
+                let trade_count = trades.len() as u32;
+                self.base_processor.metrics.update_packet_metrics(1, trade_count, message_bytes);
+
+                // Calculate CODE LATENCY: From network packet arrival to business logic ready
+                let processing_complete = crate::types::time::now_micros();
+                if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
+                    if code_latency >= 0 {
+                        self.base_processor.metrics.update_code_latency(code_latency as u64);
+                    }
+                }
+
+                return Ok(trades);
             }
         }
 

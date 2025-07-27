@@ -8,13 +8,9 @@ mod types;
 
 use clap::Parser;
 use cli::Args;
-use cli::SubscriptionSpec;
 use error::{AppError, Result};
-use exchanges::ExchangeConnector;
 use futures_util::FutureExt;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use types::OrderBookL2Update;
+use types::StreamData;
 
 
 
@@ -60,11 +56,11 @@ async fn main() -> Result<()> {
 }
 
 async fn run_application(args: Args) -> Result<()> {
-    use output::parquet::run_parquet_sink;
+    use output::run_multi_stream_parquet_sink;
     use tokio::sync::mpsc;
 
-    // Create communication channels
-    let (processed_tx, processed_rx) = mpsc::channel(10000);
+    // Create communication channel for unified stream data
+    let (stream_tx, stream_rx) = mpsc::channel::<StreamData>(10000);
 
     // Get subscriptions
     let subscriptions = args
@@ -86,7 +82,7 @@ async fn run_application(args: Args) -> Result<()> {
                 sub.instrument
             );
         }
-        log::info!("  Output: {}", args.output_parquet.display());
+        log::info!("  Output: {}", args.output_directory.display());
     }
 
     // Initialize OKX registries
@@ -96,15 +92,15 @@ async fn run_application(args: Args) -> Result<()> {
     // Create optimized subscription manager with unified handlers
     let mut manager = subscription_manager::SubscriptionManager::new(subscriptions, args.verbose);
     manager
-        .spawn_all_subscriptions(processed_tx, okx_swap_registry, okx_spot_registry)
+        .spawn_all_subscriptions(stream_tx, okx_swap_registry, okx_spot_registry)
         .await?;
 
-    // Start Parquet sink task
+    // Start Multi-Stream Parquet sink task
     let mut sink_handle = {
-        let output_path = args.output_parquet.clone();
+        let output_directory = args.output_directory.clone();
         tokio::spawn(async move {
-            log::info!("Starting Parquet sink");
-            run_parquet_sink(processed_rx, output_path).await
+            log::info!("Starting Multi-Stream Parquet sink");
+            run_multi_stream_parquet_sink(stream_rx, output_directory).await
         })
     };
 
@@ -153,6 +149,7 @@ async fn run_application(args: Args) -> Result<()> {
     // Shutdown handlers and finalize Parquet sink
     log::info!("Shutting down unified handlers and finalizing Parquet sink...");
     manager.shutdown().await;
+    
     match sink_handle.await {
         Ok(Ok(_)) => log::info!("Parquet sink finalized successfully"),
         Ok(Err(e)) => {

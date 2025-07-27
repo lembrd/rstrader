@@ -108,6 +108,141 @@ pub enum L2Action {
     Update = 1,
     Delete = 2,
 }
+/// Trade update data structure for trade stream types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeUpdate {
+    // Common fields (matching L2 structure)
+    pub timestamp: i64,       // Exchange timestamp (microseconds UTC)
+    pub rcv_timestamp: i64,   // Local receive timestamp (microseconds UTC)
+    pub exchange: ExchangeId, // Exchange identifier
+    pub ticker: String,       // Instrument symbol (e.g., "BTCUSDT")
+    pub seq_id: i64,          // Local monotonic sequence ID
+    pub packet_id: i64,       // Network packet grouping ID
+
+    // Trade specific fields
+    pub trade_id: String,     // Exchange-specific trade ID
+    pub order_id: Option<String>, // Order ID if available
+    pub side: TradeSide,      // BUY/SELL (direction of taker)
+    pub price: f64,           // Trade execution price
+    pub qty: f64,             // Trade quantity
+    pub is_buyer_maker: bool, // Was buyer the maker (false = buyer was taker)
+}
+
+/// Trade side enumeration (direction of taker)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum TradeSide {
+    Buy = 1,  // Taker bought (aggressor was buyer)
+    Sell = -1, // Taker sold (aggressor was seller)
+}
+
+impl std::fmt::Display for TradeSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TradeSide::Buy => write!(f, "BUY"),
+            TradeSide::Sell => write!(f, "SELL"),
+        }
+    }
+}
+
+/// Builder for TradeUpdate to maintain consistency with L2 pattern
+pub struct TradeUpdateBuilder {
+    timestamp: i64,
+    rcv_timestamp: i64,
+    exchange: ExchangeId,
+    ticker: String,
+    seq_id: i64,
+    packet_id: i64,
+    trade_id: String,
+    order_id: Option<String>,
+}
+
+impl TradeUpdateBuilder {
+    /// Create a new trade builder with required common fields
+    pub fn new(
+        timestamp: i64,
+        rcv_timestamp: i64,
+        exchange: ExchangeId,
+        ticker: String,
+        seq_id: i64,
+        packet_id: i64,
+        trade_id: String,
+        order_id: Option<String>,
+    ) -> Self {
+        Self {
+            timestamp,
+            rcv_timestamp,
+            exchange,
+            ticker,
+            seq_id,
+            packet_id,
+            trade_id,
+            order_id,
+        }
+    }
+
+    /// Build a trade update
+    pub fn build(self, side: TradeSide, price: f64, qty: f64, is_buyer_maker: bool) -> TradeUpdate {
+        TradeUpdate {
+            timestamp: self.timestamp,
+            rcv_timestamp: self.rcv_timestamp,
+            exchange: self.exchange,
+            ticker: self.ticker,
+            seq_id: self.seq_id,
+            packet_id: self.packet_id,
+            trade_id: self.trade_id,
+            order_id: self.order_id,
+            side,
+            price,
+            qty,
+            is_buyer_maker,
+        }
+    }
+}
+
+/// Enum to identify stream types
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamType {
+    L2,
+    Trade,
+}
+/// Unified enum for different stream data types
+#[derive(Debug, Clone)]
+pub enum StreamData {
+    L2(OrderBookL2Update),
+    Trade(TradeUpdate),
+}
+
+impl StreamData {
+    /// Get the stream type identifier
+    pub fn stream_type(&self) -> &'static str {
+        match self {
+            StreamData::L2(_) => "L2",
+            StreamData::Trade(_) => "TRADES",
+        }
+    }
+
+    /// Get common fields for any stream type
+    pub fn common_fields(&self) -> (i64, i64, ExchangeId, &str, i64, i64) {
+        match self {
+            StreamData::L2(update) => (
+                update.timestamp,
+                update.rcv_timestamp,
+                update.exchange,
+                &update.ticker,
+                update.seq_id,
+                update.packet_id,
+            ),
+            StreamData::Trade(update) => (
+                update.timestamp,
+                update.rcv_timestamp,
+                update.exchange,
+                &update.ticker,
+                update.seq_id,
+                update.packet_id,
+            ),
+        }
+    }
+}
 
 impl std::fmt::Display for L2Action {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -65,6 +65,9 @@ pub trait ExchangeConnector: Send + Sync {
     /// Subscribe to L2 order book depth stream
     async fn subscribe_l2(&mut self, symbol: &str) -> Result<(), Self::Error>;
 
+    /// Subscribe to trade stream without synchronization requirements
+    async fn subscribe_trades(&mut self, symbol: &str) -> Result<(), Self::Error>;
+
     /// Get next message from WebSocket stream
     async fn next_message(&mut self) -> Result<Option<RawMessage>, Self::Error>;
 
@@ -144,6 +147,38 @@ pub trait ExchangeProcessor: Send + Sync {
         packet_id: u64,
         message_bytes: u32,
     ) -> Result<Vec<crate::types::OrderBookL2Update>, Self::Error>;
+
+    /// Process raw trade message and return normalized trade updates
+    fn process_trade_message(
+        &mut self,
+        raw_msg: crate::types::RawMessage,
+        symbol: &str,
+        rcv_timestamp: i64,
+        packet_id: u64,
+        message_bytes: u32,
+    ) -> Result<Vec<crate::types::TradeUpdate>, Self::Error>;
+
+    /// Process raw message and return unified stream data
+    fn process_unified_message(
+        &mut self,
+        raw_msg: crate::types::RawMessage,
+        symbol: &str,
+        rcv_timestamp: i64,
+        packet_id: u64,
+        message_bytes: u32,
+        stream_type: crate::types::StreamType,
+    ) -> Result<Vec<crate::types::StreamData>, Self::Error> {
+        match stream_type {
+            crate::types::StreamType::L2 => {
+                let l2_updates = self.process_message(raw_msg, symbol, rcv_timestamp, packet_id, message_bytes)?;
+                Ok(l2_updates.into_iter().map(crate::types::StreamData::L2).collect())
+            }
+            crate::types::StreamType::Trade => {
+                let trade_updates = self.process_trade_message(raw_msg, symbol, rcv_timestamp, packet_id, message_bytes)?;
+                Ok(trade_updates.into_iter().map(crate::types::StreamData::Trade).collect())
+            }
+        }
+    }
 
     /// Get mutable reference to base processor for shared functionality
     fn base_processor(&mut self) -> &mut BaseProcessor;

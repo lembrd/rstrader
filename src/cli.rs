@@ -1,10 +1,9 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "xtrader")]
 #[command(about = "High-performance cryptocurrency market data collector")]
-#[command(version = "0.1.0")]
 pub struct Args {
     #[arg(
         long,
@@ -12,8 +11,8 @@ pub struct Args {
     )]
     pub subscriptions: String,
 
-    #[arg(long, help = "Output Parquet file path")]
-    pub output_parquet: PathBuf,
+    #[arg(long, help = "Output directory for Parquet files (will create individual files per stream type)")]
+    pub output_directory: PathBuf,
 
     #[arg(long, help = "Enable verbose output with metrics and statistics")]
     pub verbose: bool,
@@ -148,24 +147,20 @@ impl Args {
         let _subscriptions = SubscriptionSpec::parse_multiple(&self.subscriptions)
             .map_err(|e| anyhow::anyhow!("Invalid subscriptions format: {}", e))?;
 
-        // Validate output path - only check if parent is not current directory
-        if let Some(parent) = self.output_parquet.parent() {
-            if parent != std::path::Path::new(".")
-                && parent != std::path::Path::new("")
-                && !parent.exists()
-            {
-                anyhow::bail!("Output directory does not exist: {}", parent.display());
-            }
+        // Validate output directory exists or can be created
+        if !self.output_directory.exists() {
+            // Try to create the directory
+            std::fs::create_dir_all(&self.output_directory)
+                .map_err(|e| anyhow::anyhow!("Cannot create output directory {}: {}", self.output_directory.display(), e))?;
+        } else if !self.output_directory.is_dir() {
+            anyhow::bail!("Output path {} is not a directory", self.output_directory.display());
         }
 
-        // Validate file extension
-        if let Some(extension) = self.output_parquet.extension() {
-            if extension != "parquet" {
-                anyhow::bail!("Output file must have .parquet extension");
-            }
-        } else {
-            anyhow::bail!("Output file must have .parquet extension");
-        }
+        // Check if directory is writable by attempting to create a test file
+        let test_file = self.output_directory.join(".write_test");
+        std::fs::write(&test_file, "test")
+            .and_then(|_| std::fs::remove_file(&test_file))
+            .map_err(|e| anyhow::anyhow!("Output directory {} is not writable: {}", self.output_directory.display(), e))?;
 
         Ok(())
     }
@@ -186,7 +181,7 @@ mod tests {
     fn create_valid_args() -> Args {
         Args {
             subscriptions: "L2:OKX_SWAP@BTCUSDT".to_string(),
-            output_parquet: PathBuf::from("test.parquet"),
+            output_directory: PathBuf::from("test_output"),
             verbose: false,
             shutdown_after: None,
         }
@@ -195,7 +190,7 @@ mod tests {
     fn create_multi_subscription_args() -> Args {
         Args {
             subscriptions: "L2:OKX_SWAP@BTCUSDT,TRADES:BINANCE_FUTURES@ETHUSDT".to_string(),
-            output_parquet: PathBuf::from("test.parquet"),
+            output_directory: PathBuf::from("test_output"),
             verbose: false,
             shutdown_after: None,
         }
@@ -308,16 +303,11 @@ mod tests {
     }
 
     #[test]
-    fn test_output_validation() {
-        let mut args = create_valid_args();
-
-        // Wrong extension should fail
-        args.output_parquet = PathBuf::from("test.txt");
-        assert!(args.validate().is_err());
-
-        // No extension should fail
-        args.output_parquet = PathBuf::from("test");
-        assert!(args.validate().is_err());
+    fn test_output_directory_validation() {
+        let args = create_valid_args();
+        
+        // Valid directory should pass (will be created if needed)
+        assert!(args.validate().is_ok());
     }
 
     #[test]

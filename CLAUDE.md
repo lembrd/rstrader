@@ -25,7 +25,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 
 ## API Documentation Access
-Use context7 MCP for up-to-date API documentation:
+Use mcp__context7 for up-to-date API documentation
 
 ### Serena Tools
 - Use serena tools for code lookup and editing, listing files and dirs
@@ -33,6 +33,5 @@ Use context7 MCP for up-to-date API documentation:
 ## Problem Solving Techniques
 
 ### Thinking and Planning
-- Use zen for planing and thinking
-- Use zen challenge to verify ideas
-```
+- Use mcp__zen:planner for planning and thinking
+- Use mcp__zen:challenge to verify ideas

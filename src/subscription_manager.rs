@@ -5,8 +5,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, Result};
 use crate::cli::SubscriptionSpec;
-use crate::types::OrderBookL2Update;
-use crate::pipeline::{UnifiedExchangeHandler, UnifiedHandlerFactory};
+use crate::types::StreamData;
+use crate::pipeline::UnifiedHandlerFactory;
 use crate::exchanges::okx::InstrumentRegistry;
 
 /// Manager for handling multiple concurrent subscriptions using unified handlers
@@ -31,7 +31,7 @@ impl SubscriptionManager {
     /// This replaces the dual task spawning pattern with single tasks per subscription
     pub async fn spawn_all_subscriptions(
         &mut self,
-        processed_tx: mpsc::Sender<OrderBookL2Update>,
+        processed_tx: mpsc::Sender<StreamData>,
         okx_swap_registry: Option<Arc<InstrumentRegistry>>,
         okx_spot_registry: Option<Arc<InstrumentRegistry>>,
     ) -> Result<()> {
