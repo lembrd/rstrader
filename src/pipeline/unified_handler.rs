@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, Result};
 use crate::exchanges::{ExchangeConnector, ExchangeProcessor};
-use crate::types::{OrderBookL2Update, RawMessage, ExchangeId};
+use crate::types::{OrderBookL2Update, RawMessage, ExchangeId, StreamData};
 use crate::cli::{StreamType, SubscriptionSpec};
 
 /// Unified exchange handler that combines connector and processor into a single async task
@@ -43,7 +43,7 @@ impl UnifiedExchangeHandler {
     /// This eliminates the need for intermediate channels and async task overhead
     pub async fn run(
         mut self,
-        output_tx: mpsc::Sender<OrderBookL2Update>,
+        output_tx: mpsc::Sender<StreamData>,
     ) -> Result<()> {
         log::info!(
             "[{}] Starting UnifiedExchangeHandler for {:?}@{}",
@@ -139,7 +139,7 @@ impl UnifiedExchangeHandler {
     /// Run L2 depth stream with direct processing
     async fn run_l2_stream(
         &mut self,
-        output_tx: mpsc::Sender<OrderBookL2Update>,
+        output_tx: mpsc::Sender<StreamData>,
         mut reporter: Option<crate::pipeline::processor::MetricsReporter>,
     ) -> Result<()> {
         // Subscribe to L2 stream
@@ -204,13 +204,12 @@ impl UnifiedExchangeHandler {
     /// Run trade stream with direct processing
     async fn run_trade_stream(
         &mut self,
-        output_tx: mpsc::Sender<OrderBookL2Update>,
+        output_tx: mpsc::Sender<StreamData>,
         mut reporter: Option<crate::pipeline::processor::MetricsReporter>,
     ) -> Result<()> {
-        // Note: For trades, we use the same L2 subscription approach since most exchanges
-        // combine order book and trade data in the same stream
+        // Subscribe to trades stream using the dedicated trades subscription method
         self.connector
-            .subscribe_l2(&self.subscription.instrument)
+            .subscribe_trades(&self.subscription.instrument)
             .await
             .map_err(|e| {
                 AppError::stream(format!(
@@ -266,18 +265,24 @@ impl UnifiedExchangeHandler {
     }
 
     /// Process raw message directly using the exchange processor
-    async fn process_raw_message(&mut self, raw_msg: RawMessage) -> Result<Vec<OrderBookL2Update>> {
+    async fn process_raw_message(&mut self, raw_msg: RawMessage) -> Result<Vec<StreamData>> {
         let rcv_timestamp = crate::types::time::now_micros();
         let packet_id = self.processor.next_packet_id();
         let message_bytes = raw_msg.data.len() as u32;
 
-        self.processor.process_message(
+        let stream_data = self.processor.process_unified_message(
             raw_msg,
             &self.subscription.instrument,
             rcv_timestamp,
             packet_id,
             message_bytes,
-        )
+            match self.subscription.stream_type {
+                crate::cli::StreamType::L2 => crate::types::StreamType::L2,
+                crate::cli::StreamType::Trades => crate::types::StreamType::Trade,
+            },
+        )?;
+        
+        Ok(stream_data)
     }
 
     /// Get exchange ID for this handler

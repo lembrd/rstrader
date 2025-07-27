@@ -9,7 +9,7 @@ use tokio_tungstenite::{WebSocketStream, connect_async};
 
 use crate::error::{AppError, Result};
 use crate::exchanges::ExchangeConnector;
-use crate::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, PriceLevel, RawMessage};
+use crate::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate, TradeSide};
 use fast_float;
 
 /// Binance Futures WebSocket depth update message
@@ -33,11 +33,48 @@ pub struct BinanceDepthUpdate {
     #[serde(rename = "pu")]
     pub prev_final_update_id: i64, // Final update ID in previous event (for validation)
 
-    #[serde(rename = "b")]
+
     pub bids: Vec<[String; 2]>, // Bids to be updated [price, qty]
 
-    #[serde(rename = "a")]
+
     pub asks: Vec<[String; 2]>, // Asks to be updated [price, qty]
+}
+
+/// Binance Futures WebSocket trade message
+#[derive(Debug, Clone, Deserialize)]
+pub struct BinanceTradeUpdate {
+    #[serde(rename = "e")]
+    pub event_type: String, // "trade"
+
+    #[serde(rename = "E")]
+    pub event_time: i64, // Event time in milliseconds
+
+    #[serde(rename = "s")]
+    pub symbol: String, // Symbol (e.g., "BTCUSDT")
+
+    #[serde(rename = "t")]
+    pub trade_id: i64, // Trade ID
+
+    #[serde(rename = "p")]
+    pub price: String, // Trade price
+
+    #[serde(rename = "q")]
+    pub quantity: String, // Trade quantity
+
+
+
+
+
+
+
+    #[serde(rename = "T")]
+    pub trade_time: i64, // Trade time in milliseconds
+
+    #[serde(rename = "m")]
+    pub is_buyer_maker: bool, // Is buyer the maker (true = buyer was maker, false = buyer was taker)
+
+    #[serde(rename = "M")]
+    pub ignore: Option<bool>, // Ignore field (optional as it may not be present in all trade messages)
 }
 
 /// Binance REST API depth response
@@ -59,6 +96,7 @@ enum SyncState {
     Synchronizing { last_update_id: i64 }, // Synchronizing with snapshot
     Synchronized { last_update_id: i64 }, // Fully synchronized
     Resynchronizing,  // Error recovery - need new snapshot
+    TradeStream,     // Connected for trade stream - no synchronization needed
 }
 
 /// Binance Futures connector implementation
@@ -99,6 +137,11 @@ impl BinanceFuturesConnector {
         // format!("{}/ws/{}@depth@100ms", self.ws_url, symbol.to_lowercase())
     }
 
+    /// Get WebSocket trade stream URL
+    fn ws_trade_stream_url(&self, symbol: &str) -> String {
+        format!("{}/ws/{}@trade", self.ws_url, symbol.to_lowercase())
+    }
+
     /// Parse price level from string array
     fn parse_price_level(level: &[String; 2]) -> Result<PriceLevel> {
         let price = fast_float::parse::<f64, _>(&level[0])
@@ -114,6 +157,42 @@ impl BinanceFuturesConnector {
     fn parse_depth_update(&self, text: &str) -> Result<BinanceDepthUpdate> {
         serde_json::from_str(text)
             .map_err(|e| AppError::parse(format!("Failed to parse depth update: {}", e)))
+    }
+
+    /// Parse trade update from WebSocket message
+    fn parse_trade_update(&self, text: &str) -> Result<BinanceTradeUpdate> {
+        serde_json::from_str(text)
+            .map_err(|e| AppError::parse(format!("Failed to parse trade update: {}", e)))
+    }
+
+    /// Convert Binance trade update to internal TradeUpdate format
+    fn convert_trade_update(&self, trade: &BinanceTradeUpdate, rcv_timestamp: i64, packet_id: i64) -> Result<TradeUpdate> {
+        let price = fast_float::parse::<f64, _>(&trade.price)
+            .map_err(|e| AppError::parse(format!("Invalid trade price '{}': {}", trade.price, e)))?;
+        
+        let qty = fast_float::parse::<f64, _>(&trade.quantity)
+            .map_err(|e| AppError::parse(format!("Invalid trade quantity '{}': {}", trade.quantity, e)))?;
+
+        let trade_side = if trade.is_buyer_maker {
+            TradeSide::Sell // Buyer was maker, so this is a sell from taker's perspective
+        } else {
+            TradeSide::Buy  // Buyer was taker, so this is a buy
+        };
+
+        Ok(TradeUpdate {
+            timestamp: crate::types::time::millis_to_micros(trade.trade_time),
+            rcv_timestamp,
+            exchange: ExchangeId::BinanceFutures,
+            ticker: trade.symbol.clone(),
+            seq_id: trade.trade_id,
+            packet_id,
+            trade_id: trade.trade_id.to_string(),
+            order_id: Some(trade.trade_id.to_string()), // Using trade_id since buyer/seller order IDs removed from API
+            side: trade_side,
+            price,
+            qty,
+            is_buyer_maker: trade.is_buyer_maker,
+        })
     }
 
     /// Process buffered updates during synchronization
@@ -264,6 +343,28 @@ impl ExchangeConnector for BinanceFuturesConnector {
         Ok(())
     }
 
+    async fn subscribe_trades(&mut self, symbol: &str) -> Result<()> {
+        let ws_url = self.ws_trade_stream_url(symbol);
+
+        log::info!("Connecting to Binance trades WebSocket: {}", ws_url);
+
+        let (ws_stream, _) = connect_async(&ws_url)
+            .await
+            .map_err(|e| AppError::connection(format!("WebSocket error: {}", e)))?;
+
+        self.ws_stream = Some(ws_stream);
+        self.symbol = Some(symbol.to_string());
+        
+        // For trades, we don't need synchronization - set TradeStream state
+        // Trade streams don't require orderbook synchronization
+        self.sync_state = SyncState::TradeStream;
+        self.connection_status = ConnectionStatus::Connected;
+
+        log::info!("Binance trades WebSocket connected for {}", symbol);
+
+        Ok(())
+    }
+
     async fn next_message(&mut self) -> Result<Option<RawMessage>> {
         loop {
             // Waiting for WebSocket message
@@ -281,81 +382,90 @@ impl ExchangeConnector for BinanceFuturesConnector {
                     // Processing WebSocket message
                     let timestamp = SystemTime::now();
 
-                    // Try to parse as depth update
-                    let parse_result = self.parse_depth_update(&text);
-                    // Processing parsed message based on sync state
-                    match parse_result {
-Ok(update) => {
-                            // Processing depth update
-                            
-                            // Handle based on current sync state
-                            match &self.sync_state {
-                                SyncState::BufferingUpdates => {
-                                    // Buffering update
-                                    // Buffer updates until we get snapshot
-                                    self.update_buffer.push_back(update);
-                                    // Continue buffering, don't return message yet
-                                    continue;
-                                }
-                                SyncState::Synchronizing { last_update_id } => {
-                                    // Synchronizing with last_update_id
+                    // Handle based on sync state - for trade streams, skip depth parsing
+                    match &self.sync_state {
+                        SyncState::TradeStream => {
+                            // For trade streams, return raw message without depth parsing
+                            // Trade messages don't need synchronization
+                        }
+                        _ => {
+                            // Try to parse as depth update for L2 streams
+                            let parse_result = self.parse_depth_update(&text);
+                            // Processing parsed message based on sync state
+                            match parse_result {
+                                Ok(update) => {
+                                    // Processing depth update
                                     
-                                    // Check if this update is valid for synchronization
-                                    if update.final_update_id <= *last_update_id {
-                                        // Skip old update
-                                        // Skipping old update
-                                        continue;
-                                    }
+                                    // Handle based on current sync state
+                                    match &self.sync_state {
+                                        SyncState::BufferingUpdates => {
+                                            // Buffering update
+                                            // Buffer updates until we get snapshot
+                                            self.update_buffer.push_back(update);
+                                            // Continue buffering, don't return message yet
+                                            continue;
+                                        }
+                                        SyncState::Synchronizing { last_update_id } => {
+                                            // Synchronizing with last_update_id
+                                            
+                                            // Check if this update is valid for synchronization
+                                            if update.final_update_id <= *last_update_id {
+                                                // Skip old update
+                                                // Skipping old update
+                                                continue;
+                                            }
 
-                                    // Accept updates that come after our snapshot
-                                    if update.first_update_id > *last_update_id {
-                                        // There might be a gap, but this is normal after snapshot
-                                        log::info!("Accepting update after snapshot gap: {} > {}", update.first_update_id, last_update_id);
-                                        self.sync_state = SyncState::Synchronized {
-                                            last_update_id: update.final_update_id,
-                                        };
-                                        log::info!("Order book synchronized with gap handling");
-                                    } else if update.first_update_id <= last_update_id + 1
-                                        && update.final_update_id >= last_update_id + 1
-                                    {
-                                        // Perfect continuation
-                                        self.sync_state = SyncState::Synchronized {
-                                            last_update_id: update.final_update_id,
-                                        };
-                                        log::info!("Order book synchronized perfectly");
-                                    } else {
-                                        // Unexpected case - log and continue
-                                        log::warn!("Unexpected sync case: first_id={}, final_id={}, expected > {}", 
-                                            update.first_update_id, update.final_update_id, last_update_id);
-                                        self.sync_state = SyncState::Synchronized {
-                                            last_update_id: update.final_update_id,
-                                        };
-                                        log::info!("Order book synchronized with fallback");
+                                            // Accept updates that come after our snapshot
+                                            if update.first_update_id > *last_update_id {
+                                                // There might be a gap, but this is normal after snapshot
+                                                log::info!("Accepting update after snapshot gap: {} > {}", update.first_update_id, last_update_id);
+                                                self.sync_state = SyncState::Synchronized {
+                                                    last_update_id: update.final_update_id,
+                                                };
+                                                log::info!("Order book synchronized with gap handling");
+                                            } else if update.first_update_id <= last_update_id + 1
+                                                && update.final_update_id >= last_update_id + 1
+                                            {
+                                                // Perfect continuation
+                                                self.sync_state = SyncState::Synchronized {
+                                                    last_update_id: update.final_update_id,
+                                                };
+                                                log::info!("Order book synchronized perfectly");
+                                            } else {
+                                                // Unexpected case - log and continue
+                                                log::warn!("Unexpected sync case: first_id={}, final_id={}, expected > {}", 
+                                                    update.first_update_id, update.final_update_id, last_update_id);
+                                                self.sync_state = SyncState::Synchronized {
+                                                    last_update_id: update.final_update_id,
+                                                };
+                                                log::info!("Order book synchronized with fallback");
+                                            }
+                                        }
+                                        SyncState::Synchronized { last_update_id } => {
+                                            // Processing synchronized update
+                                            // Validate sequence
+                                            self.validate_update_sequence(&update, *last_update_id)?;
+
+                                            // Update state
+                                            self.sync_state = SyncState::Synchronized {
+                                                last_update_id: update.final_update_id,
+                                            };
+                                            // Processing update
+                                        }
+                                        _ => {
+                                            log::error!("Received update in invalid state: {:?}", self.sync_state);
+                                            return Err(AppError::stream(format!(
+                                                "Received update in invalid state: {:?}",
+                                                self.sync_state
+                                            )));
+                                        }
                                     }
                                 }
-                                SyncState::Synchronized { last_update_id } => {
-                                    // Processing synchronized update
-                                    // Validate sequence
-                                    self.validate_update_sequence(&update, *last_update_id)?;
-
-                                    // Update state
-                                    self.sync_state = SyncState::Synchronized {
-                                        last_update_id: update.final_update_id,
-                                    };
-                                    // Processing update
-                                }
-                                _ => {
-                                    log::error!("Received update in invalid state: {:?}", self.sync_state);
-                                    return Err(AppError::stream(format!(
-                                        "Received update in invalid state: {:?}",
-                                        self.sync_state
-                                    )));
+                                Err(_) => {
+                                    // Not a depth update, could be other message type
+                                    // Non-depth update received
                                 }
                             }
-                        }
-                        Err(_) => {
-                            // Not a depth update, could be other message type
-                            // Non-depth update received
                         }
                     }
 
@@ -427,10 +537,74 @@ Ok(update) => {
 
     async fn start_trade_stream(
         &mut self,
-        _symbol: &str,
-        _tx: tokio::sync::mpsc::Sender<RawMessage>,
+        symbol: &str,
+        tx: tokio::sync::mpsc::Sender<RawMessage>,
     ) -> Result<()> {
-        // Trades not implemented yet
+        let ws_url = self.ws_trade_stream_url(symbol);
+
+        log::info!("Connecting to Binance trade WebSocket: {}", ws_url);
+
+        let (ws_stream, _) = connect_async(&ws_url)
+            .await
+            .map_err(|e| AppError::connection(format!("WebSocket error: {}", e)))?;
+
+        self.ws_stream = Some(ws_stream);
+        self.symbol = Some(symbol.to_string());
+        self.connection_status = ConnectionStatus::Connected;
+
+        log::info!("Binance trade stream connected for {}", symbol);
+
+        // Message forwarding loop
+        loop {
+            let msg = {
+                let ws_stream = self
+                    .ws_stream
+                    .as_mut()
+                    .ok_or_else(|| AppError::connection("WebSocket not connected"))?;
+                ws_stream.next().await
+            };
+
+            match msg {
+                Some(Ok(Message::Text(text))) => {
+                    let timestamp = SystemTime::now();
+                    
+                    let raw_message = RawMessage {
+                        exchange_id: ExchangeId::BinanceFutures,
+                        data: text,
+                        timestamp,
+                    };
+
+                    if tx.send(raw_message).await.is_err() {
+                        log::info!("Trade stream channel closed, stopping");
+                        break;
+                    }
+                }
+                Some(Ok(Message::Close(_))) => {
+                    log::warn!("Binance trade WebSocket connection closed by server");
+                    self.connection_status = ConnectionStatus::Disconnected;
+                    break;
+                }
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
+                    // Handle ping/pong, continue reading
+                    continue;
+                }
+                Some(Ok(_)) => {
+                    // Other message types, continue reading
+                    continue;
+                }
+                Some(Err(e)) => {
+                    log::error!("Binance trade WebSocket error: {}", e);
+                    self.connection_status = ConnectionStatus::Failed;
+                    return Err(AppError::connection(format!("WebSocket error: {}", e)));
+                }
+                None => {
+                    log::warn!("Binance trade WebSocket stream ended");
+                    self.connection_status = ConnectionStatus::Disconnected;
+                    break;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -615,7 +789,113 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         Ok(std::mem::take(&mut self.base.updates_buffer))
     }
 
-    // Default implementations from trait are used
+    fn process_trade_message(
+        &mut self,
+        raw_msg: crate::types::RawMessage,
+        _symbol: &str,
+        rcv_timestamp: i64,
+        packet_id: u64,
+        message_bytes: u32,
+    ) -> std::result::Result<Vec<crate::types::TradeUpdate>, Self::Error> {
+        // Track message received
+        self.base.metrics.increment_received();
+
+        // Calculate packet arrival timestamp (when network packet was received)
+        let packet_arrival_us = raw_msg
+            .timestamp
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+
+        // Parse Binance trade message with timing
+        let parse_start = crate::types::time::now_micros();
+        let mut data_bytes = raw_msg.data.into_bytes();
+        let trade_update: BinanceTradeUpdate =
+            serde_json::from_slice(&mut data_bytes).map_err(|e| {
+                self.base.metrics.increment_parse_errors();
+                crate::error::AppError::pipeline(format!("Failed to parse Binance trade message: {}", e))
+            })?;
+
+        // Calculate parse time
+        let parse_end = crate::types::time::now_micros();
+        if let Some(parse_time) = parse_end.checked_sub(parse_start) {
+            self.base.metrics.update_parse_time(parse_time as u64);
+        }
+
+        // Calculate overall latency (local time vs exchange timestamp)
+        let exchange_timestamp_us = crate::types::time::millis_to_micros(trade_update.trade_time);
+        if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
+            if overall_latency >= 0 {
+                self.base
+                    .metrics
+                    .update_overall_latency(overall_latency as u64);
+            }
+        }
+
+        // Start transformation timing
+        let transform_start = crate::types::time::now_micros();
+
+        // Calculate overhead time (time between parse end and transform start)
+        if let Some(overhead_time) = transform_start.checked_sub(parse_end) {
+            self.base.metrics.update_overhead_time(overhead_time as u64);
+        }
+
+        // Parse price and quantity
+        let price = fast_float::parse::<f64, _>(&trade_update.price).map_err(|e| {
+            crate::error::AppError::pipeline(format!("Invalid trade price '{}': {}", trade_update.price, e))
+        })?;
+        
+        let qty = fast_float::parse::<f64, _>(&trade_update.quantity).map_err(|e| {
+            crate::error::AppError::pipeline(format!("Invalid trade quantity '{}': {}", trade_update.quantity, e))
+        })?;
+
+        let trade_side = if trade_update.is_buyer_maker {
+            crate::types::TradeSide::Sell // Buyer was maker, so this is a sell from taker's perspective
+        } else {
+            crate::types::TradeSide::Buy  // Buyer was taker, so this is a buy
+        };
+
+        let seq_id = self.next_sequence_id();
+        let trade = crate::types::TradeUpdate {
+            timestamp: crate::types::time::millis_to_micros(trade_update.trade_time),
+            rcv_timestamp,
+            exchange: crate::types::ExchangeId::BinanceFutures,
+            ticker: trade_update.symbol,
+            seq_id,
+            packet_id: packet_id as i64,
+            trade_id: trade_update.trade_id.to_string(),
+            order_id: None, // Binance doesn't provide order IDs in trade stream
+            side: trade_side,
+            price,
+            qty,
+            is_buyer_maker: trade_update.is_buyer_maker,
+        };
+
+        // Calculate transformation time
+        let transform_end = crate::types::time::now_micros();
+        if let Some(transform_time) = transform_end.checked_sub(transform_start) {
+            self.base
+                .metrics
+                .update_transform_time(transform_time as u64);
+        }
+
+        // Update metrics
+        self.base.metrics.increment_processed();
+        self.base.metrics.update_message_complexity(0, 0, message_bytes); // Trade message has no bid/ask levels
+
+        // Update packet metrics (Binance sends 1 trade per message)
+        self.base.metrics.update_packet_metrics(1, 1, message_bytes);
+
+        // Calculate CODE LATENCY: From network packet arrival to business logic ready
+        let processing_complete = crate::types::time::now_micros();
+        if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
+            if code_latency >= 0 {
+                self.base.metrics.update_code_latency(code_latency as u64);
+            }
+        }
+
+        Ok(vec![trade])
+    }
 }
 
 #[cfg(test)]
