@@ -13,7 +13,7 @@ use exchanges::ExchangeConnector;
 use futures_util::FutureExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use types::{OrderBookL2Update, RawMessage};
+use types::OrderBookL2Update;
 
 /// Manager for handling multiple concurrent subscriptions
 pub struct MultiSubscriptionManager {
@@ -355,302 +355,91 @@ async fn main() -> Result<()> {
 }
 
 async fn run_application(args: Args) -> Result<()> {
-    use cli::{Exchange, StreamType};
-    use exchanges::ExchangeConnector;
-    use exchanges::binance::BinanceFuturesConnector;
     use output::parquet::run_parquet_sink;
-    use pipeline::processor::run_stream_processor;
     use tokio::sync::mpsc;
 
     // Create communication channels
-    let (raw_tx, raw_rx) = mpsc::channel(10000);
     let (processed_tx, processed_rx) = mpsc::channel(10000);
 
-    // Determine mode and start appropriate stream(s)
-    if args.is_single_subscription_mode() {
-        // Single subscription mode (backward compatibility)
-        let exchange = args.exchange.unwrap();
-        let symbol = args.symbol.unwrap();
-        let stream = args.stream.unwrap();
+    // Multi-subscription mode
+    let subscriptions = args
+        .get_subscriptions()
+        .map_err(|e| AppError::cli(format!("Invalid subscriptions: {}", e)))?;
 
-        // Display configuration in verbose mode
-        if args.verbose {
-            log::info!("Starting xtrader with single subscription:");
-            log::info!("  Exchange: {:?}", exchange);
-            log::info!("  Symbol: {}", symbol);
-            log::info!("  Stream: {:?}", stream);
-            log::info!("  Output: {}", args.output_parquet.display());
-        }
 
-        // Initialize singleton registries for OKX exchanges if needed
-        let okx_registry = match exchange {
-            Exchange::OkxSwap => {
-                log::info!("Initializing OKX SWAP instrument registry");
-                let client = reqwest::Client::new();
-                let registry = exchanges::okx::InstrumentRegistry::initialize_with_instruments(
-                    &client,
-                    "https://www.okx.com",
-                    "SWAP",
-                )
-                .await
-                .map_err(|e| {
-                    AppError::connection(format!("Failed to initialize SWAP registry: {}", e))
-                })?;
-                Some(std::sync::Arc::new(registry))
-            }
-            Exchange::OkxSpot => {
-                log::info!("Initializing OKX SPOT instrument registry");
-                let client = reqwest::Client::new();
-                let registry = exchanges::okx::InstrumentRegistry::initialize_with_instruments(
-                    &client,
-                    "https://www.okx.com",
-                    "SPOT",
-                )
-                .await
-                .map_err(|e| {
-                    AppError::connection(format!("Failed to initialize SPOT registry: {}", e))
-                })?;
-                Some(std::sync::Arc::new(registry))
-            }
-            Exchange::BinanceFutures | Exchange::Deribit => None,
-        };
-
-        // Initialize exchange connector based on CLI args
-        let mut connector: Box<dyn ExchangeConnector<Error = AppError>> = match exchange {
-            Exchange::BinanceFutures => {
-                log::info!("Initializing Binance Futures connector");
-                Box::new(BinanceFuturesConnector::new())
-            }
-            Exchange::OkxSwap => {
-                log::info!("Initializing OKX SWAP connector");
-                Box::new(exchanges::okx::OkxConnector::new_swap(
-                    okx_registry.as_ref().unwrap().clone(),
-                ))
-            }
-            Exchange::OkxSpot => {
-                log::info!("Initializing OKX SPOT connector");
-                Box::new(exchanges::okx::OkxConnector::new_spot(
-                    okx_registry.as_ref().unwrap().clone(),
-                ))
-            }
-            Exchange::Deribit => {
-                log::info!("Initializing Deribit connector");
-                Box::new(exchanges::deribit::DeribitConnector::new(
-                    exchanges::deribit::DeribitConfig::from_env().map_err(|e| {
-                        AppError::connection(format!("Failed to load Deribit config: {}", e))
-                    })?,
-                ))
-            }
-        };
-
-        // Connect to the exchange
-        log::info!("Connecting to exchange...");
-        connector
-            .connect()
-            .await
-            .map_err(|e| AppError::connection(format!("Failed to connect: {}", e)))?;
-
-        // Validate symbol exists
-        log::info!("Validating symbol: {}", symbol);
-        connector
-            .validate_symbol(&symbol)
-            .await
-            .map_err(|e| AppError::validation(format!("Invalid symbol {}: {}", symbol, e)))?;
-
-        // Get initial order book snapshot if L2 stream
-        if matches!(stream, StreamType::L2) {
-            log::info!("Getting initial order book snapshot for {}", symbol);
-            let _snapshot = connector
-                .get_snapshot(&symbol)
-                .await
-                .map_err(|e| AppError::data(format!("Failed to get snapshot: {}", e)))?;
-            log::info!("Successfully retrieved order book snapshot");
-        }
-
-        // Start market data stream based on type
-        let stream_handle = {
-            let symbol_clone = symbol.clone();
-            let stream_type = stream.clone();
-            tokio::spawn(async move {
-                log::info!("Starting {} stream for {}", stream_type, symbol_clone);
-
-                match stream_type {
-                    StreamType::L2 => connector
-                        .start_depth_stream(&symbol_clone, raw_tx)
-                        .await
-                        .map_err(|e| AppError::stream(format!("L2 stream failed: {}", e))),
-                    StreamType::Trades => connector
-                        .start_trade_stream(&symbol_clone, raw_tx)
-                        .await
-                        .map_err(|e| AppError::stream(format!("Trade stream failed: {}", e))),
-                }
-            })
-        };
-
-        // Start stream processor task
-        let processor_handle = {
-            let symbol_clone = symbol.clone();
-            let verbose = args.verbose;
-            tokio::spawn(async move {
-                log::info!("Starting stream processor");
-                run_stream_processor(
-                    raw_rx,
-                    processed_tx,
-                    symbol_clone,
-                    verbose,
-                    okx_registry.clone(),
-                )
-                .await
-            })
-        };
-
-        // Start Parquet sink task
-        let sink_handle = {
-            let output_path = args.output_parquet.clone();
-            tokio::spawn(async move {
-                log::info!("Starting Parquet sink");
-                run_parquet_sink(processed_rx, output_path).await
-            })
-        };
-
-        // Set up graceful shutdown with optional timer
-        let shutdown_future = if let Some(seconds) = args.shutdown_after {
-            log::info!("Will shutdown automatically after {} seconds", seconds);
-            tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).boxed()
-        } else {
-            // Create a future that never completes
-            std::future::pending().boxed()
-        };
-
-        tokio::select! {
-            result = stream_handle => {
-                match result {
-                    Ok(Ok(_)) => log::info!("Stream completed successfully"),
-                    Ok(Err(e)) => {
-                        log::error!("Stream failed: {}", e);
-                        return Err(e);
-                    }
-                    Err(e) => {
-                        log::error!("Stream task panicked: {}", e);
-                        return Err(AppError::internal(format!("Stream task failed: {}", e)));
-                    }
-                }
-            }
-            result = processor_handle => {
-                match result {
-                    Ok(Ok(_)) => log::info!("Processor completed successfully"),
-                    Ok(Err(e)) => {
-                        log::error!("Processor failed: {}", e);
-                        return Err(e);
-                    }
-                    Err(e) => {
-                        log::error!("Processor task panicked: {}", e);
-                        return Err(AppError::internal(format!("Processor task failed: {}", e)));
-                    }
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                log::info!("Received shutdown signal, gracefully shutting down...");
-            }
-            _ = shutdown_future => {
-                log::info!("Shutdown timer expired, gracefully shutting down...");
-            }
-        }
-
-        // Ensure Parquet sink completes before exiting
-        log::info!("Shutdown triggered. Finalizing Parquet sink...");
-        match sink_handle.await {
-            Ok(Ok(_)) => log::info!("Parquet sink finalized successfully"),
-            Ok(Err(e)) => {
-                log::error!("Parquet sink failed during finalization: {}", e);
-                return Err(e);
-            }
-            Err(e) => {
-                log::error!("Parquet sink task panicked during finalization: {}", e);
-                return Err(AppError::internal(format!("Parquet sink task failed: {}", e)));
-            }
-        }
-    } else {
-        // Multi-subscription mode
-        let subscriptions = args
-            .get_subscriptions()
-            .map_err(|e| AppError::cli(format!("Invalid subscriptions: {}", e)))?
-            .unwrap();
-
-        // Display configuration in verbose mode
-        if args.verbose {
+    // Display configuration in verbose mode
+    if args.verbose {
+        log::info!(
+            "Starting xtrader with {} subscriptions:",
+            subscriptions.len()
+        );
+        for (i, sub) in subscriptions.iter().enumerate() {
             log::info!(
-                "Starting xtrader with {} subscriptions:",
-                subscriptions.len()
+                "  [{}] {:?}:{:?}@{}",
+                i + 1,
+                sub.stream_type,
+                sub.exchange,
+                sub.instrument
             );
-            for (i, sub) in subscriptions.iter().enumerate() {
-                log::info!(
-                    "  [{}] {:?}:{:?}@{}",
-                    i + 1,
-                    sub.stream_type,
-                    sub.exchange,
-                    sub.instrument
-                );
-            }
-            log::info!("  Output: {}", args.output_parquet.display());
         }
+        log::info!("  Output: {}", args.output_parquet.display());
+    }
 
-        // Create and initialize multi-subscription manager
-        let mut manager = MultiSubscriptionManager::new(subscriptions);
-        manager
-            .spawn_all_subscriptions(processed_tx, args.verbose)
-            .await?;
+    // Create and initialize multi-subscription manager
+    let mut manager = MultiSubscriptionManager::new(subscriptions);
+    manager
+        .spawn_all_subscriptions(processed_tx, args.verbose)
+        .await?;
 
-        // Start Parquet sink task
-        let sink_handle = {
-            let output_path = args.output_parquet.clone();
-            tokio::spawn(async move {
-                log::info!("Starting Parquet sink");
-                run_parquet_sink(processed_rx, output_path).await
-            })
-        };
+    // Start Parquet sink task
+    let sink_handle = {
+        let output_path = args.output_parquet.clone();
+        tokio::spawn(async move {
+            log::info!("Starting Parquet sink");
+            run_parquet_sink(processed_rx, output_path).await
+        })
+    };
 
-        // Set up graceful shutdown with optional timer
-        let shutdown_future = if let Some(seconds) = args.shutdown_after {
-            log::info!("Will shutdown automatically after {} seconds", seconds);
-            tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).boxed()
-        } else {
-            // Create a future that never completes
-            std::future::pending().boxed()
-        };
+    // Set up graceful shutdown with optional timer
+    let shutdown_future = if let Some(seconds) = args.shutdown_after {
+        log::info!("Will shutdown automatically after {} seconds", seconds);
+        tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).boxed()
+    } else {
+        // Create a future that never completes
+        std::future::pending().boxed()
+    };
 
-        tokio::select! {
-            result = manager.wait_for_any_completion() => {
-                match result {
-                    Ok(_) => log::info!("One connector completed successfully"),
-                    Err(e) => {
-                        log::error!("Connector failed: {}", e);
-                        manager.shutdown().await;
-                        return Err(e);
-                    }
+    tokio::select! {
+        result = manager.wait_for_any_completion() => {
+            match result {
+                Ok(_) => log::info!("One connector completed successfully"),
+                Err(e) => {
+                    log::error!("Connector failed: {}", e);
+                    manager.shutdown().await;
+                    return Err(e);
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                log::info!("Received shutdown signal, gracefully shutting down...");
-            }
-            _ = shutdown_future => {
-                log::info!("Shutdown timer expired, gracefully shutting down...");
-            }
         }
+        _ = tokio::signal::ctrl_c() => {
+            log::info!("Received shutdown signal, gracefully shutting down...");
+        }
+        _ = shutdown_future => {
+            log::info!("Shutdown timer expired, gracefully shutting down...");
+        }
+    }
 
-        // Shutdown connectors and finalize Parquet sink
-        log::info!("Shutting down connectors and finalizing Parquet sink...");
-        manager.shutdown().await;
-        match sink_handle.await {
-            Ok(Ok(_)) => log::info!("Parquet sink finalized successfully"),
-            Ok(Err(e)) => {
-                log::error!("Parquet sink failed during finalization: {}", e);
-                return Err(e);
-            }
-            Err(e) => {
-                log::error!("Parquet sink task panicked during finalization: {}", e);
-                return Err(AppError::internal(format!("Parquet sink task failed: {}", e)));
-            }
+    // Shutdown connectors and finalize Parquet sink
+    log::info!("Shutting down connectors and finalizing Parquet sink...");
+    manager.shutdown().await;
+    match sink_handle.await {
+        Ok(Ok(_)) => log::info!("Parquet sink finalized successfully"),
+        Ok(Err(e)) => {
+            log::error!("Parquet sink failed during finalization: {}", e);
+            return Err(e);
+        }
+        Err(e) => {
+            log::error!("Parquet sink task panicked during finalization: {}", e);
+            return Err(AppError::internal(format!("Parquet sink task failed: {}", e)));
         }
     }
 

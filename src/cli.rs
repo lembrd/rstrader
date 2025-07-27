@@ -6,26 +6,14 @@ use std::path::PathBuf;
 #[command(about = "High-performance cryptocurrency market data collector")]
 #[command(version = "0.1.0")]
 pub struct Args {
-    #[arg(long, help = "Exchange to connect to (single subscription mode)")]
-    pub exchange: Option<Exchange>,
-
     #[arg(
         long,
-        help = "Trading symbol (e.g., BTCUSDT) (single subscription mode)"
+        help = "Subscriptions in format stream_type:exchange@instrument (e.g., L2:OKX_SWAP@BTCUSDT,L2:BINANCE_FUTURES@ETHUSDT)"
     )]
-    pub symbol: Option<String>,
+    pub subscriptions: String,
 
     #[arg(long, help = "Output Parquet file path")]
     pub output_parquet: PathBuf,
-
-    #[arg(long, help = "Stream type to collect (single subscription mode)")]
-    pub stream: Option<StreamType>,
-
-    #[arg(
-        long,
-        help = "Multiple subscriptions in format stream_type:exchange@instrument (e.g., L2:OKX_SWAP@BTCUSDT,L2:BINANCE_FUTURES@ETHUSDT)"
-    )]
-    pub subscriptions: Option<String>,
 
     #[arg(long, help = "Enable verbose output with metrics and statistics")]
     pub verbose: bool,
@@ -156,37 +144,9 @@ impl std::fmt::Display for StreamType {
 
 impl Args {
     pub fn validate(&self) -> anyhow::Result<()> {
-        // Check for mutually exclusive modes
-        let has_single_args =
-            self.exchange.is_some() || self.symbol.is_some() || self.stream.is_some();
-        let has_subscriptions = self.subscriptions.is_some();
-
-        if has_single_args && has_subscriptions {
-            anyhow::bail!(
-                "Cannot use both single subscription arguments (--exchange, --symbol, --stream) and --subscriptions together"
-            );
-        }
-
-        if !has_single_args && !has_subscriptions {
-            anyhow::bail!(
-                "Must provide either single subscription arguments (--exchange, --symbol, --stream) or --subscriptions"
-            );
-        }
-
-        // Validate single subscription mode
-        if has_single_args {
-            if self.exchange.is_none() || self.symbol.is_none() || self.stream.is_none() {
-                anyhow::bail!(
-                    "Single subscription mode requires --exchange, --symbol, and --stream arguments"
-                );
-            }
-        }
-
-        // Validate multi-subscription mode
-        if let Some(subscriptions_str) = &self.subscriptions {
-            let _subscriptions = SubscriptionSpec::parse_multiple(subscriptions_str)
-                .map_err(|e| anyhow::anyhow!("Invalid subscriptions format: {}", e))?;
-        }
+        // Validate subscriptions format
+        let _subscriptions = SubscriptionSpec::parse_multiple(&self.subscriptions)
+            .map_err(|e| anyhow::anyhow!("Invalid subscriptions format: {}", e))?;
 
         // Validate output path - only check if parent is not current directory
         if let Some(parent) = self.output_parquet.parent() {
@@ -210,20 +170,12 @@ impl Args {
         Ok(())
     }
 
-    /// Helper to determine if running in single subscription mode
-    pub fn is_single_subscription_mode(&self) -> bool {
-        self.exchange.is_some() && self.symbol.is_some() && self.stream.is_some()
-    }
+    
 
-    /// Helper to get parsed subscriptions (for multi-subscription mode)
-    pub fn get_subscriptions(&self) -> anyhow::Result<Option<Vec<SubscriptionSpec>>> {
-        if let Some(subscriptions_str) = &self.subscriptions {
-            let specs = SubscriptionSpec::parse_multiple(subscriptions_str)
-                .map_err(|e| anyhow::anyhow!("Invalid subscriptions: {}", e))?;
-            Ok(Some(specs))
-        } else {
-            Ok(None)
-        }
+    pub fn get_subscriptions(&self) -> anyhow::Result<Vec<SubscriptionSpec>> {
+        let specs = SubscriptionSpec::parse_multiple(&self.subscriptions)
+            .map_err(|e| anyhow::anyhow!("Invalid subscriptions: {}", e))?;
+        Ok(specs)
     }
 }
 
