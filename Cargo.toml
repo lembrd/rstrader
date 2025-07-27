@@ -37,3 +37,4 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # TLS and crypto
 rustls = { version = "0.23.29", features = ["ring"] }
+rustc-hash = "1.1"

@@ -1,19 +1,16 @@
-use std::path::PathBuf;
-use std::sync::Arc;
+use crate::{
+    error::{AppError, Result},
+    types::{Metrics, OrderBookL2Update},
+};
 use arrow::{
     array::{ArrayRef, Float64Array, Int64Array, StringArray, UInt64Array},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use parquet::{
-    arrow::ArrowWriter,
-    file::properties::WriterProperties,
-};
+use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
-use crate::{
-    types::{OrderBookL2Update, Metrics},
-    error::{AppError, Result},
-};
 
 const BATCH_SIZE: usize = 1000;
 const FLUSH_INTERVAL_MS: u64 = 5000;
@@ -29,7 +26,7 @@ pub struct ParquetSink {
 impl ParquetSink {
     pub fn new(output_path: PathBuf) -> Result<Self> {
         let schema = Self::create_schema();
-        
+
         Ok(Self {
             writer: None,
             schema,
@@ -73,7 +70,10 @@ impl ParquetSink {
             .map_err(|e| AppError::io(format!("Failed to create Parquet writer: {}", e)))?;
 
         self.writer = Some(writer);
-        log::info!("Initialized Parquet writer for: {}", self.output_path.display());
+        log::info!(
+            "Initialized Parquet writer for: {}",
+            self.output_path.display()
+        );
         Ok(())
     }
 
@@ -98,7 +98,8 @@ impl ParquetSink {
         let batch = self.create_record_batch()?;
         let writer = self.writer.as_mut().unwrap();
 
-        writer.write(&batch)
+        writer
+            .write(&batch)
             .map_err(|e| AppError::io(format!("Failed to write batch: {}", e)))?;
 
         let batch_size = self.buffer.len();
@@ -112,41 +113,56 @@ impl ParquetSink {
     fn create_record_batch(&self) -> Result<RecordBatch> {
         let _len = self.buffer.len();
 
-        let timestamp_array = Int64Array::from(
-            self.buffer.iter().map(|u| u.timestamp).collect::<Vec<_>>()
-        );
+        let timestamp_array =
+            Int64Array::from(self.buffer.iter().map(|u| u.timestamp).collect::<Vec<_>>());
         let rcv_timestamp_array = Int64Array::from(
-            self.buffer.iter().map(|u| u.rcv_timestamp).collect::<Vec<_>>()
+            self.buffer
+                .iter()
+                .map(|u| u.rcv_timestamp)
+                .collect::<Vec<_>>(),
         );
         let exchange_array = StringArray::from(
-            self.buffer.iter().map(|u| u.exchange.to_string()).collect::<Vec<_>>()
+            self.buffer
+                .iter()
+                .map(|u| u.exchange.to_string())
+                .collect::<Vec<_>>(),
         );
         let ticker_array = StringArray::from(
-            self.buffer.iter().map(|u| u.ticker.clone()).collect::<Vec<_>>()
+            self.buffer
+                .iter()
+                .map(|u| u.ticker.clone())
+                .collect::<Vec<_>>(),
         );
-        let seq_id_array = Int64Array::from(
-            self.buffer.iter().map(|u| u.seq_id).collect::<Vec<_>>()
-        );
-        let packet_id_array = Int64Array::from(
-            self.buffer.iter().map(|u| u.packet_id).collect::<Vec<_>>()
-        );
+        let seq_id_array =
+            Int64Array::from(self.buffer.iter().map(|u| u.seq_id).collect::<Vec<_>>());
+        let packet_id_array =
+            Int64Array::from(self.buffer.iter().map(|u| u.packet_id).collect::<Vec<_>>());
         let action_array = StringArray::from(
-            self.buffer.iter().map(|u| u.action.to_string()).collect::<Vec<_>>()
+            self.buffer
+                .iter()
+                .map(|u| u.action.to_string())
+                .collect::<Vec<_>>(),
         );
         let side_array = StringArray::from(
-            self.buffer.iter().map(|u| u.side.to_string()).collect::<Vec<_>>()
+            self.buffer
+                .iter()
+                .map(|u| u.side.to_string())
+                .collect::<Vec<_>>(),
         );
-        let price_array = Float64Array::from(
-            self.buffer.iter().map(|u| u.price).collect::<Vec<_>>()
-        );
-        let qty_array = Float64Array::from(
-            self.buffer.iter().map(|u| u.qty).collect::<Vec<_>>()
-        );
+        let price_array =
+            Float64Array::from(self.buffer.iter().map(|u| u.price).collect::<Vec<_>>());
+        let qty_array = Float64Array::from(self.buffer.iter().map(|u| u.qty).collect::<Vec<_>>());
         let update_id_array = UInt64Array::from(
-            self.buffer.iter().map(|u| u.update_id as u64).collect::<Vec<_>>()
+            self.buffer
+                .iter()
+                .map(|u| u.update_id as u64)
+                .collect::<Vec<_>>(),
         );
         let first_update_id_array = UInt64Array::from(
-            self.buffer.iter().map(|u| u.first_update_id as u64).collect::<Vec<_>>()
+            self.buffer
+                .iter()
+                .map(|u| u.first_update_id as u64)
+                .collect::<Vec<_>>(),
         );
 
         let arrays: Vec<ArrayRef> = vec![
@@ -174,7 +190,8 @@ impl ParquetSink {
         }
 
         if let Some(mut writer) = self.writer.take() {
-            writer.close()
+            writer
+                .close()
                 .map_err(|e| AppError::io(format!("Failed to close Parquet writer: {}", e)))?;
             log::info!("Closed Parquet writer for: {}", self.output_path.display());
         }
@@ -193,9 +210,8 @@ pub async fn run_parquet_sink(
     output_path: PathBuf,
 ) -> Result<()> {
     let mut sink = ParquetSink::new(output_path)?;
-    let mut flush_interval = tokio::time::interval(
-        tokio::time::Duration::from_millis(FLUSH_INTERVAL_MS)
-    );
+    let mut flush_interval =
+        tokio::time::interval(tokio::time::Duration::from_millis(FLUSH_INTERVAL_MS));
 
     log::info!("Starting Parquet sink");
 

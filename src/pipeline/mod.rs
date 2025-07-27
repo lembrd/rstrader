@@ -1,5 +1,5 @@
-pub mod processor;
 pub mod orderbook;
+pub mod processor;
 
-pub use processor::StreamProcessor;
 pub use orderbook::OrderBookManager;
+pub use processor::StreamProcessor;
