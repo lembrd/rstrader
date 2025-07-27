@@ -3,6 +3,7 @@ mod error;
 mod exchanges;
 mod output;
 mod pipeline;
+mod subscription_manager;
 mod types;
 
 use clap::Parser;
@@ -15,303 +16,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use types::OrderBookL2Update;
 
-/// Manager for handling multiple concurrent subscriptions
-pub struct MultiSubscriptionManager {
-    subscriptions: Vec<SubscriptionSpec>,
-    connector_handles: Vec<JoinHandle<Result<()>>>,
-}
 
-impl MultiSubscriptionManager {
-    pub fn new(subscriptions: Vec<SubscriptionSpec>) -> Self {
-        Self {
-            subscriptions,
-            connector_handles: Vec::new(),
-        }
-    }
-
-    /// Spawn per-subscription connector and processor pairs
-    pub async fn spawn_all_subscriptions(
-        &mut self,
-        processed_tx: mpsc::Sender<OrderBookL2Update>,
-        verbose: bool,
-    ) -> Result<()> {
-        use cli::{Exchange, StreamType};
-        use exchanges::binance::BinanceFuturesConnector;
-        use exchanges::okx::{InstrumentRegistry, OkxConnector};
-        use pipeline::processor::run_stream_processor;
-        use reqwest::Client;
-        use std::sync::Arc;
-
-        // Initialize singleton registries for OKX exchanges once
-        let mut okx_swap_registry: Option<Arc<InstrumentRegistry>> = None;
-        let mut okx_spot_registry: Option<Arc<InstrumentRegistry>> = None;
-
-        // Pre-initialize registries based on subscriptions
-        let needs_swap = self
-            .subscriptions
-            .iter()
-            .any(|s| matches!(s.exchange, Exchange::OkxSwap));
-        let needs_spot = self
-            .subscriptions
-            .iter()
-            .any(|s| matches!(s.exchange, Exchange::OkxSpot));
-
-        if needs_swap {
-            log::info!("Initializing OKX SWAP instrument registry");
-            let client = Client::new();
-            let registry = InstrumentRegistry::initialize_with_instruments(
-                &client,
-                "https://www.okx.com",
-                "SWAP",
-            )
-            .await
-            .map_err(|e| {
-                AppError::connection(format!("Failed to initialize SWAP registry: {}", e))
-            })?;
-            okx_swap_registry = Some(Arc::new(registry));
-        }
-
-        if needs_spot {
-            log::info!("Initializing OKX SPOT instrument registry");
-            let client = Client::new();
-            let registry = InstrumentRegistry::initialize_with_instruments(
-                &client,
-                "https://www.okx.com",
-                "SPOT",
-            )
-            .await
-            .map_err(|e| {
-                AppError::connection(format!("Failed to initialize SPOT registry: {}", e))
-            })?;
-            okx_spot_registry = Some(Arc::new(registry));
-        }
-
-        for (index, subscription) in self.subscriptions.iter().enumerate() {
-            // Create dedicated channels for this subscription
-            let (raw_tx, raw_rx) = mpsc::channel(10000);
-
-            // Create connector based on exchange
-            let mut connector: Box<dyn ExchangeConnector<Error = AppError>> = match subscription
-                .exchange
-            {
-                Exchange::BinanceFutures => {
-                    log::info!(
-                        "[{}] Creating Binance Futures connector for {}",
-                        index,
-                        subscription.instrument
-                    );
-                    Box::new(BinanceFuturesConnector::new())
-                }
-                Exchange::OkxSwap => {
-                    log::info!(
-                        "[{}] Creating OKX SWAP connector for {}",
-                        index,
-                        subscription.instrument
-                    );
-                    Box::new(OkxConnector::new_swap(
-                        okx_swap_registry.as_ref().unwrap().clone(),
-                    ))
-                }
-                Exchange::OkxSpot => {
-                    log::info!(
-                        "[{}] Creating OKX SPOT connector for {}",
-                        index,
-                        subscription.instrument
-                    );
-                    Box::new(OkxConnector::new_spot(
-                        okx_spot_registry.as_ref().unwrap().clone(),
-                    ))
-                }
-                Exchange::Deribit => {
-                    log::info!(
-                        "[{}] Creating Deribit connector for {}",
-                        index,
-                        subscription.instrument
-                    );
-                    Box::new(exchanges::deribit::DeribitConnector::new(
-                        exchanges::deribit::DeribitConfig::from_env().map_err(|e| {
-                            AppError::connection(format!("Failed to load Deribit config: {}", e))
-                        })?,
-                    ))
-                }
-            };
-
-            // Connect to the exchange
-            log::info!(
-                "[{}] Connecting to {:?} for {}...",
-                index,
-                subscription.exchange,
-                subscription.instrument
-            );
-            connector.connect().await.map_err(|e| {
-                AppError::connection(format!(
-                    "Failed to connect to {:?}: {}",
-                    subscription.exchange, e
-                ))
-            })?;
-
-            // Validate symbol exists
-            log::info!("[{}] Validating symbol: {}", index, subscription.instrument);
-            connector
-                .validate_symbol(&subscription.instrument)
-                .await
-                .map_err(|e| {
-                    AppError::validation(format!(
-                        "Invalid symbol {} on {:?}: {}",
-                        subscription.instrument, subscription.exchange, e
-                    ))
-                })?;
-
-            // Get initial order book snapshot if L2 stream
-            if matches!(subscription.stream_type, StreamType::L2) {
-                log::info!(
-                    "[{}] Getting initial order book snapshot for {} on {:?}",
-                    index,
-                    subscription.instrument,
-                    subscription.exchange
-                );
-                let _snapshot = connector
-                    .get_snapshot(&subscription.instrument)
-                    .await
-                    .map_err(|e| {
-                        AppError::data(format!(
-                            "Failed to get snapshot for {} on {:?}: {}",
-                            subscription.instrument, subscription.exchange, e
-                        ))
-                    })?;
-                log::info!(
-                    "[{}] Successfully retrieved order book snapshot for {} on {:?}",
-                    index,
-                    subscription.instrument,
-                    subscription.exchange
-                );
-            }
-
-            // Spawn dedicated StreamProcessor for this subscription
-            let processor_tx = processed_tx.clone();
-            let processor_symbol = subscription.instrument.clone();
-            let processor_index = index;
-            let processor_exchange = subscription.exchange.clone();
-
-            // Get appropriate OKX registry for this exchange (clone outside async block)
-            let processor_registry = match subscription.exchange {
-                Exchange::OkxSwap => okx_swap_registry.as_ref().map(|r| r.clone()),
-                Exchange::OkxSpot => okx_spot_registry.as_ref().map(|r| r.clone()),
-                _ => None,
-            };
-
-            let processor_handle = tokio::spawn(async move {
-                log::info!(
-                    "[{}] Starting StreamProcessor for {:?}@{}",
-                    processor_index,
-                    processor_exchange,
-                    processor_symbol
-                );
-                // Registry was already cloned outside the closure
-                // processor_registry is captured from outer scope
-                run_stream_processor(
-                    raw_rx,
-                    processor_tx,
-                    processor_symbol,
-                    verbose,
-                    processor_registry,
-                )
-                .await
-            });
-
-            self.connector_handles.push(processor_handle);
-
-            // Spawn connector task
-            let connector_symbol = subscription.instrument.clone();
-            let stream_type = subscription.stream_type.clone();
-            let exchange = subscription.exchange.clone();
-            let connector_index = index;
-
-            let connector_handle = tokio::spawn(async move {
-                log::info!(
-                    "[{}] Starting {:?} stream for {} on {:?}",
-                    connector_index,
-                    stream_type,
-                    connector_symbol,
-                    exchange
-                );
-
-                match stream_type {
-                    StreamType::L2 => connector
-                        .start_depth_stream(&connector_symbol, raw_tx)
-                        .await
-                        .map_err(|e| {
-                            AppError::stream(format!(
-                                "L2 stream failed for {} on {:?}: {}",
-                                connector_symbol, exchange, e
-                            ))
-                        }),
-                    StreamType::Trades => connector
-                        .start_trade_stream(&connector_symbol, raw_tx)
-                        .await
-                        .map_err(|e| {
-                            AppError::stream(format!(
-                                "Trade stream failed for {} on {:?}: {}",
-                                connector_symbol, exchange, e
-                            ))
-                        }),
-                }
-            });
-
-            self.connector_handles.push(connector_handle);
-        }
-
-        log::info!(
-            "Successfully spawned {} subscription pairs (connector + processor)",
-            self.subscriptions.len()
-        );
-        Ok(())
-    }
-
-    /// Wait for any subscription component to complete (usually due to error or shutdown)
-    pub async fn wait_for_any_completion(&mut self) -> Result<()> {
-        if self.connector_handles.is_empty() {
-            return Ok(());
-        }
-
-        // Wait for first component to complete
-        let (result, _index, remaining) =
-            futures_util::future::select_all(self.connector_handles.drain(..)).await;
-
-        // Store remaining handles back
-        self.connector_handles = remaining;
-
-        match result {
-            Ok(Ok(_)) => {
-                log::info!("One subscription component completed successfully");
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                log::error!("Subscription component failed: {}", e);
-                Err(e)
-            }
-            Err(e) => {
-                log::error!("Subscription component task panicked: {}", e);
-                Err(AppError::internal(format!(
-                    "Subscription component task failed: {}",
-                    e
-                )))
-            }
-        }
-    }
-
-    /// Gracefully shutdown all subscription components
-    pub async fn shutdown(&mut self) {
-        log::info!(
-            "Shutting down {} subscription component tasks",
-            self.connector_handles.len()
-        );
-
-        for handle in self.connector_handles.drain(..) {
-            handle.abort();
-        }
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -361,16 +66,15 @@ async fn run_application(args: Args) -> Result<()> {
     // Create communication channels
     let (processed_tx, processed_rx) = mpsc::channel(10000);
 
-    // Multi-subscription mode
+    // Get subscriptions
     let subscriptions = args
         .get_subscriptions()
         .map_err(|e| AppError::cli(format!("Invalid subscriptions: {}", e)))?;
 
-
     // Display configuration in verbose mode
     if args.verbose {
         log::info!(
-            "Starting xtrader with {} subscriptions:",
+            "Starting xtrader with {} subscriptions (using optimized unified handlers):",
             subscriptions.len()
         );
         for (i, sub) in subscriptions.iter().enumerate() {
@@ -385,14 +89,18 @@ async fn run_application(args: Args) -> Result<()> {
         log::info!("  Output: {}", args.output_parquet.display());
     }
 
-    // Create and initialize multi-subscription manager
-    let mut manager = MultiSubscriptionManager::new(subscriptions);
+    // Initialize OKX registries
+    let (okx_swap_registry, okx_spot_registry) = 
+        subscription_manager::RegistryFactory::initialize_okx_registries(&subscriptions).await?;
+
+    // Create optimized subscription manager with unified handlers
+    let mut manager = subscription_manager::SubscriptionManager::new(subscriptions, args.verbose);
     manager
-        .spawn_all_subscriptions(processed_tx, args.verbose)
+        .spawn_all_subscriptions(processed_tx, okx_swap_registry, okx_spot_registry)
         .await?;
 
     // Start Parquet sink task
-    let sink_handle = {
+    let mut sink_handle = {
         let output_path = args.output_parquet.clone();
         tokio::spawn(async move {
             log::info!("Starting Parquet sink");
@@ -405,18 +113,32 @@ async fn run_application(args: Args) -> Result<()> {
         log::info!("Will shutdown automatically after {} seconds", seconds);
         tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).boxed()
     } else {
-        // Create a future that never completes
         std::future::pending().boxed()
     };
 
     tokio::select! {
         result = manager.wait_for_any_completion() => {
             match result {
-                Ok(_) => log::info!("One connector completed successfully"),
+                Ok(_) => log::info!("One unified handler completed successfully"),
                 Err(e) => {
-                    log::error!("Connector failed: {}", e);
+                    log::error!("Unified handler failed: {}", e);
                     manager.shutdown().await;
                     return Err(e);
+                }
+            }
+        }
+        result = &mut sink_handle => {
+            match result {
+                Ok(Ok(_)) => log::info!("Parquet sink completed successfully"),
+                Ok(Err(e)) => {
+                    log::error!("Parquet sink failed: {}", e);
+                    manager.shutdown().await;
+                    return Err(e);
+                }
+                Err(e) => {
+                    log::error!("Parquet sink task panicked: {}", e);
+                    manager.shutdown().await;
+                    return Err(AppError::internal(format!("Parquet sink task failed: {}", e)));
                 }
             }
         }
@@ -428,8 +150,8 @@ async fn run_application(args: Args) -> Result<()> {
         }
     }
 
-    // Shutdown connectors and finalize Parquet sink
-    log::info!("Shutting down connectors and finalizing Parquet sink...");
+    // Shutdown handlers and finalize Parquet sink
+    log::info!("Shutting down unified handlers and finalizing Parquet sink...");
     manager.shutdown().await;
     match sink_handle.await {
         Ok(Ok(_)) => log::info!("Parquet sink finalized successfully"),
@@ -443,6 +165,6 @@ async fn run_application(args: Args) -> Result<()> {
         }
     }
 
-    log::info!("Shutdown complete");
+    log::info!("Shutdown complete - performance optimizations applied");
     Ok(())
 }

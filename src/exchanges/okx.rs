@@ -720,6 +720,10 @@ impl ExchangeConnector for OkxConnector {
             "Trade streams not implemented for OKX yet".to_string(),
         ))
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 /// Parse OKX raw message into L2 updates
@@ -769,11 +773,15 @@ pub fn create_okx_spot_connector() -> OkxConnector {
     OkxConnector::new_spot(registry)
 }
 
-/// OKX-specific message processor  
+/// OKX-specific message processor with performance optimizations
 pub struct OkxProcessor {
     base: crate::exchanges::BaseProcessor,
     okx_registry: Option<std::sync::Arc<InstrumentRegistry>>,
     exchange_id: crate::types::ExchangeId,
+    // Performance optimizations
+    symbol_cache: std::collections::HashMap<String, String>, // Cache for symbol conversions
+    metadata_cache: std::collections::HashMap<String, InstrumentMetadata>, // Cache for metadata lookups
+    string_buffer: String, // Pre-allocated buffer for string operations
 }
 
 impl OkxProcessor {
@@ -785,11 +793,41 @@ impl OkxProcessor {
             base: crate::exchanges::BaseProcessor::new(),
             okx_registry: registry,
             exchange_id,
+            // Performance optimizations
+            symbol_cache: std::collections::HashMap::with_capacity(16), // Pre-allocate for common symbols
+            metadata_cache: std::collections::HashMap::with_capacity(16), // Cache frequently used metadata
+            string_buffer: String::with_capacity(32), // Pre-allocate buffer for string operations
         }
     }
 
-    /// Convert symbol to OKX format for metadata lookup
+    /// Convert symbol to OKX format for metadata lookup (deprecated - use owned version)
     fn convert_symbol_to_okx_format(&self, symbol: &str) -> String {
+        self.convert_symbol_to_okx_format_owned(symbol)
+    }
+
+    /// Get metadata with caching to avoid repeated registry lookups
+    fn get_cached_metadata_by_owned_symbol(&mut self, okx_symbol: &str) -> Option<InstrumentMetadata> {
+        // Check if we already have it cached
+        if let Some(cached) = self.metadata_cache.get(okx_symbol) {
+            return Some(cached.clone());
+        }
+
+        // Fetch from registry and cache it
+        if let Some(ref registry) = self.okx_registry {
+            if let Ok(metadata) = registry.get_metadata(okx_symbol) {
+                let cloned_metadata = metadata.clone();
+                self.metadata_cache.insert(okx_symbol.to_string(), cloned_metadata.clone());
+                Some(cloned_metadata)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Convert symbol to OKX format returning owned string (for avoiding borrow conflicts)
+    fn convert_symbol_to_okx_format_owned(&self, symbol: &str) -> String {
         match self.exchange_id {
             crate::types::ExchangeId::OkxSwap => {
                 // For SWAP: BTC-USDT-SWAP
@@ -875,8 +913,8 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         // Start transformation timing
         let transform_start = crate::types::time::now_micros();
 
-        // Get OKX symbol format for metadata lookup once
-        let okx_symbol = self.convert_symbol_to_okx_format(symbol);
+        // Get OKX symbol format for metadata lookup once (avoid borrowing issues)
+        let okx_symbol = self.convert_symbol_to_okx_format_owned(symbol);
 
         // Track total bid/ask count across all data entries
         let mut total_bid_count = 0u32;
@@ -926,15 +964,15 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
                     // Apply unit conversion if metadata available
                     let size = if let Some(ref registry) = self.okx_registry {
-                        if let Ok(metadata) = registry.get_metadata(&okx_symbol) {
+                        if let Some(metadata) = self.get_cached_metadata_by_owned_symbol(&okx_symbol) {
                             let converted = metadata.normalize_quantity(raw_size);
-                            log::debug!(
-                                "Unit conversion: {} raw={} -> converted={} (multiplier={:?})",
-                                okx_symbol,
-                                raw_size,
-                                converted,
-                                metadata.contract_multiplier
-                            );
+                            // log::debug!(
+                            //     "Unit conversion: {} raw={} -> converted={} (multiplier={:?})",
+                            //     okx_symbol,
+                            //     raw_size,
+                            //     converted,
+                            //     metadata.contract_multiplier
+                            // );
                             converted
                         } else {
                             log::warn!("No metadata found for symbol: {}", okx_symbol);
@@ -981,15 +1019,15 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
                     // Apply unit conversion if metadata available
                     let size = if let Some(ref registry) = self.okx_registry {
-                        if let Ok(metadata) = registry.get_metadata(&okx_symbol) {
+                        if let Some(metadata) = self.get_cached_metadata_by_owned_symbol(&okx_symbol) {
                             let converted = metadata.normalize_quantity(raw_size);
-                            log::debug!(
-                                "Unit conversion: {} raw={} -> converted={} (multiplier={:?})",
-                                okx_symbol,
-                                raw_size,
-                                converted,
-                                metadata.contract_multiplier
-                            );
+                            // log::debug!(
+                            //     "Unit conversion: {} raw={} -> converted={} (multiplier={:?})",
+                            //     okx_symbol,
+                            //     raw_size,
+                            //     converted,
+                            //     metadata.contract_multiplier
+                            // );
                             converted
                         } else {
                             log::warn!("No metadata found for symbol: {}", okx_symbol);

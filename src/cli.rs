@@ -182,15 +182,11 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
-    fn create_single_subscription_args() -> Args {
+    fn create_valid_args() -> Args {
         Args {
-            exchange: Some(Exchange::BinanceFutures),
-            symbol: Some("BTCUSDT".to_string()),
+            subscriptions: "L2:OKX_SWAP@BTCUSDT".to_string(),
             output_parquet: PathBuf::from("test.parquet"),
-            stream: Some(StreamType::L2),
-            subscriptions: None,
             verbose: false,
             shutdown_after: None,
         }
@@ -198,11 +194,8 @@ mod tests {
 
     fn create_multi_subscription_args() -> Args {
         Args {
-            exchange: None,
-            symbol: None,
+            subscriptions: "L2:OKX_SWAP@BTCUSDT,TRADES:BINANCE_FUTURES@ETHUSDT".to_string(),
             output_parquet: PathBuf::from("test.parquet"),
-            stream: None,
-            subscriptions: Some("L2:OKX_SWAP@BTCUSDT".to_string()),
             verbose: false,
             shutdown_after: None,
         }
@@ -283,90 +276,40 @@ mod tests {
     }
 
     #[test]
-    fn test_single_subscription_validation() {
-        let mut args = create_single_subscription_args();
+    fn test_subscription_validation() {
+        let mut args = create_valid_args();
 
-        // Valid single subscription should pass
+        // Valid subscription should pass
         assert!(args.validate().is_ok());
-        assert!(args.is_single_subscription_mode());
 
-        // Lowercase symbol should fail
-        args.symbol = Some("btcusdt".to_string());
+        // Invalid format should fail
+        args.subscriptions = "INVALID_FORMAT".to_string();
         assert!(args.validate().is_err());
 
-        // Non-USDT should fail
-        args.symbol = Some("BTCEUR".to_string());
+        // Invalid stream type should fail
+        args.subscriptions = "INVALID:OKX_SWAP@BTCUSDT".to_string();
         assert!(args.validate().is_err());
 
-        // Too short should fail
-        args.symbol = Some("BTC".to_string());
-        assert!(args.validate().is_err());
-
-        // Missing required fields should fail
-        let mut args = create_single_subscription_args();
-        args.exchange = None;
-        assert!(args.validate().is_err());
-
-        args = create_single_subscription_args();
-        args.symbol = None;
-        assert!(args.validate().is_err());
-
-        args = create_single_subscription_args();
-        args.stream = None;
-        assert!(args.validate().is_err());
-    }
-
-    #[test]
-    fn test_multi_subscription_validation() {
-        let mut args = create_multi_subscription_args();
-
-        // Valid multi subscription should pass
-        assert!(args.validate().is_ok());
-        assert!(!args.is_single_subscription_mode());
-
-        // Invalid subscription format should fail
-        args.subscriptions = Some("INVALID_FORMAT".to_string());
-        assert!(args.validate().is_err());
-
-        // Lowercase instrument should fail
-        args.subscriptions = Some("L2:OKX_SWAP@btcusdt".to_string());
-        assert!(args.validate().is_err());
-
-        // Non-USDT should fail
-        args.subscriptions = Some("L2:OKX_SWAP@BTCEUR".to_string());
+        // Invalid exchange should fail
+        args.subscriptions = "L2:INVALID_EXCHANGE@BTCUSDT".to_string();
         assert!(args.validate().is_err());
 
         // Multiple valid subscriptions should pass
-        args.subscriptions = Some("L2:OKX_SWAP@BTCUSDT,TRADES:BINANCE_FUTURES@ETHUSDT".to_string());
+        args.subscriptions = "L2:OKX_SWAP@BTCUSDT,TRADES:BINANCE_FUTURES@ETHUSDT".to_string();
         assert!(args.validate().is_ok());
-    }
 
-    #[test]
-    fn test_mutually_exclusive_modes() {
-        let mut args = Args {
-            exchange: Some(Exchange::BinanceFutures),
-            symbol: Some("BTCUSDT".to_string()),
-            output_parquet: PathBuf::from("test.parquet"),
-            stream: Some(StreamType::L2),
-            subscriptions: Some("L2:OKX_SWAP@BTCUSDT".to_string()),
-            verbose: false,
-            shutdown_after: None,
-        };
+        // Lowercase instruments are now allowed
+        args.subscriptions = "L2:OKX_SWAP@btcusdt".to_string();
+        assert!(args.validate().is_ok());
 
-        // Both modes specified should fail
-        assert!(args.validate().is_err());
-
-        // No mode specified should fail
-        args.exchange = None;
-        args.symbol = None;
-        args.stream = None;
-        args.subscriptions = None;
-        assert!(args.validate().is_err());
+        // Non-USDT instruments are now allowed  
+        args.subscriptions = "L2:OKX_SWAP@BTCEUR".to_string();
+        assert!(args.validate().is_ok());
     }
 
     #[test]
     fn test_output_validation() {
-        let mut args = create_single_subscription_args();
+        let mut args = create_valid_args();
 
         // Wrong extension should fail
         args.output_parquet = PathBuf::from("test.txt");
@@ -379,12 +322,13 @@ mod tests {
 
     #[test]
     fn test_get_subscriptions() {
-        let args = create_multi_subscription_args();
-        let subscriptions = args.get_subscriptions().unwrap().unwrap();
+        let args = create_valid_args();
+        let subscriptions = args.get_subscriptions().unwrap();
         assert_eq!(subscriptions.len(), 1);
         assert_eq!(subscriptions[0].instrument, "BTCUSDT");
 
-        let args = create_single_subscription_args();
-        assert!(args.get_subscriptions().unwrap().is_none());
+        let args = create_multi_subscription_args();
+        let subscriptions = args.get_subscriptions().unwrap();
+        assert_eq!(subscriptions.len(), 2);
     }
 }

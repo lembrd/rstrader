@@ -98,6 +98,9 @@ pub trait ExchangeConnector: Send + Sync {
         symbol: &str,
         tx: tokio::sync::mpsc::Sender<RawMessage>,
     ) -> Result<(), Self::Error>;
+
+    /// Allow downcasting to concrete types for exchange-specific operations
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 /// Base processor containing common fields shared by all exchange processors

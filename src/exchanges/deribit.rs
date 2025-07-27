@@ -610,6 +610,10 @@ impl ExchangeConnector for DeribitConnector {
         // TODO: Implement trade subscription
         Ok(())
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 /// Factory function for creating Deribit connector

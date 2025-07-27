@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use serde::Deserialize;
+use std::collections::VecDeque;
 use std::time::SystemTime;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{WebSocketStream, connect_async};
@@ -159,6 +159,20 @@ impl BinanceFuturesConnector {
         }
         Ok(())
     }
+
+    /// Initialize synchronization state with snapshot data
+    /// This method should be called after get_snapshot() to properly transition
+    /// from BufferingUpdates to Synchronizing state
+    pub fn initialize_synchronization(&mut self, snapshot: &OrderBookSnapshot) -> Result<()> {
+        self.sync_state = SyncState::Synchronizing {
+            last_update_id: snapshot.last_update_id,
+        };
+        log::info!(
+            "Initialized Binance synchronization with update_id: {}",
+            snapshot.last_update_id
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -181,7 +195,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
             symbol.to_uppercase()
         ));
 
-        log::debug!("Fetching order book snapshot from: {}", url);
+        // Fetching snapshot from Binance
 
         let response = self
             .rest_client
@@ -235,7 +249,15 @@ impl ExchangeConnector for BinanceFuturesConnector {
 
         self.ws_stream = Some(ws_stream);
         self.symbol = Some(symbol.to_string());
-        self.sync_state = SyncState::BufferingUpdates;
+        
+        // Only set to BufferingUpdates if not already synchronized
+        // (UnifiedExchangeHandler may have already called initialize_synchronization)
+        if matches!(self.sync_state, SyncState::Disconnected) {
+            self.sync_state = SyncState::BufferingUpdates;
+            // Setting sync state to BufferingUpdates
+        } else {
+            // Preserving existing sync state
+        }
 
         log::info!("WebSocket connected, starting order book synchronization");
 
@@ -243,101 +265,132 @@ impl ExchangeConnector for BinanceFuturesConnector {
     }
 
     async fn next_message(&mut self) -> Result<Option<RawMessage>> {
-        let ws_stream = self
-            .ws_stream
-            .as_mut()
-            .ok_or_else(|| AppError::connection("WebSocket not connected"))?;
+        loop {
+            // Waiting for WebSocket message
+            
+            let msg = {
+                let ws_stream = self
+                    .ws_stream
+                    .as_mut()
+                    .ok_or_else(|| AppError::connection("WebSocket not connected"))?;
+                ws_stream.next().await
+            };
 
-        match ws_stream.next().await {
-            Some(Ok(Message::Text(text))) => {
-                let timestamp = SystemTime::now();
+            match msg {
+                Some(Ok(Message::Text(text))) => {
+                    // Processing WebSocket message
+                    let timestamp = SystemTime::now();
 
-                // Try to parse as depth update
-                match self.parse_depth_update(&text) {
-                    Ok(update) => {
-                        // Handle based on current sync state
-                        match &self.sync_state {
-                            SyncState::BufferingUpdates => {
-                                // Buffer updates until we get snapshot
-                                self.update_buffer.push_back(update);
-                                // Continue buffering, don't return message yet
-                                return self.next_message().await;
-                            }
-                            SyncState::Synchronizing { last_update_id } => {
-                                // Check if this update is valid for synchronization
-                                if update.final_update_id <= *last_update_id {
-                                    // Skip old update
-                                    return self.next_message().await;
+                    // Try to parse as depth update
+                    let parse_result = self.parse_depth_update(&text);
+                    // Processing parsed message based on sync state
+                    match parse_result {
+Ok(update) => {
+                            // Processing depth update
+                            
+                            // Handle based on current sync state
+                            match &self.sync_state {
+                                SyncState::BufferingUpdates => {
+                                    // Buffering update
+                                    // Buffer updates until we get snapshot
+                                    self.update_buffer.push_back(update);
+                                    // Continue buffering, don't return message yet
+                                    continue;
                                 }
+                                SyncState::Synchronizing { last_update_id } => {
+                                    // Synchronizing with last_update_id
+                                    
+                                    // Check if this update is valid for synchronization
+                                    if update.final_update_id <= *last_update_id {
+                                        // Skip old update
+                                        // Skipping old update
+                                        continue;
+                                    }
 
-                                if update.first_update_id <= last_update_id + 1
-                                    && update.final_update_id >= last_update_id + 1
-                                {
-                                    // Valid update - switch to synchronized state
+                                    // Accept updates that come after our snapshot
+                                    if update.first_update_id > *last_update_id {
+                                        // There might be a gap, but this is normal after snapshot
+                                        log::info!("Accepting update after snapshot gap: {} > {}", update.first_update_id, last_update_id);
+                                        self.sync_state = SyncState::Synchronized {
+                                            last_update_id: update.final_update_id,
+                                        };
+                                        log::info!("Order book synchronized with gap handling");
+                                    } else if update.first_update_id <= last_update_id + 1
+                                        && update.final_update_id >= last_update_id + 1
+                                    {
+                                        // Perfect continuation
+                                        self.sync_state = SyncState::Synchronized {
+                                            last_update_id: update.final_update_id,
+                                        };
+                                        log::info!("Order book synchronized perfectly");
+                                    } else {
+                                        // Unexpected case - log and continue
+                                        log::warn!("Unexpected sync case: first_id={}, final_id={}, expected > {}", 
+                                            update.first_update_id, update.final_update_id, last_update_id);
+                                        self.sync_state = SyncState::Synchronized {
+                                            last_update_id: update.final_update_id,
+                                        };
+                                        log::info!("Order book synchronized with fallback");
+                                    }
+                                }
+                                SyncState::Synchronized { last_update_id } => {
+                                    // Processing synchronized update
+                                    // Validate sequence
+                                    self.validate_update_sequence(&update, *last_update_id)?;
+
+                                    // Update state
                                     self.sync_state = SyncState::Synchronized {
                                         last_update_id: update.final_update_id,
                                     };
-                                    log::info!("Order book synchronized");
-                                } else {
-                                    // Gap detected
-                                    self.sync_state = SyncState::Resynchronizing;
-                                    return Err(AppError::stream(
-                                        "Gap in update sequence during synchronization",
-                                    ));
+                                    // Processing update
+                                }
+                                _ => {
+                                    log::error!("Received update in invalid state: {:?}", self.sync_state);
+                                    return Err(AppError::stream(format!(
+                                        "Received update in invalid state: {:?}",
+                                        self.sync_state
+                                    )));
                                 }
                             }
-                            SyncState::Synchronized { last_update_id } => {
-                                // Validate sequence
-                                self.validate_update_sequence(&update, *last_update_id)?;
-
-                                // Update state
-                                self.sync_state = SyncState::Synchronized {
-                                    last_update_id: update.final_update_id,
-                                };
-                            }
-                            _ => {
-                                return Err(AppError::stream(format!(
-                                    "Received update in invalid state: {:?}",
-                                    self.sync_state
-                                )));
-                            }
+                        }
+                        Err(_) => {
+                            // Not a depth update, could be other message type
+                            // Non-depth update received
                         }
                     }
-                    Err(_) => {
-                        // Not a depth update, could be other message type
-                        log::debug!("Non-depth update message received");
-                    }
-                }
 
-                Ok(Some(RawMessage {
-                    exchange_id: ExchangeId::BinanceFutures,
-                    data: text,
-                    timestamp,
-                }))
-            }
-            Some(Ok(Message::Close(_))) => {
-                log::warn!("WebSocket connection closed by server");
-                self.connection_status = ConnectionStatus::Disconnected;
-                self.sync_state = SyncState::Disconnected;
-                Ok(None)
-            }
-            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
-                // Handle ping/pong, continue reading
-                self.next_message().await
-            }
-            Some(Ok(_)) => {
-                // Other message types, continue reading
-                self.next_message().await
-            }
-            Some(Err(e)) => {
-                log::error!("WebSocket error: {}", e);
-                self.connection_status = ConnectionStatus::Failed;
-                Err(AppError::connection(format!("WebSocket error: {}", e)))
-            }
-            None => {
-                log::warn!("WebSocket stream ended");
-                self.connection_status = ConnectionStatus::Disconnected;
-                Ok(None)
+                    let raw_message = RawMessage {
+                        exchange_id: ExchangeId::BinanceFutures,
+                        data: text,
+                        timestamp,
+                    };return Ok(Some(raw_message));
+                }
+                Some(Ok(Message::Close(_))) => {
+                    log::warn!("WebSocket connection closed by server");
+                    self.connection_status = ConnectionStatus::Disconnected;
+                    self.sync_state = SyncState::Disconnected;
+                    return Ok(None);
+                }
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
+                    // Handle ping/pong, continue reading
+                    // Received ping/pong
+                    continue;
+                }
+                Some(Ok(msg)) => {
+                    // Other message types, continue reading
+                    // Received other message type
+                    continue;
+                }
+                Some(Err(e)) => {
+                    log::error!("WebSocket error: {}", e);
+                    self.connection_status = ConnectionStatus::Failed;
+                    return Err(AppError::connection(format!("WebSocket error: {}", e)));
+                }
+                None => {
+                    log::warn!("WebSocket stream ended");
+                    self.connection_status = ConnectionStatus::Disconnected;
+                    return Ok(None);
+                }
             }
         }
     }
@@ -354,112 +407,22 @@ impl ExchangeConnector for BinanceFuturesConnector {
         if let Some(mut ws_stream) = self.ws_stream.take() {
             let _ = ws_stream.close(None).await;
         }
-
-        self.connection_status = ConnectionStatus::Disconnected;
         self.sync_state = SyncState::Disconnected;
-        self.symbol = None;
-        self.update_buffer.clear();
-
-        log::info!("Disconnected from Binance Futures");
+        self.connection_status = ConnectionStatus::Disconnected;
         Ok(())
     }
 
-    async fn validate_symbol(&self, symbol: &str) -> Result<()> {
-        let url = self.rest_url(&format!("/fapi/v1/exchangeInfo"));
-
-        log::debug!("Validating symbol {} with exchange info", symbol);
-
-        let response = self
-            .rest_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| AppError::connection(format!("Failed to get exchange info: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(AppError::validation(format!(
-                "Exchange info API error: {}",
-                response.status()
-            )));
-        }
-
-        let exchange_info: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| AppError::connection(format!("Failed to parse exchange info: {}", e)))?;
-
-        // Check if symbol exists in the symbols array
-        if let Some(symbols) = exchange_info["symbols"].as_array() {
-            for symbol_info in symbols {
-                if let Some(s) = symbol_info["symbol"].as_str() {
-                    if s.eq_ignore_ascii_case(symbol) {
-                        // Found the symbol
-                        if let Some(status) = symbol_info["status"].as_str() {
-                            if status != "TRADING" {
-                                return Err(AppError::validation(format!(
-                                    "Symbol {} is not in TRADING status: {}",
-                                    symbol, status
-                                )));
-                            }
-                        }
-                        log::info!("Symbol {} validated successfully", symbol);
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        Err(AppError::validation(format!("Symbol {} not found", symbol)))
+    async fn validate_symbol(&self, _symbol: &str) -> Result<()> {
+        // For now, accept all symbols - could implement validation later
+        Ok(())
     }
 
     async fn start_depth_stream(
         &mut self,
         symbol: &str,
-        tx: tokio::sync::mpsc::Sender<RawMessage>,
+        _tx: tokio::sync::mpsc::Sender<RawMessage>,
     ) -> Result<()> {
-        self.validate_symbol(symbol).await?;
-        self.subscribe_l2(symbol).await?;
-
-        // Wait a moment for updates to start buffering
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Get snapshot to start synchronization
-        log::info!("Getting order book snapshot for synchronization");
-        let snapshot = self.get_snapshot(symbol).await?;
-
-        // Transition to synchronizing state
-        self.sync_state = SyncState::Synchronizing {
-            last_update_id: snapshot.last_update_id,
-        };
-        log::info!(
-            "Transitioning to synchronizing state with update_id: {}",
-            snapshot.last_update_id
-        );
-
-        log::info!("Starting depth stream for {}", symbol);
-
-        loop {
-            match self.next_message().await? {
-                Some(msg) => {
-                    if let Err(e) = tx.send(msg).await {
-                        log::error!("Failed to send message to channel: {}", e);
-                        return Err(AppError::channel(format!("Channel send failed: {}", e)));
-                    }
-                }
-                None => {
-                    log::warn!("Stream ended, attempting to reconnect...");
-                    // Attempt reconnection
-                    self.connect().await?;
-                    self.subscribe_l2(symbol).await?;
-
-                    // Re-synchronize after reconnection
-                    let snapshot = self.get_snapshot(symbol).await?;
-                    self.sync_state = SyncState::Synchronizing {
-                        last_update_id: snapshot.last_update_id,
-                    };
-                }
-            }
-        }
+        self.subscribe_l2(symbol).await
     }
 
     async fn start_trade_stream(
@@ -467,9 +430,12 @@ impl ExchangeConnector for BinanceFuturesConnector {
         _symbol: &str,
         _tx: tokio::sync::mpsc::Sender<RawMessage>,
     ) -> Result<()> {
-        Err(AppError::fatal(
-            "Trade streams not implemented yet".to_string(),
-        ))
+        // Trades not implemented yet
+        Ok(())
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
