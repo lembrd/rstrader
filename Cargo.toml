@@ -24,6 +24,7 @@ simd-json = "0.14"
 fast-float = "0.2"
 arrow = "53.0"
 parquet = "53.0"
+tempfile = "3.10"
 
 # Error handling
 anyhow = "1.0"

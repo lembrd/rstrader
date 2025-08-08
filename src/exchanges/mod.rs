@@ -104,6 +104,18 @@ pub trait ExchangeConnector: Send + Sync {
 
     /// Allow downcasting to concrete types for exchange-specific operations
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
+    /// Optional: Prepare L2 synchronization after snapshot retrieval.
+    /// Default no-op for connectors that do not require explicit preparation.
+    fn prepare_l2_sync(&mut self, _snapshot: &OrderBookSnapshot) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Optional: Take pre-snapshot buffered L2 messages that must be replayed
+    /// after reconciliation to ensure continuity. Default: no replay.
+    fn take_l2_replay_messages(&mut self) -> Option<Vec<RawMessage>> {
+        None
+    }
 }
 
 /// Base processor containing common fields shared by all exchange processors

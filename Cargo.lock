@@ -3192,6 +3192,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simd-json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",

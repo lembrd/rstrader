@@ -156,11 +156,15 @@ impl Args {
             anyhow::bail!("Output path {} is not a directory", self.output_directory.display());
         }
 
-        // Check if directory is writable by attempting to create a test file
-        let test_file = self.output_directory.join(".write_test");
-        std::fs::write(&test_file, "test")
-            .and_then(|_| std::fs::remove_file(&test_file))
-            .map_err(|e| anyhow::anyhow!("Output directory {} is not writable: {}", self.output_directory.display(), e))?;
+        // Check if directory is writable using a unique temp file to avoid test races
+        let _tmp = tempfile::Builder::new()
+            .prefix(".write_test_")
+            .tempfile_in(&self.output_directory)
+            .map_err(|e| anyhow::anyhow!(
+                "Output directory {} is not writable: {}",
+                self.output_directory.display(),
+                e
+            ))?;
 
         Ok(())
     }

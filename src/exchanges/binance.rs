@@ -8,6 +8,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{WebSocketStream, connect_async};
 
 use crate::error::{AppError, Result};
+use serde_json::json;
 use crate::exchanges::ExchangeConnector;
 use crate::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate, TradeSide};
 use fast_float;
@@ -248,22 +249,8 @@ impl BinanceFuturesConnector {
     /// from BufferingUpdates to Synchronizing state
     pub fn initialize_synchronization(&mut self, snapshot: &OrderBookSnapshot) -> Result<()> {
         // Process any buffered updates before transitioning state
-        if matches!(self.sync_state, SyncState::BufferingUpdates) {
-            log::info!("Processing {} buffered updates before synchronization", self.update_buffer.len());
-            match self.process_buffered_updates(snapshot.last_update_id) {
-                Ok(valid_updates) => {
-                    log::info!("Found {} valid buffered updates to apply", valid_updates.len());
-                    // The buffered updates are already processed and cleared from buffer
-                    // The synchronization will continue with incoming updates
-                }
-                Err(e) => {
-                    log::warn!("Failed to process buffered updates, continuing anyway: {}", e);
-                    // Clear buffer to prevent issues
-                    self.update_buffer.clear();
-                }
-            }
-        }
-        
+        // Switch to Synchronizing with snapshot's update id. Do not drain buffer here;
+        // buffered updates will be reconciled and replayed by take_l2_replay_messages().
         self.sync_state = SyncState::Synchronizing {
             last_update_id: snapshot.last_update_id,
         };
@@ -272,6 +259,33 @@ impl BinanceFuturesConnector {
             snapshot.last_update_id
         );
         Ok(())
+    }
+
+    /// Build RawMessage list for buffered depth updates to be replayed via processor
+    fn drain_buffered_as_raw(&mut self) -> Vec<RawMessage> {
+        let mut out = Vec::with_capacity(self.update_buffer.len());
+        let exchange_id = ExchangeId::BinanceFutures;
+        while let Some(update) = self.update_buffer.pop_front() {
+            // Manually encode to JSON using the expected Binance wire schema
+            let text = json!({
+                "e": update.event_type,
+                "E": update.event_time,
+                "T": update.transaction_time,
+                "s": update.symbol,
+                "U": update.first_update_id,
+                "u": update.final_update_id,
+                "pu": update.prev_final_update_id,
+                "b": update.bids,
+                "a": update.asks,
+            }).to_string();
+
+            out.push(RawMessage {
+                exchange_id,
+                data: text,
+                timestamp: std::time::SystemTime::now(),
+            });
+        }
+        out
     }
 }
 
@@ -631,6 +645,31 @@ impl ExchangeConnector for BinanceFuturesConnector {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+
+    fn prepare_l2_sync(&mut self, snapshot: &OrderBookSnapshot) -> Result<()> {
+        // Initialize internal state for synchronization
+        self.initialize_synchronization(snapshot)
+    }
+
+    fn take_l2_replay_messages(&mut self) -> Option<Vec<RawMessage>> {
+        // Only reconcile and replay if we are in Synchronizing state with a known last_update_id
+        let mut last_id_opt: Option<i64> = None;
+        if let SyncState::Synchronizing { last_update_id } = self.sync_state {
+            last_id_opt = Some(last_update_id);
+        }
+
+        if let Some(last_id) = last_id_opt {
+            if let Ok(valid) = self.process_buffered_updates(last_id) {
+                if valid.is_empty() && self.update_buffer.is_empty() {
+                    return None;
+                }
+                // valid were drained by process_buffered_updates(); now encode all drained items
+                let msgs = self.drain_buffered_as_raw();
+                return if msgs.is_empty() { None } else { Some(msgs) };
+            }
+        }
+        None
     }
 }
 

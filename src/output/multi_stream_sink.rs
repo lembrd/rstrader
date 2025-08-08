@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
@@ -75,9 +74,12 @@ impl StreamWriter {
         let batch = L2RecordBatchFactory::create_record_batch(schema, &self.l2_buffer)?;
         
         let writer = self.writer.as_mut().unwrap();
-        writer
-            .write(&batch)
-            .map_err(|e| AppError::io(format!("Failed to write L2 batch: {}", e)))?;
+        // Prevent blocking the async scheduler by running blocking parquet write on a blocking thread
+        tokio::task::block_in_place(|| {
+            writer
+                .write(&batch)
+                .map_err(|e| AppError::io(format!("Failed to write L2 batch: {}", e)))
+        })?;
 
         let batch_size = self.l2_buffer.len();
         self.l2_buffer.clear();
@@ -98,9 +100,11 @@ impl StreamWriter {
         let batch = TradeRecordBatchFactory::create_record_batch(schema, &self.trade_buffer)?;
         
         let writer = self.writer.as_mut().unwrap();
-        writer
-            .write(&batch)
-            .map_err(|e| AppError::io(format!("Failed to write Trade batch: {}", e)))?;
+        tokio::task::block_in_place(|| {
+            writer
+                .write(&batch)
+                .map_err(|e| AppError::io(format!("Failed to write Trade batch: {}", e)))
+        })?;
 
         let batch_size = self.trade_buffer.len();
         self.trade_buffer.clear();
@@ -116,18 +120,21 @@ impl StreamWriter {
         }
 
         let file_path = file_manager.generate_file_path(&self.stream_type, self.exchange, &self.symbol);
-        
-        let file = std::fs::File::create(&file_path)
-            .map_err(|e| AppError::io(format!("Failed to create output file: {}", e)))?;
 
-        let schema = get_schema_for_stream_type(&self.stream_type);
-        let props = WriterProperties::builder()
-            .set_compression(parquet::basic::Compression::SNAPPY)
-            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
-            .build();
+        // File create and writer construction are blocking; use block_in_place to avoid starving runtime
+        let writer = tokio::task::block_in_place(|| {
+            let file = std::fs::File::create(&file_path)
+                .map_err(|e| AppError::io(format!("Failed to create output file: {}", e)))?;
 
-        let writer = ArrowWriter::try_new(file, schema, Some(props))
-            .map_err(|e| AppError::io(format!("Failed to create Parquet writer: {}", e)))?;
+            let schema = get_schema_for_stream_type(&self.stream_type);
+            let props = WriterProperties::builder()
+                .set_compression(parquet::basic::Compression::SNAPPY)
+                .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+                .build();
+
+            ArrowWriter::try_new(file, schema, Some(props))
+                .map_err(|e| AppError::io(format!("Failed to create Parquet writer: {}", e)))
+        })?;
 
         self.writer = Some(writer);
         self.current_file_path = Some(file_path.clone());
@@ -154,9 +161,11 @@ impl StreamWriter {
 
         if let Some(writer) = self.writer.take() {
             let mut writer = writer;
-            writer
-                .close()
-                .map_err(|e| AppError::io(format!("Failed to close Parquet writer: {}", e)))?;
+            tokio::task::block_in_place(|| {
+                writer
+                    .close()
+                    .map_err(|e| AppError::io(format!("Failed to close Parquet writer: {}", e)))
+            })?;
             
             if let Some(path) = &self.current_file_path {
                 log::info!("Closed {} writer for: {}", self.stream_type, path.display());

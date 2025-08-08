@@ -148,10 +148,12 @@ impl FileManager {
 
     /// Simple pattern matching for file listing
     fn matches_pattern(&self, filename: &str, pattern: &str) -> bool {
-        if pattern.starts_with('*') {
-            filename.ends_with(&pattern[1..])
-        } else if pattern.ends_with('*') {
-            filename.starts_with(&pattern[..pattern.len()-1])
+        // Simple contains-based match to handle our *_*.parquet use-case without external deps.
+        // Pattern like L2_EXCH_SYMBOL_*.parquet -> must start with prefix and end with .parquet
+        if let Some(star_idx) = pattern.find('*') {
+            let (prefix, suffix) = pattern.split_at(star_idx);
+            let suffix = &suffix[1..];
+            filename.starts_with(prefix) && filename.ends_with(suffix)
         } else {
             filename == pattern
         }

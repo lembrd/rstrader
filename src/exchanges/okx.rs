@@ -891,6 +891,12 @@ impl ExchangeConnector for OkxConnector {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+
+    fn prepare_l2_sync(&mut self, _snapshot: &OrderBookSnapshot) -> Result<()> {
+        // OKX provides prevSeqId/seqId; we start in Subscribed state and allow normal processing.
+        // For checksum-capable channels (books-l2-tbt), checksum verification should be added here.
+        Ok(())
+    }
 }
 
 /// Parse OKX raw message into L2 updates
@@ -949,6 +955,7 @@ pub struct OkxProcessor {
     symbol_cache: std::collections::HashMap<String, String>, // Cache for symbol conversions
     metadata_cache: std::collections::HashMap<String, InstrumentMetadata>, // Cache for metadata lookups
     string_buffer: String, // Pre-allocated buffer for string operations
+    last_seq_id: Option<i64>,
 }
 
 impl OkxProcessor {
@@ -964,6 +971,7 @@ impl OkxProcessor {
             symbol_cache: std::collections::HashMap::with_capacity(16), // Pre-allocate for common symbols
             metadata_cache: std::collections::HashMap::with_capacity(16), // Cache frequently used metadata
             string_buffer: String::with_capacity(32), // Pre-allocate buffer for string operations
+            last_seq_id: None,
         }
     }
 
@@ -1127,6 +1135,18 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
             let seq_id = data.seq_id.unwrap_or(0);
             let first_update_id = data.prev_seq_id.unwrap_or(seq_id);
+
+            // Minimal continuity check to detect gaps quickly
+            if let Some(prev) = self.last_seq_id {
+                if let Some(prev_seq) = data.prev_seq_id {
+                    if prev_seq != prev {
+                        return Err(crate::error::AppError::pipeline(
+                            format!("OKX sequence gap: prev_seq_id={} last_seq_id={}", prev_seq, prev),
+                        ));
+                    }
+                }
+            }
+            self.last_seq_id = Some(seq_id);
 
             // Count bid/ask levels for complexity metrics
             total_bid_count += data.bids.len() as u32;

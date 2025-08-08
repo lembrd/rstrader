@@ -1,11 +1,10 @@
 use std::sync::Arc;
-use std::any::Any;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, Result};
 use crate::exchanges::{ExchangeConnector, ExchangeProcessor};
-use crate::types::{OrderBookL2Update, RawMessage, ExchangeId, StreamData};
+use crate::types::{RawMessage, ExchangeId, StreamData};
 use crate::cli::{StreamType, SubscriptionSpec};
 
 /// Unified exchange handler that combines connector and processor into a single async task
@@ -81,48 +80,7 @@ impl UnifiedExchangeHandler {
                 ))
             })?;
 
-        // Get initial snapshot if L2 stream and initialize synchronization
-        // Checking stream type for snapshot requirement
-        if matches!(self.subscription.stream_type, StreamType::L2) {
-            // Getting snapshot for L2 stream
-            let snapshot = self.connector
-                .get_snapshot(&self.subscription.instrument)
-                .await
-                .map_err(|e| {
-                    AppError::data(format!(
-                        "Failed to get snapshot for {} on {:?}: {}",
-                        self.subscription.instrument, self.subscription.exchange, e
-                    ))
-                })?;
-            // Successfully retrieved snapshot
-
-            // Initialize Binance synchronization state if this is a Binance connector
-            // Checking for Binance connector
-            if let crate::cli::Exchange::BinanceFutures = self.subscription.exchange {
-                // Initializing Binance synchronization
-                // Cast connector to BinanceFuturesConnector to access synchronization method
-                // Attempting downcast to BinanceFuturesConnector
-                if let Some(binance_connector) = self.connector
-                    .as_any_mut()
-                    .downcast_mut::<crate::exchanges::binance::BinanceFuturesConnector>()
-                {
-                    // Successfully downcast, initializing synchronization
-                    binance_connector
-                        .initialize_synchronization(&snapshot)
-                        .map_err(|e| {
-                            AppError::data(format!(
-                                "Failed to initialize Binance synchronization: {}",
-                                e
-                            ))
-                        })?;
-                    // Binance synchronization initialized
-                } else {
-                    log::error!("Failed to downcast to BinanceFuturesConnector");
-                }
-            }
-        } else {
-            // Skipping snapshot for non-L2 stream
-        }
+        // Snapshot handling moved into L2 stream runner to enforce subscribe-first, then snapshot reconciliation.
 
         // Set exchange info for metrics reporter
         if let Some(ref mut reporter) = reporter {
@@ -147,16 +105,43 @@ impl UnifiedExchangeHandler {
         output_tx: mpsc::Sender<StreamData>,
         mut reporter: Option<crate::pipeline::processor::MetricsReporter>,
     ) -> Result<()> {
-        // Subscribe to L2 stream
+        // Subscribe FIRST to begin buffering updates on the connector side
         self.connector
             .subscribe_l2(&self.subscription.instrument)
             .await
-            .map_err(|e| {
-                AppError::stream(format!(
-                    "Failed to subscribe to L2 stream: {}",
-                    e
-                ))
-            })?;
+            .map_err(|e| AppError::stream(format!("Failed to subscribe to L2 stream: {}", e)))?;
+
+        // Then fetch snapshot and let connector prepare sync (reconciliation)
+        let snapshot = self
+            .connector
+            .get_snapshot(&self.subscription.instrument)
+            .await
+            .map_err(|e| AppError::data(format!(
+                "Failed to get snapshot for {} on {:?}: {}",
+                self.subscription.instrument, self.subscription.exchange, e
+            )))?;
+
+        // Give connector a chance to prepare internal sync state and reconcile buffered deltas
+        self.connector
+            .prepare_l2_sync(&snapshot)
+            .map_err(|e| AppError::data(format!("Failed to prepare L2 sync: {}", e)))?;
+
+        // If connector exposes replayable buffered messages, process them now to ensure continuity
+        if let Some(replay_msgs) = self.connector.take_l2_replay_messages() {
+            for raw in replay_msgs {
+                match self.process_raw_message(raw).await {
+                    Ok(updates) => {
+                        for update in updates {
+                            if let Err(e) = output_tx.send(update).await {
+                                log::error!("Failed to send replayed update: {}", e);
+                                return Err(AppError::pipeline("Output channel send failed".to_string()));
+                            }
+                        }
+                    }
+                    Err(e) => log::error!("Failed to process replayed message: {}", e),
+                }
+            }
+        }
 
         // Direct message processing loop with cancellation support
         loop {
