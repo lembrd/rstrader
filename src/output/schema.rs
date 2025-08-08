@@ -1,7 +1,7 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use std::sync::Arc;
 
-use crate::types::{OrderBookL2Update, TradeUpdate};
+// No direct dependency on stream types here; keep schema independent of data structs
 
 /// Trait for creating Arrow schemas for different stream types
 pub trait SchemaFactory {

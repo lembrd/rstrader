@@ -1,6 +1,7 @@
 use crate::exchanges::ExchangeError;
 
 /// Main application error type
+#[allow(dead_code)]
 #[derive(thiserror::Error, Debug)]
 pub enum AppError {
     #[error("CLI argument error: {message}")]
@@ -56,42 +57,49 @@ pub enum AppError {
 }
 
 impl AppError {
+    #[allow(dead_code)]
     pub fn cli(message: impl Into<String>) -> Self {
         Self::Cli {
             message: message.into(),
         }
     }
 
+    #[allow(dead_code)]
     pub fn config(message: impl Into<String>) -> Self {
         Self::Config {
             message: message.into(),
         }
     }
 
+    #[allow(dead_code)]
     pub fn pipeline(message: impl Into<String>) -> Self {
         Self::Pipeline {
             message: message.into(),
         }
     }
 
+    #[allow(dead_code)]
     pub fn output(message: impl Into<String>) -> Self {
         Self::Output {
             message: message.into(),
         }
     }
 
+    #[allow(dead_code)]
     pub fn channel(message: impl Into<String>) -> Self {
         Self::Channel {
             message: message.into(),
         }
     }
 
+    #[allow(dead_code)]
     pub fn timeout(message: impl Into<String>) -> Self {
         Self::Timeout {
             message: message.into(),
         }
     }
 
+    #[allow(dead_code)]
     pub fn fatal(message: impl Into<String>) -> Self {
         Self::Fatal {
             message: message.into(),

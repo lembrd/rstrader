@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, RawMessage};
 use async_trait::async_trait;
 
@@ -6,6 +7,7 @@ pub mod deribit;
 pub mod okx;
 
 /// Error types for exchange operations
+#[allow(dead_code)]
 #[derive(thiserror::Error, Debug)]
 pub enum ExchangeError {
     #[error("Connection error: {message}")]

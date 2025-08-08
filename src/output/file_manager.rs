@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -141,7 +142,7 @@ impl FileManager {
     }
 
     /// Normalize symbol for use in filenames (remove special characters)
-    fn normalize_symbol(&self, exchange: ExchangeId, symbol: &str) -> String {
+    fn normalize_symbol(&self, _exchange: ExchangeId, symbol: &str) -> String {
         // Remove any characters that might be problematic in filenames
         symbol.replace('/', "_").replace('-', "_")
     }

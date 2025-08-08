@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
@@ -291,6 +292,7 @@ impl std::fmt::Display for ExchangeId {
 
 /// Connection status enumeration
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum ConnectionStatus {
     Disconnected,
     Connecting,
@@ -389,10 +391,12 @@ impl Metrics {
         self.messages_processed += 1;
     }
 
+    #[allow(dead_code)]
     pub fn increment_connection_attempts(&mut self) {
         self.connection_attempts += 1;
     }
 
+    #[allow(dead_code)]
     pub fn increment_reconnections(&mut self) {
         self.reconnections += 1;
     }
@@ -519,6 +523,7 @@ impl Metrics {
             / packet_count_f64;
     }
 
+    #[allow(dead_code)]
     pub fn update_message_bytes(&mut self, bytes: u32) {
         self.last_message_bytes = bytes;
         self.total_message_bytes += bytes as u64;
@@ -612,6 +617,7 @@ pub mod time {
     }
 
     /// Calculate latency in microseconds between two timestamps
+    #[allow(dead_code)]
     pub fn latency_micros(start: SystemTime, end: SystemTime) -> u64 {
         end.duration_since(start).unwrap_or_default().as_micros() as u64
     }

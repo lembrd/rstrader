@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -521,7 +522,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
                     // Received ping/pong
                     continue;
                 }
-                Some(Ok(msg)) => {
+                Some(Ok(_msg)) => {
                     // Other message types, continue reading
                     // Received other message type
                     continue;

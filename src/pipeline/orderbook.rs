@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::error::{AppError, Result};
 use crate::types::{OrderBookL2Update, OrderBookSnapshot, OrderSide, PriceLevel};
 use std::collections::BTreeMap;
