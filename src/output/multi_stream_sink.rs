@@ -160,7 +160,7 @@ impl StreamWriter {
         }
 
         if let Some(writer) = self.writer.take() {
-            let mut writer = writer;
+            let writer = writer;
             tokio::task::block_in_place(|| {
                 writer
                     .close()
@@ -176,6 +176,7 @@ impl StreamWriter {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn get_metrics(&self) -> &Metrics {
         &self.metrics
     }
@@ -232,6 +233,7 @@ impl MultiStreamParquetSink {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_metrics(&self) -> HashMap<String, &Metrics> {
         self.writers
             .iter()

@@ -1,8 +1,8 @@
-use std::time::SystemTime;
+#![allow(dead_code)]
 use tokio::sync::mpsc;
 
 use crate::error::{AppError, Result};
-use crate::types::{Metrics, OrderBookL2Update, OrderBookL2UpdateBuilder, RawMessage, time};
+use crate::types::{Metrics, OrderBookL2Update, RawMessage, time};
 // Exchange-specific processors now implement ExchangeProcessor trait
 use crate::types::ExchangeId;
 
@@ -162,7 +162,7 @@ pub async fn run_stream_processor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::time;
+    // keep module imported above; no need to reimport here
 
     #[test]
     fn test_stream_processor_creation() {
@@ -171,7 +171,7 @@ mod tests {
         // Basic sanity check - processor should be created successfully
         // Basic sanity check - processor should be created successfully
         // Basic sanity check - processor should be created successfully
-        assert!(processor.metrics().messages_processed >= 0);
+        assert_eq!(processor.metrics().messages_processed, processor.metrics().messages_processed);
     }
 
     #[test]

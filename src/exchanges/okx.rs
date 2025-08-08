@@ -1,8 +1,9 @@
+#![allow(dead_code)]
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use serde::Deserialize;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::TcpStream;
@@ -11,8 +12,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use crate::error::{AppError, Result};
 use crate::exchanges::ExchangeConnector;
 use crate::types::{
-    ConnectionStatus, ExchangeId, L2Action, OrderBookL2Update, OrderBookL2UpdateBuilder,
-    OrderBookSnapshot, OrderSide, PriceLevel, RawMessage, TradeUpdate, TradeSide,
+    ConnectionStatus, ExchangeId, OrderBookL2Update, OrderBookL2UpdateBuilder,
+    OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate, TradeSide,
 };
 use fast_float;
 
@@ -1075,6 +1076,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         self.base.metrics.increment_received();
 
         // Calculate packet arrival timestamp (when network packet was received)
+        // Use socket receive time from RawMessage for code latency measurement
         let packet_arrival_us = raw_msg
             .timestamp
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -1169,7 +1171,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
                     })?;
 
                     // Apply unit conversion if metadata available
-                    let size = if let Some(ref registry) = self.okx_registry {
+                    let size = if let Some(ref _registry) = self.okx_registry {
                         if let Some(metadata) = self.get_cached_metadata_by_owned_symbol(&okx_symbol) {
                             let converted = metadata.normalize_quantity(raw_size);
                             // log::debug!(
@@ -1224,7 +1226,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
                     })?;
 
                     // Apply unit conversion if metadata available
-                    let size = if let Some(ref registry) = self.okx_registry {
+                    let size = if let Some(ref _registry) = self.okx_registry {
                         if let Some(metadata) = self.get_cached_metadata_by_owned_symbol(&okx_symbol) {
                             let converted = metadata.normalize_quantity(raw_size);
                             // log::debug!(
@@ -1313,6 +1315,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         self.base.metrics.increment_received();
 
         // Calculate packet arrival timestamp (when network packet was received)
+        // Use socket receive time from RawMessage for code latency measurement
         let packet_arrival_us = raw_msg
             .timestamp
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -1379,7 +1382,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             })?;
 
             // Handle size conversion based on exchange type
-            let size = if let Some(ref registry) = self.okx_registry {
+            let size = if let Some(ref _registry) = self.okx_registry {
                 // Use registry for contract size conversion if available
                 let size = fast_float::parse::<f64, _>(&trade_data.size).map_err(|e| {
                     crate::error::AppError::pipeline(format!("Invalid trade size '{}': {}", trade_data.size, e))

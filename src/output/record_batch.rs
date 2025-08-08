@@ -1,4 +1,4 @@
-use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array};
+use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;

@@ -12,9 +12,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+#[allow(dead_code)]
 const BATCH_SIZE: usize = 1000;
+#[allow(dead_code)]
 const FLUSH_INTERVAL_MS: u64 = 5000;
 
+#[allow(dead_code)]
 pub struct ParquetSink {
     writer: Option<ArrowWriter<std::fs::File>>,
     schema: Arc<Schema>,
@@ -23,6 +26,7 @@ pub struct ParquetSink {
     metrics: Metrics,
 }
 
+#[allow(dead_code)]
 impl ParquetSink {
     pub fn new(output_path: PathBuf) -> Result<Self> {
         let schema = Self::create_schema();
@@ -189,7 +193,7 @@ impl ParquetSink {
             self.flush_batch().await?;
         }
 
-        if let Some(mut writer) = self.writer.take() {
+        if let Some(writer) = self.writer.take() {
             writer
                 .close()
                 .map_err(|e| AppError::io(format!("Failed to close Parquet writer: {}", e)))?;
@@ -205,6 +209,7 @@ impl ParquetSink {
     }
 }
 
+#[allow(dead_code)]
 pub async fn run_parquet_sink(
     mut rx: mpsc::Receiver<OrderBookL2Update>,
     output_path: PathBuf,

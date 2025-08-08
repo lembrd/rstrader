@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use rustc_hash::FxHashMap;
@@ -8,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::time::{interval, timeout};
+use tokio::sync::{Mutex, oneshot};
+use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::error::AppError;
@@ -70,7 +71,7 @@ struct DeribitRpcResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct DeribitRpcError {
+pub(crate) struct DeribitRpcError {
     code: i32,
     message: String,
 }
@@ -464,7 +465,7 @@ impl DeribitConnector {
         let channel = self.extract_channel_fast(text)?;
 
         // Check if this is a subscribed channel
-        if let Some(instrument) = self.active_subscriptions.get(&channel) {
+        if let Some(_instrument) = self.active_subscriptions.get(&channel) {
             return Ok(Some(RawMessage {
                 exchange_id: ExchangeId::Deribit,
                 data: text.to_string(),
@@ -794,7 +795,7 @@ impl ExchangeProcessor for DeribitProcessor {
     fn process_message(
         &mut self,
         raw_msg: crate::types::RawMessage,
-        symbol: &str,
+        _symbol: &str,
         rcv_timestamp: i64,
         packet_id: u64,
         message_bytes: u32,
@@ -802,7 +803,12 @@ impl ExchangeProcessor for DeribitProcessor {
         // Track message received
         self.base_processor.metrics.increment_received();
 
-        let packet_arrival_us = rcv_timestamp;
+        // Use socket receive time from RawMessage for code latency consistency across exchanges
+        let packet_arrival_us = raw_msg
+            .timestamp
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
 
         // Start parsing timer
         let parse_start = crate::types::time::now_micros();
@@ -899,7 +905,12 @@ impl ExchangeProcessor for DeribitProcessor {
         // Track message received
         self.base_processor.metrics.increment_received();
 
-        let packet_arrival_us = rcv_timestamp;
+        // Use socket receive time from RawMessage for code latency consistency across exchanges
+        let packet_arrival_us = raw_msg
+            .timestamp
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
 
         // Start parsing timer
         let parse_start = crate::types::time::now_micros();

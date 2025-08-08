@@ -714,6 +714,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         self.base.metrics.increment_received();
 
         // Calculate packet arrival timestamp (when network packet was received)
+        // Use socket receive time from RawMessage for code latency measurement
         let packet_arrival_us = raw_msg
             .timestamp
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -892,6 +893,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         self.base.metrics.increment_received();
 
         // Calculate packet arrival timestamp (when network packet was received)
+        // Use socket receive time from RawMessage for code latency measurement
         let packet_arrival_us = raw_msg
             .timestamp
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
