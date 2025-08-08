@@ -699,9 +699,30 @@ impl ExchangeConnector for OkxConnector {
     }
 
     async fn subscribe_trades(&mut self, symbol: &str) -> Result<()> {
-        // For OKX, trades and L2 use the same connection mechanism
-        // Delegate to the existing subscribe_l2 method
-        self.subscribe_l2(symbol).await
+        let okx_symbol = self.convert_symbol(symbol);
+        let ws_stream = self
+            .ws_stream
+            .as_mut()
+            .ok_or_else(|| AppError::connection("WebSocket not connected".to_string()))?;
+
+        // Subscribe to trades channel for actual trade data
+        let subscribe_msg = serde_json::json!({
+            "op": "subscribe",
+            "args": [{
+                "channel": "trades",
+                "instId": okx_symbol
+            }]
+        });
+
+        let message = Message::Text(subscribe_msg.to_string());
+        ws_stream
+            .send(message)
+            .await
+            .map_err(|e| AppError::connection(format!("Failed to send trades subscription: {}", e)))?;
+
+        self.sync_state = OkxSyncState::Subscribed;
+        log::info!("OKX trades subscription sent for {}", okx_symbol);
+        Ok(())
     }
 
     async fn next_message(&mut self) -> Result<Option<RawMessage>> {
@@ -1278,14 +1299,41 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             .unwrap_or_default()
             .as_micros() as i64;
 
-        // Parse OKX trade message with timing
+        // Parse OKX message with timing
         let parse_start = crate::types::time::now_micros();
         let mut data_bytes = raw_msg.data.into_bytes();
-        let trade_message: OkxTradeUpdate =
-            serde_json::from_slice(&mut data_bytes).map_err(|e| {
-                self.base.metrics.increment_parse_errors();
-                crate::error::AppError::pipeline(format!("Failed to parse OKX trade message: {}", e))
-            })?;
+        
+        // First try to parse as generic OKX message to handle different types
+        let okx_message: serde_json::Value = serde_json::from_slice(&mut data_bytes).map_err(|e| {
+            self.base.metrics.increment_parse_errors();
+            crate::error::AppError::pipeline(format!("Failed to parse OKX message: {}", e))
+        })?;
+
+        // Check if this is a subscription confirmation or error message
+        if let Some(event) = okx_message.get("event") {
+            match event.as_str() {
+                Some("subscribe") => {
+                    log::info!("OKX trades subscription confirmed");
+                    return Ok(vec![]); // No trades to process
+                }
+                Some("error") => {
+                    let code = okx_message.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                    let msg = okx_message.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown error");
+                    log::error!("OKX subscription error: {} - {}", code, msg);
+                    return Ok(vec![]); // No trades to process
+                }
+                _ => {
+                    log::warn!("Unknown OKX event type: {}", event);
+                    return Ok(vec![]);
+                }
+            }
+        }
+
+        // If no event field, this should be a data message - parse as trade update
+        let trade_message: OkxTradeUpdate = serde_json::from_value(okx_message).map_err(|e| {
+            self.base.metrics.increment_parse_errors();
+            crate::error::AppError::pipeline(format!("Failed to parse OKX trade data: {}", e))
+        })?;
 
         // Calculate parse time
         let parse_end = crate::types::time::now_micros();
@@ -1305,53 +1353,54 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
         // Process each trade in the data array
         for trade_data in trade_message.data {
-            // Parse timestamp
-            let timestamp_millis = trade_data.timestamp.parse::<i64>().map_err(|e| {
-                crate::error::AppError::pipeline(format!("Invalid trade timestamp '{}': {}", trade_data.timestamp, e))
-            })?;
-
-            // Calculate overall latency (local time vs exchange timestamp)
-            let exchange_timestamp_us = crate::types::time::millis_to_micros(timestamp_millis);
-            if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
-                if overall_latency >= 0 {
-                    self.base
-                        .metrics
-                        .update_overall_latency(overall_latency as u64);
-                }
-            }
-
-            // Parse price and quantity
+            // Parse price and size using fast_float for performance
             let price = fast_float::parse::<f64, _>(&trade_data.price).map_err(|e| {
                 crate::error::AppError::pipeline(format!("Invalid trade price '{}': {}", trade_data.price, e))
             })?;
-            
-            let qty = fast_float::parse::<f64, _>(&trade_data.size).map_err(|e| {
-                crate::error::AppError::pipeline(format!("Invalid trade quantity '{}': {}", trade_data.size, e))
-            })?;
 
+            // Handle size conversion based on exchange type
+            let size = if let Some(ref registry) = self.okx_registry {
+                // Use registry for contract size conversion if available
+                let size = fast_float::parse::<f64, _>(&trade_data.size).map_err(|e| {
+                    crate::error::AppError::pipeline(format!("Invalid trade size '{}': {}", trade_data.size, e))
+                })?;
+                // TODO: Apply contract multiplier if needed
+                size
+            } else {
+                fast_float::parse::<f64, _>(&trade_data.size).map_err(|e| {
+                    crate::error::AppError::pipeline(format!("Invalid trade size '{}': {}", trade_data.size, e))
+                })?
+            };
+
+            // Parse trade side
             let trade_side = match trade_data.side.as_str() {
                 "buy" => crate::types::TradeSide::Buy,
                 "sell" => crate::types::TradeSide::Sell,
-                _ => return Err(crate::error::AppError::pipeline(format!("Invalid trade side: {}", trade_data.side))),
+                _ => {
+                    log::warn!("Unknown OKX trade side: {}", trade_data.side);
+                    continue; // Skip this trade
+                }
             };
 
-            // Convert OKX symbol to standard format
-            let converted_symbol = self.convert_symbol_from_okx(&trade_data.inst_id);
+            // Parse timestamp 
+            let timestamp_ms = trade_data.timestamp.parse::<i64>().map_err(|e| {
+                crate::error::AppError::pipeline(format!("Invalid timestamp '{}': {}", trade_data.timestamp, e))
+            })?;
 
             let seq_id = self.next_sequence_id();
             let trade = crate::types::TradeUpdate {
-                timestamp: crate::types::time::millis_to_micros(timestamp_millis),
+                timestamp: crate::types::time::millis_to_micros(timestamp_ms), 
                 rcv_timestamp,
                 exchange: self.exchange_id,
-                ticker: converted_symbol,
+                ticker: trade_data.inst_id,
                 seq_id,
                 packet_id: packet_id as i64,
                 trade_id: trade_data.trade_id,
-                order_id: None, // OKX doesn't provide order IDs in public trade stream
+                order_id: None, // OKX doesn't provide order IDs in trade stream
                 side: trade_side,
                 price,
-                qty,
-                is_buyer_maker: false, // OKX doesn't provide maker/taker info in public trade stream
+                qty: size,
+                is_buyer_maker: false, // OKX doesn't provide this info directly
             };
 
             trades.push(trade);
@@ -1360,18 +1409,16 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         // Calculate transformation time
         let transform_end = crate::types::time::now_micros();
         if let Some(transform_time) = transform_end.checked_sub(transform_start) {
-            self.base
-                .metrics
-                .update_transform_time(transform_time as u64);
+            self.base.metrics.update_transform_time(transform_time as u64);
         }
 
         // Update metrics
         self.base.metrics.increment_processed();
         self.base.metrics.update_message_complexity(0, 0, message_bytes); // Trade message has no bid/ask levels
 
-        // Update packet metrics
-        let trade_count = trades.len() as u32;
-        self.base.metrics.update_packet_metrics(1, trade_count, message_bytes);
+        // Update packet metrics 
+        let trades_count = trades.len() as u32;
+        self.base.metrics.update_packet_metrics(1, trades_count, message_bytes);
 
         // Calculate CODE LATENCY: From network packet arrival to business logic ready
         let processing_complete = crate::types::time::now_micros();

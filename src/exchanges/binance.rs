@@ -21,6 +21,9 @@ pub struct BinanceDepthUpdate {
     #[serde(rename = "E")]
     pub event_time: i64, // Event time in milliseconds
 
+    #[serde(rename = "T")]
+    pub transaction_time: i64, // Transaction time in milliseconds
+
     #[serde(rename = "s")]
     pub symbol: String, // Symbol (e.g., "BTCUSDT")
 
@@ -34,9 +37,10 @@ pub struct BinanceDepthUpdate {
     pub prev_final_update_id: i64, // Final update ID in previous event (for validation)
 
 
+    #[serde(rename = "b")]
     pub bids: Vec<[String; 2]>, // Bids to be updated [price, qty]
 
-
+    #[serde(rename = "a")]
     pub asks: Vec<[String; 2]>, // Asks to be updated [price, qty]
 }
 
@@ -243,6 +247,23 @@ impl BinanceFuturesConnector {
     /// This method should be called after get_snapshot() to properly transition
     /// from BufferingUpdates to Synchronizing state
     pub fn initialize_synchronization(&mut self, snapshot: &OrderBookSnapshot) -> Result<()> {
+        // Process any buffered updates before transitioning state
+        if matches!(self.sync_state, SyncState::BufferingUpdates) {
+            log::info!("Processing {} buffered updates before synchronization", self.update_buffer.len());
+            match self.process_buffered_updates(snapshot.last_update_id) {
+                Ok(valid_updates) => {
+                    log::info!("Found {} valid buffered updates to apply", valid_updates.len());
+                    // The buffered updates are already processed and cleared from buffer
+                    // The synchronization will continue with incoming updates
+                }
+                Err(e) => {
+                    log::warn!("Failed to process buffered updates, continuing anyway: {}", e);
+                    // Clear buffer to prevent issues
+                    self.update_buffer.clear();
+                }
+            }
+        }
+        
         self.sync_state = SyncState::Synchronizing {
             last_update_id: snapshot.last_update_id,
         };
@@ -331,11 +352,11 @@ impl ExchangeConnector for BinanceFuturesConnector {
         
         // Only set to BufferingUpdates if not already synchronized
         // (UnifiedExchangeHandler may have already called initialize_synchronization)
-        if matches!(self.sync_state, SyncState::Disconnected) {
+        if matches!(self.sync_state, SyncState::Disconnected | SyncState::Connecting) {
             self.sync_state = SyncState::BufferingUpdates;
             // Setting sync state to BufferingUpdates
         } else {
-            // Preserving existing sync state
+            // Preserving existing sync state (already initialized synchronization)
         }
 
         log::info!("WebSocket connected, starting order book synchronization");
@@ -662,12 +683,41 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
         // Parse Binance message with timing
         let parse_start = crate::types::time::now_micros();
+        
         let mut data_bytes = raw_msg.data.into_bytes();
-        let depth_update: BinanceDepthUpdate =
-            serde_json::from_slice(&mut data_bytes).map_err(|e| {
-                self.base.metrics.increment_parse_errors();
-                crate::error::AppError::pipeline(format!("Failed to parse Binance message: {}", e))
-            })?;
+        
+        // First try to parse as generic JSON to check for subscription responses
+        let json_value: serde_json::Value = serde_json::from_slice(&mut data_bytes).map_err(|e| {
+            self.base.metrics.increment_parse_errors();
+            crate::error::AppError::pipeline(format!("Failed to parse Binance JSON: {}", e))
+        })?;
+
+
+
+        // Check if this is a subscription response (has "result" field)
+        if json_value.get("result").is_some() {
+            // This is a subscription confirmation - no depth updates to process
+            return Ok(vec![]);
+        }
+
+        // Check if this has at least one of the required fields for depth update
+        // Binance @depth@0ms sends incremental updates that may contain only bids OR only asks
+        // Note: Binance uses "b" for bids and "a" for asks, not "bids"/"asks"
+        if json_value.get("b").is_none() && json_value.get("a").is_none() {
+            // Not a depth update - might be other message type, skip silently
+            log::debug!("Skipping message without b/a fields: {}", json_value);
+            return Ok(vec![]);
+        }
+
+        // Parse as depth update
+        let depth_update: BinanceDepthUpdate = serde_json::from_value(json_value).map_err(|e| {
+            self.base.metrics.increment_parse_errors();
+            log::error!("CRITICAL: Failed to parse Binance depth update: {}", e);
+            crate::error::AppError::pipeline(format!("Failed to parse Binance depth update: {}", e))
+        })?;
+        
+        log::debug!("Successfully parsed Binance depth update: {} bids, {} asks", 
+                   depth_update.bids.len(), depth_update.asks.len());
 
         // Calculate parse time
         let parse_end = crate::types::time::now_micros();
@@ -785,6 +835,8 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
             }
         }
 
+
+        
         // Return moved buffer instead of cloning
         Ok(std::mem::take(&mut self.base.updates_buffer))
     }

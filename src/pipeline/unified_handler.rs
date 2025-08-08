@@ -127,6 +127,11 @@ impl UnifiedExchangeHandler {
         // Set exchange info for metrics reporter
         if let Some(ref mut reporter) = reporter {
             reporter.set_exchange(self.get_exchange_id());
+            let stream_type_str = match self.subscription.stream_type {
+                crate::cli::StreamType::L2 => "L2",
+                crate::cli::StreamType::Trades => "TRADES",
+            };
+            reporter.set_stream_type(stream_type_str);
         }
 
         // Main processing loop - direct processing without intermediate channels

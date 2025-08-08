@@ -52,6 +52,7 @@ impl StreamProcessor {
 
 pub struct MetricsReporter {
     symbol: String,
+    stream_type: Option<String>,
     exchange: Option<ExchangeId>,
     last_report: std::time::Instant,
     report_interval: std::time::Duration,
@@ -61,6 +62,7 @@ impl MetricsReporter {
     pub fn new(symbol: String, interval_seconds: u64) -> Self {
         Self {
             symbol,
+            stream_type: None,
             exchange: None,
             last_report: std::time::Instant::now(),
             report_interval: std::time::Duration::from_secs(interval_seconds),
@@ -71,16 +73,25 @@ impl MetricsReporter {
         self.exchange = Some(exchange_id);
     }
 
+    pub fn set_stream_type(&mut self, stream_type: &str) {
+        self.stream_type = Some(stream_type.to_string());
+    }
+
     pub fn maybe_report(&mut self, metrics: &Metrics) {
         if self.last_report.elapsed() >= self.report_interval {
             let exchange_str = match self.exchange {
                 Some(ref exchange) => format!("{:?}", exchange),
                 None => "Unknown".to_string(),
             };
+            let stream_type_str = match self.stream_type {
+                Some(ref stream_type) => format!("{}", stream_type),
+                None => "Unknown".to_string(),
+            };
             log::info!(
-                "📊 Stream Metrics [{}@{}]: {}",
+                "📊 Stream Metrics [{}@{}:{}]: {}",
                 self.symbol,
                 exchange_str,
+                stream_type_str,
                 metrics
             );
             self.last_report = std::time::Instant::now();

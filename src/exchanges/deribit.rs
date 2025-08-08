@@ -599,9 +599,9 @@ impl ExchangeConnector for DeribitConnector {
     }
 
     async fn subscribe_trades(&mut self, symbol: &str) -> Result<(), Self::Error> {
-        // For Deribit, trades and L2 use the same connection mechanism
-        // Delegate to the existing subscribe_l2 method
-        self.subscribe_l2(symbol).await
+        self.subscribe_trades_internal(symbol)
+            .await
+            .map_err(|e| AppError::stream(format!("Trade subscription failed: {}", e)))
     }
 
     async fn next_message(&mut self) -> Result<Option<RawMessage>, Self::Error> {
