@@ -2,8 +2,10 @@ name: Build and Publish Docker Image (Docker Build Cloud)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
     tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
   workflow_dispatch: {}
 
 concurrency:
