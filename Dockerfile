@@ -1,4 +1,4 @@
-FROM rust:1.78 as builder
+FROM rust:1.82 AS builder
 WORKDIR /app
 
 # Cache dependencies first (optional speed-up if Docker Build Cloud cache is cold)
