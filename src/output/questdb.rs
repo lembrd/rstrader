@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -84,6 +85,7 @@ impl QuestDbClient {
 struct StreamWriter {
     l2_buffer: Vec<OrderBookL2Update>,
     trade_buffer: Vec<TradeUpdate>,
+    last_activity: Instant,
 }
 
 impl StreamWriter {
@@ -91,6 +93,7 @@ impl StreamWriter {
         Self {
             l2_buffer: Vec::with_capacity(BATCH_SIZE),
             trade_buffer: Vec::with_capacity(BATCH_SIZE),
+            last_activity: Instant::now(),
         }
     }
 
@@ -103,6 +106,7 @@ impl StreamWriter {
             StreamData::L2(u) => self.l2_buffer.push(u),
             StreamData::Trade(t) => self.trade_buffer.push(t),
         }
+        self.last_activity = Instant::now();
     }
 
     fn serialize_and_clear(&mut self) -> Vec<u8> {
@@ -256,6 +260,19 @@ impl MultiStreamQuestDbSink {
         }
         Ok(())
     }
+
+    fn prune_idle_writers(&mut self, max_idle: Duration) {
+        let now = Instant::now();
+        self.writers.retain(|key, w| {
+            let idle = now.duration_since(w.last_activity) > max_idle;
+            let empty = w.buffer_len() == 0;
+            let keep = !(idle && empty);
+            if !keep {
+                log::info!("Pruning idle QuestDB writer: {}", key);
+            }
+            keep
+        });
+    }
 }
 
 pub async fn run_multi_stream_questdb_sink(
@@ -286,10 +303,24 @@ pub async fn run_multi_stream_questdb_sink(
                 }
             }
             _ = flush_interval.tick() => {
+                // Periodic flush; report current writer & buffered record counts for visibility
+                let writer_count = sink.writers.len();
+                if writer_count > 0 {
+                    let mut total_buffered = 0usize;
+                    for w in sink.writers.values() {
+                        total_buffered += w.buffer_len();
+                    }
+                    log::debug!(
+                        "QuestDB flush tick: writers={}, buffered_records={}",
+                        writer_count, total_buffered
+                    );
+                }
                 if let Err(e) = sink.flush_all().await {
                     log::error!("Failed to flush QuestDB batches: {}", e);
                     return Err(e);
                 }
+                // Prune idle writers after flushing (e.g., idle for > 2 minutes)
+                sink.prune_idle_writers(Duration::from_secs(120));
             }
         }
     }

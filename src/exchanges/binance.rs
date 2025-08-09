@@ -118,6 +118,9 @@ pub struct BinanceFuturesConnector {
 }
 
 impl BinanceFuturesConnector {
+    /// Maximum number of depth updates to buffer while waiting for snapshot
+    /// This prevents unbounded memory growth if REST snapshot is slow/unavailable
+    const MAX_BUFFERED_UPDATES: usize = 50_000;
     pub fn new() -> Self {
         Self {
             rest_client: Client::new(),
@@ -433,6 +436,19 @@ impl ExchangeConnector for BinanceFuturesConnector {
                                             // Buffering update
                                             // Buffer updates until we get snapshot
                                             self.update_buffer.push_back(update);
+                                            // Enforce an upper bound on buffered updates to avoid unbounded memory growth
+                                            if self.update_buffer.len() > Self::MAX_BUFFERED_UPDATES {
+                                                // Drop oldest entries first to keep most recent data for reconciliation
+                                                let to_trim = self.update_buffer.len() - Self::MAX_BUFFERED_UPDATES;
+                                                for _ in 0..to_trim {
+                                                    self.update_buffer.pop_front();
+                                                }
+                                                log::warn!(
+                                                    "Binance buffer reached limit ({}). Dropped {} oldest updates to cap memory.",
+                                                    Self::MAX_BUFFERED_UPDATES,
+                                                    to_trim
+                                                );
+                                            }
                                             // Continue buffering, don't return message yet
                                             continue;
                                         }

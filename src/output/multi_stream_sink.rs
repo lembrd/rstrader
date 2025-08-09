@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
@@ -25,6 +26,7 @@ struct StreamWriter {
     exchange: ExchangeId,
     symbol: String,
     metrics: Metrics,
+    last_activity: Instant,
 }
 
 impl StreamWriter {
@@ -38,6 +40,7 @@ impl StreamWriter {
             exchange,
             symbol,
             metrics: Metrics::new(),
+            last_activity: Instant::now(),
         }
     }
 
@@ -46,6 +49,7 @@ impl StreamWriter {
             StreamData::L2(update) => {
                 self.l2_buffer.push(update);
                 self.metrics.increment_messages_processed();
+                self.last_activity = Instant::now();
 
                 if self.l2_buffer.len() >= BATCH_SIZE {
                     self.flush_l2_batch(file_manager).await?;
@@ -54,6 +58,7 @@ impl StreamWriter {
             StreamData::Trade(update) => {
                 self.trade_buffer.push(update);
                 self.metrics.increment_messages_processed();
+                self.last_activity = Instant::now();
 
                 if self.trade_buffer.len() >= BATCH_SIZE {
                     self.flush_trade_batch(file_manager).await?;
@@ -84,6 +89,7 @@ impl StreamWriter {
         let batch_size = self.l2_buffer.len();
         self.l2_buffer.clear();
         self.metrics.increment_batches_written();
+        self.last_activity = Instant::now();
 
         log::debug!("Wrote L2 batch of {} records to Parquet", batch_size);
         Ok(())
@@ -109,6 +115,7 @@ impl StreamWriter {
         let batch_size = self.trade_buffer.len();
         self.trade_buffer.clear();
         self.metrics.increment_batches_written();
+        self.last_activity = Instant::now();
 
         log::debug!("Wrote Trade batch of {} records to Parquet", batch_size);
         Ok(())
@@ -221,6 +228,40 @@ impl MultiStreamParquetSink {
         Ok(())
     }
 
+    fn prune_idle_writers(&mut self, max_idle: Duration) -> Result<()> {
+        // Collect keys first to avoid mutable borrow issues
+        let now = Instant::now();
+        let mut to_remove: Vec<String> = Vec::new();
+        for (key, writer) in self.writers.iter() {
+            if writer.l2_buffer.is_empty()
+                && writer.trade_buffer.is_empty()
+                && now.duration_since(writer.last_activity) > max_idle
+            {
+                to_remove.push(key.clone());
+            }
+        }
+
+        for key in to_remove {
+            if let Some(mut writer) = self.writers.remove(&key) {
+                log::info!("Pruning idle Parquet writer: {}", key);
+                // Best-effort close in a blocking section (we're on runtime thread but closing is quick)
+                let _ = tokio::task::block_in_place(|| {
+                    writer
+                        .writer
+                        .take()
+                        .map(|mut w| {
+                            w.close().map_err(|e| AppError::io(format!(
+                                "Failed to close Parquet writer during prune: {}",
+                                e
+                            )))
+                        })
+                        .transpose()
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub async fn close(&mut self) -> Result<()> {
         self.flush_all().await?;
 
@@ -270,9 +311,28 @@ pub async fn run_multi_stream_parquet_sink(
                 }
             }
             _ = flush_interval.tick() => {
+                // Periodic flush of all writers; also log current writer/buffer counts for telemetry
+                let writer_count = sink.writers.len();
+                if writer_count > 0 {
+                    // Summarize buffered records across writers (best-effort)
+                    let mut total_l2 = 0usize;
+                    let mut total_trades = 0usize;
+                    for w in sink.writers.values() {
+                        total_l2 += w.l2_buffer.len();
+                        total_trades += w.trade_buffer.len();
+                    }
+                    log::debug!(
+                        "Parquet flush tick: writers={}, buffered_l2={}, buffered_trades={}",
+                        writer_count, total_l2, total_trades
+                    );
+                }
                 if let Err(e) = sink.flush_all().await {
                     log::error!("Failed to flush Parquet batches: {}", e);
                     return Err(e);
+                }
+                // Prune idle writers after flushing (e.g., idle for > 2 minutes)
+                if let Err(e) = sink.prune_idle_writers(Duration::from_secs(120)) {
+                    log::warn!("Pruning idle writers failed: {}", e);
                 }
             }
         }
