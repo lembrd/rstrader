@@ -7,7 +7,7 @@ High-performance, low-latency cryptocurrency market data collector written in Ru
   - Exchanges: BINANCE_FUTURES, OKX_SWAP, OKX_SPOT, DERIBIT
   - Streams: L2 (order book deltas), TRADES
 - Normalizes all messages to a unified data model (consistent fields across exchanges)
-- Writes data per-stream into Parquet files (SNAPPY-compressed, Parquet v2.0)
+- Writes data per-stream into Parquet files (SNAPPY-compressed, Parquet v2.0) or to QuestDB (ILP TCP)
 - Reports detailed performance metrics (parse/transform/code latency, throughput, packet stats)
 - Scales across many simultaneous subscriptions using a unified, low-overhead async handler
 
@@ -64,7 +64,8 @@ xtrader \
   --subscriptions <SUBS> \
   --output-directory <DIR> \
   [--verbose] \
-  [--shutdown-after <SECONDS>]
+  [--shutdown-after <SECONDS>] \
+  [--sink <parquet|questdb>]
 
 Where <SUBS> is a comma-separated list in the form: STREAM:EXCHANGE@INSTRUMENT
 Examples:
@@ -75,13 +76,57 @@ Examples:
 
 Notes:
 - Instruments are passed in the exchange’s common notation (e.g., BTCUSDT). The OKX connector converts to OKX’s `BASE-QUOTE[-SWAP]` internally. Deribit uses native names like `BTC-PERPETUAL`.
-- The output directory is created if missing and must be writable.
+- The output directory is created if missing and must be writable (only relevant when `--sink parquet`).
+
+## QuestDB sink
+
+XTrader can write directly to QuestDB using ILP over TCP. Schema management is externalized and handled by the provided control script with SQL files in `sql/`.
+
+- Enable via CLI: `--sink questdb`
+- ILP connection env vars (optional):
+  - `QUESTDB_HOST` (default `127.0.0.1`)
+  - `QUESTDB_ILP_PORT` (default `9009`)
+- Schema: initialize via `scripts/questdb_ctl.sh init` which applies SQL from `sql/*.sql` (see section below). The Rust code does not create/alter tables.
+- Timestamps are written in nanoseconds; internal microseconds are multiplied by 1000 on write.
+
+### Local/remote QuestDB control script
+Use the provided control script to manage a local QuestDB instance (Docker) or initialize schema on any instance reachable via HTTP SQL:
+
+```bash
+# Start local QuestDB (Docker)
+chmod +x scripts/questdb_ctl.sh
+./scripts/questdb_ctl.sh start
+
+# Initialize schema (local or remote)
+./scripts/questdb_ctl.sh init --host 127.0.0.1 --http-port 9000
+
+# Check status / Stop
+./scripts/questdb_ctl.sh status
+./scripts/questdb_ctl.sh stop
+```
+
+When started locally, this exposes:
+- Web console / HTTP SQL: `http://localhost:9000`
+- ILP TCP: `localhost:9009`
+- Postgres wire: `localhost:8812`
+- ILP HTTP: `localhost:9003`
+
+### Running the app with QuestDB sink
+```bash
+RUST_LOG=info \
+  cargo run --release -- \
+  --subscriptions "L2:OKX_SWAP@BTCUSDT,TRADES:BINANCE_FUTURES@ETHUSDT" \
+  --sink questdb \
+  --shutdown-after 30 \
+  --verbose
+```
 
 ## Output
 - Files are written under the provided output directory using the pattern:
   - `{STREAM}_{EXCHANGE}_{SYMBOL}_{SEQUENCE}.parquet` (e.g., `L2_BINANCE_FUTURES_BTCUSDT_000001.parquet`)
 - Each file contains Arrow/Parquet batches of 1000 rows by default; flush interval ~5s
 - Compression: SNAPPY; Parquet writer version: 2.0
+- QuestDB: rows inserted via ILP batching; periodic flush ~500ms; idempotent with WAL + dedup keys (as defined by SQL in `sql/`). Note: `is_buyer_maker` is omitted since it's redundant with trade `side`.
 
 ## Data model
 XTrader uses a unified schema for all exchanges.
@@ -91,7 +136,7 @@ XTrader uses a unified schema for all exchanges.
   - L2-specific: `action` (UPDATE/DELETE), `side` (BID/ASK), `price`, `qty`, `update_id`, `first_update_id`
 - Trade updates:
   - Common: `timestamp`, `rcv_timestamp`, `exchange`, `ticker`, `seq_id`, `packet_id`
-  - Trade-specific: `trade_id`, `order_id?`, `side` (BUY/SELL), `price`, `qty`, `is_buyer_maker`
+  - Trade-specific: `trade_id`, `order_id?`, `side` (BUY/SELL/UNKNOWN), `price`, `qty`
 
 See `docs/data_schema.md` for the detailed schema.
 
@@ -121,6 +166,7 @@ See `docs/data_schema.md` for the detailed schema.
 - `src/output/multi_stream_sink.rs`: receives unified `StreamData` across all subscriptions and writes Parquet per stream
 - `src/output/file_manager.rs`: file naming, sequence tracking, and directory handling
 - `src/output/schema.rs` & `src/output/record_batch.rs`: Arrow schemas and batch builders for L2/Trades
+- `src/output/questdb.rs`: ILP TCP batching sink (schema managed externally via SQL files)
 
 ## Logging & metrics
 - Logging via `env_logger`; set `RUST_LOG` (e.g., `RUST_LOG=info`)
@@ -143,6 +189,35 @@ RUST_LOG=info cargo run --release -- \
   --shutdown-after 30 \
   --verbose
 ```
+
+- Collect Binance Futures trades for ETHUSDT for 30 seconds into QuestDB:
+```bash
+RUST_LOG=info cargo run --release -- \
+  --subscriptions "TRADES:BINANCE_FUTURES@ETHUSDT" \
+  --sink questdb \
+  --shutdown-after 30 \
+  --verbose
+```
+
+## Integration tests (QuestDB)
+We provide an integration test that writes to a local QuestDB and verifies ingestion via HTTP SQL.
+
+-- Start QuestDB locally:
+```bash
+chmod +x scripts/questdb_ctl.sh
+./scripts/questdb_ctl.sh start
+./scripts/questdb_ctl.sh init --host 127.0.0.1 --http-port 9000
+```
+
+- Run the test:
+```bash
+RUN_QUESTDB_TESTS=1 cargo test --test questdb_integration -- --nocapture
+```
+
+- What it does:
+  - Assumes schema is initialized via the script and `sql/*.sql`
+  - Sends a small ILP TCP batch with one L2 and one trade
+  - Queries QuestDB via HTTP SQL and asserts the results
 
 ## Development
 - Run tests:

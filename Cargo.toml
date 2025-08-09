@@ -25,6 +25,7 @@ fast-float = "0.2"
 arrow = "53.0"
 parquet = "53.0"
 tempfile = "3.10"
+ryu = "1.0"
 
 # Error handling
 anyhow = "1.0"
@@ -40,3 +41,8 @@ chrono = { version = "0.4", features = ["serde"] }
 rustls = { version = "0.23.29", features = ["ring"] }
 rustc-hash = "1.1"
 tokio-util = "0.7.15"
+urlencoding = "2.1"
+
+[dev-dependencies]
+ureq = { version = "2.9", default-features = false }
+urlencoding = "2.1"

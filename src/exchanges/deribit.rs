@@ -550,7 +550,7 @@ impl DeribitConnector {
             side: trade_side,
             price: trade.price,
             qty: trade.amount,
-            is_buyer_maker: trade.direction == "sell", // Sell orders are typically from makers
+            // is_buyer_maker removed
         })
     }
 }
@@ -977,7 +977,7 @@ impl ExchangeProcessor for DeribitProcessor {
                         side: trade_side,
                         price: trade_data.price,
                         qty: trade_data.amount,
-                        is_buyer_maker: trade_data.direction == "sell", // Sell orders are typically from makers
+                        // is_buyer_maker removed
                     };
 
                     trades.push(trade);

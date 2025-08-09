@@ -627,7 +627,7 @@ impl OkxConnector {
             side: trade_side,
             price,
             qty,
-            is_buyer_maker: trade_data.side == "sell", // In OKX, "sell" means seller was maker
+            // is_buyer_maker removed; side encodes aggressor
         })
     }
 
@@ -1423,7 +1423,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
                 side: trade_side,
                 price,
                 qty: size,
-                is_buyer_maker: false, // OKX doesn't provide this info directly
+                // is_buyer_maker removed
             };
 
             trades.push(trade);

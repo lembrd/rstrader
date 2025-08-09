@@ -4,4 +4,14 @@
 /.mcp.json
 *.parquet
 /.env
+/.env.local
+/.DS_Store
+/.vscode/
+*.log
+logs/
+# Local QuestDB data volume (created by scripts/start_questdb.sh)
+/.questdb_data/
+# Local output dirs
+/test_output/
+/data/
 /.idea/

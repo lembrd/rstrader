@@ -7,7 +7,7 @@ mod subscription_manager;
 mod types;
 
 use clap::Parser;
-use cli::Args;
+use cli::{Args, Sink};
 use error::{AppError, Result};
 use futures_util::FutureExt;
 use types::StreamData;
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_application(args: Args) -> Result<()> {
-    use output::run_multi_stream_parquet_sink;
+    use output::{run_multi_stream_parquet_sink, run_multi_stream_questdb_sink};
     use tokio::sync::mpsc;
 
     // Create communication channel for unified stream data
@@ -95,13 +95,21 @@ async fn run_application(args: Args) -> Result<()> {
         .spawn_all_subscriptions(stream_tx, okx_swap_registry, okx_spot_registry)
         .await?;
 
-    // Start Multi-Stream Parquet sink task
-    let mut sink_handle = {
-        let output_directory = args.output_directory.clone();
-        tokio::spawn(async move {
-            log::info!("Starting Multi-Stream Parquet sink");
-            run_multi_stream_parquet_sink(stream_rx, output_directory).await
-        })
+    // Start sink task based on CLI
+    let mut sink_handle = match args.sink {
+        Sink::Parquet => {
+            let output_directory = args.output_directory.clone();
+            tokio::spawn(async move {
+                log::info!("Starting Multi-Stream Parquet sink");
+                run_multi_stream_parquet_sink(stream_rx, output_directory).await
+            })
+        }
+        Sink::QuestDb => {
+            tokio::spawn(async move {
+                log::info!("Starting Multi-Stream QuestDB sink");
+                run_multi_stream_questdb_sink(stream_rx).await
+            })
+        }
     };
 
     // Set up graceful shutdown with optional timer
@@ -113,28 +121,18 @@ async fn run_application(args: Args) -> Result<()> {
     };
 
     tokio::select! {
-        result = manager.wait_for_any_completion() => {
-            match result {
-                Ok(_) => log::info!("One unified handler completed successfully"),
-                Err(e) => {
-                    log::error!("Unified handler failed: {}", e);
-                    manager.shutdown().await;
-                    return Err(e);
-                }
-            }
-        }
         result = &mut sink_handle => {
             match result {
-                Ok(Ok(_)) => log::info!("Parquet sink completed successfully"),
+                Ok(Ok(_)) => log::info!("Sink completed successfully"),
                 Ok(Err(e)) => {
-                    log::error!("Parquet sink failed: {}", e);
+                    log::error!("Sink failed: {}", e);
                     manager.shutdown().await;
                     return Err(e);
                 }
                 Err(e) => {
-                    log::error!("Parquet sink task panicked: {}", e);
+                    log::error!("Sink task panicked: {}", e);
                     manager.shutdown().await;
-                    return Err(AppError::internal(format!("Parquet sink task failed: {}", e)));
+                    return Err(AppError::internal(format!("Sink task failed: {}", e)));
                 }
             }
         }
@@ -146,19 +144,19 @@ async fn run_application(args: Args) -> Result<()> {
         }
     }
 
-    // Shutdown handlers and finalize Parquet sink
-    log::info!("Shutting down unified handlers and finalizing Parquet sink...");
+    // Shutdown handlers and finalize sink
+    log::info!("Shutting down unified handlers and finalizing sink...");
     manager.shutdown().await;
     
     match sink_handle.await {
-        Ok(Ok(_)) => log::info!("Parquet sink finalized successfully"),
+        Ok(Ok(_)) => log::info!("Sink finalized successfully"),
         Ok(Err(e)) => {
-            log::error!("Parquet sink failed during finalization: {}", e);
+            log::error!("Sink failed during finalization: {}", e);
             return Err(e);
         }
         Err(e) => {
-            log::error!("Parquet sink task panicked during finalization: {}", e);
-            return Err(AppError::internal(format!("Parquet sink task failed: {}", e)));
+            log::error!("Sink task panicked during finalization: {}", e);
+            return Err(AppError::internal(format!("Sink task failed: {}", e)));
         }
     }
 

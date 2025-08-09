@@ -123,16 +123,16 @@ pub struct TradeUpdate {
     // Trade specific fields
     pub trade_id: String,     // Exchange-specific trade ID
     pub order_id: Option<String>, // Order ID if available
-    pub side: TradeSide,      // BUY/SELL (direction of taker)
+    pub side: TradeSide,      // BUY/SELL/UNKNOWN (direction of taker)
     pub price: f64,           // Trade execution price
     pub qty: f64,             // Trade quantity
-    pub is_buyer_maker: bool, // Was buyer the maker (false = buyer was taker)
 }
 
 /// Trade side enumeration (direction of taker)
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum TradeSide {
-    Buy = 1,  // Taker bought (aggressor was buyer)
+    Unknown = 0,
+    Buy = 1,   // Taker bought (aggressor was buyer)
     Sell = -1, // Taker sold (aggressor was seller)
 }
 
@@ -141,6 +141,7 @@ impl std::fmt::Display for TradeSide {
         match self {
             TradeSide::Buy => write!(f, "BUY"),
             TradeSide::Sell => write!(f, "SELL"),
+            TradeSide::Unknown => write!(f, "UNKNOWN"),
         }
     }
 }
@@ -182,7 +183,7 @@ impl TradeUpdateBuilder {
     }
 
     /// Build a trade update
-    pub fn build(self, side: TradeSide, price: f64, qty: f64, is_buyer_maker: bool) -> TradeUpdate {
+    pub fn build(self, side: TradeSide, price: f64, qty: f64, _is_buyer_maker: bool) -> TradeUpdate {
         TradeUpdate {
             timestamp: self.timestamp,
             rcv_timestamp: self.rcv_timestamp,
@@ -195,7 +196,6 @@ impl TradeUpdateBuilder {
             side,
             price,
             qty,
-            is_buyer_maker,
         }
     }
 }

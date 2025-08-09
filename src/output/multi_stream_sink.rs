@@ -338,7 +338,6 @@ mod tests {
             side: TradeSide::Buy,
             price: 50000.0,
             qty: 0.5,
-            is_buyer_maker: false,
         };
 
         let stream_data = StreamData::Trade(trade_update);

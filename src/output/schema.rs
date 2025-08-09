@@ -52,7 +52,6 @@ impl SchemaFactory for TradeSchemaFactory {
             Field::new("side", DataType::Utf8, false),
             Field::new("price", DataType::Float64, false),
             Field::new("qty", DataType::Float64, false),
-            Field::new("is_buyer_maker", DataType::Boolean, false),
         ]))
     }
 
@@ -89,12 +88,12 @@ mod tests {
     #[test]
     fn test_trade_schema_creation() {
         let schema = TradeSchemaFactory::create_schema();
-        assert_eq!(schema.fields().len(), 12);
+        assert_eq!(schema.fields().len(), 11);
         assert_eq!(TradeSchemaFactory::schema_name(), "Trades");
         
         // Check required fields exist
         assert!(schema.field_with_name("trade_id").is_ok());
-        assert!(schema.field_with_name("is_buyer_maker").is_ok());
+        assert!(schema.field_with_name("side").is_ok());
         
         // Check nullable field
         let order_id_field = schema.field_with_name("order_id").unwrap();
@@ -107,7 +106,7 @@ mod tests {
         let trade_schema = get_schema_for_stream_type("TRADES");
         
         assert_eq!(l2_schema.fields().len(), 12);
-        assert_eq!(trade_schema.fields().len(), 12);
+        assert_eq!(trade_schema.fields().len(), 11);
         
         // Schemas should be different
         assert_ne!(l2_schema.field(6).name(), trade_schema.field(6).name());

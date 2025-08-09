@@ -1,4 +1,4 @@
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, UInt64Array};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
@@ -125,11 +125,7 @@ impl RecordBatchFactory<TradeUpdate> for TradeRecordBatchFactory {
         );
         let price_array = Float64Array::from(data.iter().map(|u| u.price).collect::<Vec<_>>());
         let qty_array = Float64Array::from(data.iter().map(|u| u.qty).collect::<Vec<_>>());
-        let is_buyer_maker_array = BooleanArray::from(
-            data.iter()
-                .map(|u| u.is_buyer_maker)
-                .collect::<Vec<_>>(),
-        );
+        // is_buyer_maker removed from TradeUpdate
 
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(timestamp_array),
@@ -143,7 +139,6 @@ impl RecordBatchFactory<TradeUpdate> for TradeRecordBatchFactory {
             Arc::new(side_array),
             Arc::new(price_array),
             Arc::new(qty_array),
-            Arc::new(is_buyer_maker_array),
         ];
 
         RecordBatch::try_new(schema, arrays)
@@ -198,13 +193,12 @@ mod tests {
                 side: TradeSide::Buy,
                 price: 50000.0,
                 qty: 0.5,
-                is_buyer_maker: false,
             },
         ];
 
         let batch = TradeRecordBatchFactory::create_record_batch(schema, &updates).unwrap();
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 12);
+        assert_eq!(batch.num_columns(), 11);
     }
 
     #[test]

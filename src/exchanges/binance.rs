@@ -179,11 +179,7 @@ impl BinanceFuturesConnector {
         let qty = fast_float::parse::<f64, _>(&trade.quantity)
             .map_err(|e| AppError::parse(format!("Invalid trade quantity '{}': {}", trade.quantity, e)))?;
 
-        let trade_side = if trade.is_buyer_maker {
-            TradeSide::Sell // Buyer was maker, so this is a sell from taker's perspective
-        } else {
-            TradeSide::Buy  // Buyer was taker, so this is a buy
-        };
+        let trade_side = if trade.is_buyer_maker { TradeSide::Sell } else { TradeSide::Buy };
 
         Ok(TradeUpdate {
             timestamp: crate::types::time::millis_to_micros(trade.trade_time),
@@ -197,7 +193,6 @@ impl BinanceFuturesConnector {
             side: trade_side,
             price,
             qty,
-            is_buyer_maker: trade.is_buyer_maker,
         })
     }
 
@@ -943,11 +938,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
             crate::error::AppError::pipeline(format!("Invalid trade quantity '{}': {}", trade_update.quantity, e))
         })?;
 
-        let trade_side = if trade_update.is_buyer_maker {
-            crate::types::TradeSide::Sell // Buyer was maker, so this is a sell from taker's perspective
-        } else {
-            crate::types::TradeSide::Buy  // Buyer was taker, so this is a buy
-        };
+        let trade_side = if trade_update.is_buyer_maker { crate::types::TradeSide::Sell } else { crate::types::TradeSide::Buy };
 
         let seq_id = self.next_sequence_id();
         let trade = crate::types::TradeUpdate {
@@ -962,7 +953,6 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
             side: trade_side,
             price,
             qty,
-            is_buyer_maker: trade_update.is_buyer_maker,
         };
 
         // Calculate transformation time

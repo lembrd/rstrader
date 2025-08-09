@@ -11,7 +11,7 @@ pub struct Args {
     )]
     pub subscriptions: String,
 
-    #[arg(long, help = "Output directory for Parquet files (will create individual files per stream type)")]
+    #[arg(long, help = "Output directory for Parquet files (used when --sink parquet)", default_value = "./test_output")]
     pub output_directory: PathBuf,
 
     #[arg(long, help = "Enable verbose output with metrics and statistics")]
@@ -19,6 +19,9 @@ pub struct Args {
 
     #[arg(long, help = "Shutdown after N seconds (for debugging)")]
     pub shutdown_after: Option<u64>,
+
+    #[arg(long, value_enum, default_value_t = Sink::Parquet, help = "Sink to use: parquet or questdb")]
+    pub sink: Sink,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -39,6 +42,15 @@ pub enum StreamType {
     L2,
     #[value(name = "TRADES")]
     Trades,
+}
+// removed duplicate Sink definition (single definition remains above)
+
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
+pub enum Sink {
+    #[value(name = "parquet")]
+    Parquet,
+    #[value(name = "questdb")]
+    QuestDb,
 }
 #[derive(Clone, Debug)]
 pub struct SubscriptionSpec {
@@ -147,24 +159,33 @@ impl Args {
         let _subscriptions = SubscriptionSpec::parse_multiple(&self.subscriptions)
             .map_err(|e| anyhow::anyhow!("Invalid subscriptions format: {}", e))?;
 
-        // Validate output directory exists or can be created
-        if !self.output_directory.exists() {
-            // Try to create the directory
-            std::fs::create_dir_all(&self.output_directory)
-                .map_err(|e| anyhow::anyhow!("Cannot create output directory {}: {}", self.output_directory.display(), e))?;
-        } else if !self.output_directory.is_dir() {
-            anyhow::bail!("Output path {} is not a directory", self.output_directory.display());
-        }
+        // If Parquet sink, validate output directory exists or can be created
+        if self.sink == Sink::Parquet {
+            if !self.output_directory.exists() {
+                std::fs::create_dir_all(&self.output_directory).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Cannot create output directory {}: {}",
+                        self.output_directory.display(),
+                        e
+                    )
+                })?;
+            } else if !self.output_directory.is_dir() {
+                anyhow::bail!(
+                    "Output path {} is not a directory",
+                    self.output_directory.display()
+                );
+            }
 
-        // Check if directory is writable using a unique temp file to avoid test races
-        let _tmp = tempfile::Builder::new()
-            .prefix(".write_test_")
-            .tempfile_in(&self.output_directory)
-            .map_err(|e| anyhow::anyhow!(
-                "Output directory {} is not writable: {}",
-                self.output_directory.display(),
-                e
-            ))?;
+            // Check if directory is writable using a unique temp file
+            let _tmp = tempfile::Builder::new()
+                .prefix(".write_test_")
+                .tempfile_in(&self.output_directory)
+                .map_err(|e| anyhow::anyhow!(
+                    "Output directory {} is not writable: {}",
+                    self.output_directory.display(),
+                    e
+                ))?;
+        }
 
         Ok(())
     }
@@ -188,6 +209,7 @@ mod tests {
             output_directory: PathBuf::from("test_output"),
             verbose: false,
             shutdown_after: None,
+            sink: Sink::Parquet,
         }
     }
 
@@ -197,6 +219,7 @@ mod tests {
             output_directory: PathBuf::from("test_output"),
             verbose: false,
             shutdown_after: None,
+            sink: Sink::Parquet,
         }
     }
 
