@@ -306,7 +306,7 @@ pub enum ConnectionStatus {
 #[derive(Debug, Clone)]
 pub struct RawMessage {
     pub exchange_id: ExchangeId,
-    pub data: String,
+    pub data: Vec<u8>,
     pub timestamp: SystemTime,
 }
 

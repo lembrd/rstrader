@@ -468,7 +468,7 @@ impl DeribitConnector {
         if let Some(_instrument) = self.active_subscriptions.get(&channel) {
             return Ok(Some(RawMessage {
                 exchange_id: ExchangeId::Deribit,
-                data: text.to_string(),
+                data: text.as_bytes().to_vec(),
                 timestamp: SystemTime::now(),
             }));
         }
@@ -815,7 +815,7 @@ impl ExchangeProcessor for DeribitProcessor {
 
         // Parse the notification
         let notification: DeribitNotification =
-            serde_json::from_str(&raw_msg.data).map_err(|e| crate::error::AppError::Pipeline {
+            serde_json::from_slice(&raw_msg.data).map_err(|e| crate::error::AppError::Pipeline {
                 message: format!("Failed to parse Deribit message: {}", e),
             })?;
 
@@ -917,7 +917,7 @@ impl ExchangeProcessor for DeribitProcessor {
 
         // Parse the notification
         let notification: DeribitNotification =
-            serde_json::from_str(&raw_msg.data).map_err(|e| crate::error::AppError::Pipeline {
+            serde_json::from_slice(&raw_msg.data).map_err(|e| crate::error::AppError::Pipeline {
                 message: format!("Failed to parse Deribit trade message: {}", e),
             })?;
 

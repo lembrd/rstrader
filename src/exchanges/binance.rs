@@ -356,7 +356,7 @@ impl BinanceFuturesConnector {
         let mut out = Vec::with_capacity(self.update_buffer.len());
         let exchange_id = ExchangeId::BinanceFutures;
         while let Some(update) = self.update_buffer.pop_front() {
-            out.push(RawMessage { exchange_id, data: update.text, timestamp: std::time::SystemTime::now() });
+            out.push(RawMessage { exchange_id, data: update.text.into_bytes(), timestamp: std::time::SystemTime::now() });
         }
         out
     }
@@ -546,7 +546,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
 
                     let raw_message = RawMessage {
                         exchange_id: ExchangeId::BinanceFutures,
-                        data: text,
+                        data: text.into_bytes(),
                         timestamp,
                     };return Ok(Some(raw_message));
                 }
@@ -662,7 +662,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
                     
                     let raw_message = RawMessage {
                         exchange_id: ExchangeId::BinanceFutures,
-                        data: text,
+                        data: text.into_bytes(),
                         timestamp,
                     };
 
@@ -781,7 +781,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         // Parse Binance message with timing
         let parse_start = crate::types::time::now_micros();
         
-        let mut data_bytes = raw_msg.data.into_bytes();
+        let mut data_bytes = raw_msg.data;
         
         // First try to parse as generic JSON to check for subscription responses
         let json_value: serde_json::Value = serde_json::from_slice(&mut data_bytes).map_err(|e| {
@@ -958,7 +958,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
         // Parse Binance trade message with timing
         let parse_start = crate::types::time::now_micros();
-        let mut data_bytes = raw_msg.data.into_bytes();
+        let mut data_bytes = raw_msg.data;
         let trade_update: BinanceTradeUpdate =
             serde_json::from_slice(&mut data_bytes).map_err(|e| {
                 self.base.metrics.increment_parse_errors();

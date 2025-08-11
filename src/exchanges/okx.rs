@@ -794,7 +794,7 @@ impl ExchangeConnector for OkxConnector {
         match ws_stream.next().await {
             Some(Ok(Message::Text(text))) => Ok(Some(RawMessage {
                 exchange_id: self.exchange_id,
-                data: text,
+                data: text.into_bytes(),
                 timestamp: SystemTime::now(),
             })),
             Some(Ok(Message::Close(_))) => {
@@ -882,7 +882,7 @@ impl ExchangeConnector for OkxConnector {
                 Ok(Message::Text(text)) => {
                     let raw_message = RawMessage {
                         exchange_id: self.exchange_id,
-                        data: text,
+                        data: text.into_bytes(),
                         timestamp: SystemTime::now(),
                     };
 
@@ -939,7 +939,7 @@ impl ExchangeConnector for OkxConnector {
                 Ok(Message::Text(text)) => {
                     let raw_message = RawMessage {
                         exchange_id: self.exchange_id,
-                        data: text,
+                        data: text.into_bytes(),
                         timestamp: SystemTime::now(),
                     };
 
@@ -981,7 +981,7 @@ pub fn parse_okx_message(
     packet_id: u64,
     rcv_timestamp: i64,
 ) -> Result<Vec<OrderBookL2Update>> {
-    let message: OkxMessage = serde_json::from_str(&raw_message.data)
+        let message: OkxMessage = serde_json::from_slice(&raw_message.data)
         .map_err(|e| AppError::parse(format!("Failed to parse OKX message: {}", e)))?;
 
     match message {
@@ -1158,7 +1158,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             .as_micros() as i64;
 
         // Parse OKX message JSON
-        let okx_message: OkxMessage = serde_json::from_str(&raw_msg.data).map_err(|e| {
+        let okx_message: OkxMessage = serde_json::from_slice(&raw_msg.data).map_err(|e| {
             self.base.metrics.increment_parse_errors();
             crate::error::AppError::pipeline(format!("Failed to parse OKX message JSON: {}", e))
         })?;
@@ -1398,7 +1398,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
         // Parse OKX message with timing
         let parse_start = crate::types::time::now_micros();
-        let mut data_bytes = raw_msg.data.into_bytes();
+        let mut data_bytes = raw_msg.data;
         
         // First try to parse as generic OKX message to handle different types
         let okx_message: serde_json::Value = serde_json::from_slice(&mut data_bytes).map_err(|e| {
