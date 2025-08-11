@@ -169,8 +169,55 @@ See `docs/data_schema.md` for the detailed schema.
 - `src/output/questdb.rs`: ILP TCP batching sink (schema managed externally via SQL files)
 
 ## Logging & metrics
-- Logging via `env_logger`; set `RUST_LOG` (e.g., `RUST_LOG=info`)
-- `--verbose` enables periodic metrics logs per subscription: message counts, latencies (parse/transform/code vs overall), packet stats, throughput
+- Logging via `env_logger`; set `RUST_LOG` (e.g., `RUST_LOG=info`).
+- `--verbose` enables periodic metrics logs per subscription: message counts, latencies (parse/transform/code vs overall), packet stats, throughput.
+
+### Prometheus endpoint
+- A lightweight HTTP listener is started on `127.0.0.1:9898` and exposes Prometheus text metrics at `/metrics`.
+- Example:
+  ```bash
+  curl -s http://127.0.0.1:9898/metrics | head
+  ```
+- Minimal scrape config:
+  ```yaml
+  scrape_configs:
+    - job_name: xtrader
+      static_configs:
+        - targets: ["127.0.0.1:9898"]
+  ```
+
+Metrics included (non-exhaustive):
+- `messages_received_total` (gauge of total observed)
+- `messages_processed_total` (gauge of total observed)
+- `parse_errors_total`
+- `throughput_msgs_per_sec`
+
+Notes:
+- Counters are currently exported as gauges set to snapshot totals to avoid in-process delta tracking on hot paths.
+
+### StatsD exporter (optional)
+- Enable by setting environment variables before starting the app:
+  - `XTRADER_STATSD_HOST` (e.g., `127.0.0.1`)
+  - `XTRADER_STATSD_PORT` (e.g., `8125`)
+- Emitted metrics: `messages_received`, `messages_processed`, `parse_errors` (counters) and `throughput_msgs_per_sec` (gauge).
+- UDP/queued sink is used; emission happens on a background task.
+
+### HDR latency histograms (optional)
+- Feature-gated via Cargo feature `metrics-hdr`.
+- Build with:
+  ```bash
+  cargo run --release --features metrics-hdr -- ...
+  ```
+- When enabled, per-component histograms record code/overall/parse/transform/overhead latencies in microseconds; p50/p99 are included in human logs and can be surfaced via exporters.
+- Histograms are initialized only in selected components and can be extended as needed.
+
+### Global metrics snapshot
+- The system maintains a lightweight `Arc<Mutex<Metrics>>` snapshot for exporters.
+- Hot-path code updates only local, low-cost counters; background tasks periodically snapshot and export without blocking the data plane.
+
+### Overhead and safety
+- Hot paths avoid locks/allocations; exporters run off-thread.
+- Prometheus listener is intentionally minimal and local-only by default.
 
 ## Examples
 - Collect OKX SWAP L2 for BTCUSDT into `./data/out`:
