@@ -89,6 +89,7 @@ pub async fn run_arbitrated_trades(
 
     // Spawn connectors with ramp-up
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut conn_tokens: Vec<CancellationToken> = Vec::new();
     let exchange = subscription.exchange.clone();
     let instrument = subscription.instrument.clone();
 
@@ -103,6 +104,7 @@ pub async fn run_arbitrated_trades(
         let verbose_local = verbose;
 
         let cancel_child = cancel.child_token();
+        let cancel_child_for_task = cancel_child.clone();
         let handle = tokio::spawn(async move {
             if verbose_local {
                 log::info!("[arb][{}] connecting trades conn={} {}@{}", index, conn_id, format!("{:?}", exchange), symbol);
@@ -121,7 +123,7 @@ pub async fn run_arbitrated_trades(
 
             loop {
                 tokio::select! {
-                    _ = cancel_child.cancelled() => {
+                    _ = cancel_child_for_task.cancelled() => {
                         let _ = local_conn.disconnect().await; break;
                     }
                     msg = local_conn.next_message() => {
@@ -135,6 +137,7 @@ pub async fn run_arbitrated_trades(
             }
         });
         handles.push(handle);
+        conn_tokens.push(cancel_child);
 
         // Ramp-up spacing
         if conn_id + 1 < max_conn {
@@ -142,7 +145,9 @@ pub async fn run_arbitrated_trades(
         }
     }
 
-    drop(raw_tx); // keep arb alive while any tasks still hold a clone
+    // Keep a clone for rotation spawns; drop the original sender
+    let raw_tx_for_rotation = raw_tx.clone();
+    drop(raw_tx);
 
     // Deduper for trades (exchange+symbol+trade_id) with LRU+TTL
     use crate::pipeline::deduper::Deduper;
@@ -152,10 +157,62 @@ pub async fn run_arbitrated_trades(
     // Simple per-connector accounting
     let mut wins: HashMap<usize, u64> = HashMap::default();
     let mut msgs: HashMap<usize, u64> = HashMap::default();
+    let mut wins_window: HashMap<usize, u64> = HashMap::default();
+    let mut msgs_window: HashMap<usize, u64> = HashMap::default();
     let mut last_report = Instant::now() - Duration::from_secs(ARB_REPORT_INTERVAL_SECS);
+    let mut rotation_interval = tokio::time::interval(Duration::from_secs(60));
 
     loop {
-        let next = tokio::select! { _ = cancel.cancelled() => None, msg = raw_rx.recv() => msg };
+        let next = tokio::select! {
+            _ = cancel.cancelled() => None,
+            _ = rotation_interval.tick() => {
+                // pick conn with lowest wins in window
+                let mut loser: Option<usize> = None;
+                let mut low = u64::MAX;
+                for id in 0..max_conn {
+                    let w = wins_window.get(&id).copied().unwrap_or(0);
+                    if w < low { low = w; loser = Some(id); }
+                }
+                if let Some(id) = loser {
+                    log::info!("[arb][TRADES][{}] rotating conn={} (window_wins={})", index, id, low);
+                    if let Some(tok) = conn_tokens.get(id) { tok.cancel(); }
+                    if let Some(h) = handles.get(id) { h.abort(); }
+                    // spawn replacement
+                    let exchange = exchange;
+                    let symbol = instrument.clone();
+                    let cancel_child = cancel.child_token();
+                    let cancel_child_for_task = cancel_child.clone();
+                    let tx = raw_tx_for_rotation.clone();
+                    let okx_swap_registry = okx_swap_registry.clone();
+                    let okx_spot_registry = okx_spot_registry.clone();
+                    let handle = tokio::spawn(async move {
+                        let mut local_conn: Box<dyn ExchangeConnector<Error = AppError>> =
+                            ConnectorFactory::create_connector(exchange, okx_swap_registry.clone(), okx_spot_registry.clone());
+                        if let Err(e) = local_conn.connect().await { log::error!("[arb][TRADES] connect failed conn={}: {}", id, e); return; }
+                        if let Err(e) = local_conn.subscribe_trades(&symbol).await { log::error!("[arb][TRADES] subscribe trades failed conn={}: {}", id, e); return; }
+                        if log::log_enabled!(log::Level::Info) { log::info!("[arb][TRADES] connected conn={} {:?}@{}", id, exchange, symbol); }
+                        loop {
+                            tokio::select! {
+                                _ = cancel_child_for_task.cancelled() => { let _ = local_conn.disconnect().await; break; }
+                                msg = local_conn.next_message() => {
+                                    match msg {
+                                        Ok(Some(raw)) => { if tx.send((id, raw)).await.is_err() { break; } }
+                                        Ok(None) => { if log::log_enabled!(log::Level::Info) { log::info!("[arb][TRADES] disconnected conn={}", id); } break; }
+                                        Err(e) => { log::error!("[arb][TRADES] next_message error conn={}: {}", id, e); break; }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    if let Some(hslot) = handles.get_mut(id) { *hslot = handle; }
+                    if let Some(tslot) = conn_tokens.get_mut(id) { *tslot = cancel_child; }
+                    wins_window.clear(); msgs_window.clear();
+                    for cid in 0..max_conn { wins_window.insert(cid, 0); msgs_window.insert(cid, 0); }
+                }
+                continue;
+            }
+            msg = raw_rx.recv() => msg
+        };
         let Some((conn_id, raw_msg)) = next else { break; };
         if verbose { log::debug!("[arb][L2][{}] recv from conn={}", index, conn_id); }
         // Process through processor (unified path) as Trade stream
@@ -176,6 +233,7 @@ pub async fn run_arbitrated_trades(
                 let key = (t.exchange, t.ticker.clone(), t.trade_id.clone());
                 if !trade_deduper.insert(key, std::time::Instant::now()) { continue; }
                 *wins.entry(conn_id).or_insert(0) += 1;
+                *wins_window.entry(conn_id).or_insert(0) += 1;
             }
 
             // Forward downstream
@@ -185,6 +243,7 @@ pub async fn run_arbitrated_trades(
         }
 
         *msgs.entry(conn_id).or_insert(0) += 1;
+        *msgs_window.entry(conn_id).or_insert(0) += 1;
 
         // Report metrics periodically
         if let Some(ref mut rep) = reporter { rep.maybe_report(processor.metrics()); }
@@ -194,8 +253,10 @@ pub async fn run_arbitrated_trades(
             let ex = format!("{:?}", exchange);
             for id in 0..max_conn {
                 let m = msgs.get(&id).copied().unwrap_or(0);
+                let mw = msgs_window.get(&id).copied().unwrap_or(0);
                 let w = wins.get(&id).copied().unwrap_or(0);
-                log::info!("[arb][{}][{}@{}] conn={} msgs={} wins={}", index, ex, instrument, id, m, w);
+                let ww = wins_window.get(&id).copied().unwrap_or(0);
+                log::info!("[arb][TRADES][{}][{}@{}] conn={} msgs={} (win={}) wins={} (win={})", index, ex, instrument, id, m, mw, w, ww);
             }
             last_report = Instant::now();
         }
