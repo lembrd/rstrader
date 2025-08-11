@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio::net::lookup_host;
 
 use crate::error::{AppError, Result};
 use crate::exchanges::ExchangeConnector;
@@ -397,6 +398,62 @@ impl OkxConnector {
         }
     }
 
+    fn parse_host_port(url: &str, default_port: u16) -> Option<(String, u16)> {
+        let without_scheme = url.strip_prefix("wss://").or_else(|| url.strip_prefix("ws://"))?;
+        let parts: Vec<&str> = without_scheme.splitn(2, '/').collect();
+        let host_port = parts.get(0).copied().unwrap_or("");
+        if host_port.is_empty() { return None; }
+        if let Some((host, port_str)) = host_port.split_once(':') {
+            if let Ok(port) = port_str.parse::<u16>() { return Some((host.to_string(), port)); }
+            return Some((host_port.to_string(), default_port));
+        }
+        Some((host_port.to_string(), default_port))
+    }
+
+    async fn log_dns_and_target(&self, url: &str, default_port: u16) {
+        if let Some((host, port)) = Self::parse_host_port(url, default_port) {
+            match lookup_host((host.as_str(), port)).await {
+                Ok(addrs) => {
+                    let addrs_vec: Vec<String> = addrs.map(|a| a.to_string()).collect();
+                    log::info!("[dns][okx] host={} port={} resolved={:?}", host, port, addrs_vec);
+                }
+                Err(e) => {
+                    log::warn!("[dns][okx] host={} port={} resolution failed: {}", host, port, e);
+                }
+            }
+        } else {
+            log::warn!("[dns][okx] failed to parse host from URL: {}", url);
+        }
+    }
+
+    fn log_connected_addrs(stream: &WebSocketStream<MaybeTlsStream<TcpStream>>) {
+        let inner = stream.get_ref();
+        match inner {
+            MaybeTlsStream::Plain(tcp) => {
+                if let (Ok(local), Ok(peer)) = (tcp.local_addr(), tcp.peer_addr()) {
+                    log::info!("[net][okx] connected local={} peer={}", local, peer);
+                }
+            }
+            MaybeTlsStream::Rustls(tls) => {
+                let (io, _session) = tls.get_ref();
+                if let (Ok(local), Ok(peer)) = (io.local_addr(), io.peer_addr()) {
+                    log::info!("[net][okx] connected local={} peer={}", local, peer);
+                }
+            }
+            #[cfg(feature = "native-tls")]
+            MaybeTlsStream::NativeTls(tls) => {
+                if let Some(io) = tls.get_ref() {
+                    if let (Ok(local), Ok(peer)) = (io.local_addr(), io.peer_addr()) {
+                        log::info!("[net][okx] connected local={} peer={}", local, peer);
+                    }
+                }
+            }
+            _ => {
+                log::info!("[net][okx] connected (unrecognized TLS stream variant)");
+            }
+        }
+    }
+
     async fn get_depth_snapshot(&self, symbol: &str) -> Result<OrderBookSnapshot> {
         let okx_symbol = self.convert_symbol(symbol);
         let url = format!(
@@ -656,11 +713,13 @@ impl ExchangeConnector for OkxConnector {
     type Error = AppError;
 
     async fn connect(&mut self) -> Result<()> {
+        self.log_dns_and_target(&self.ws_url, 8443).await;
         let (ws_stream, _) = connect_async(&self.ws_url).await.map_err(|e| {
             AppError::connection(format!("Failed to connect to OKX WebSocket: {}", e))
         })?;
 
         self.ws_stream = Some(ws_stream);
+        if let Some(ref stream) = self.ws_stream { Self::log_connected_addrs(stream); }
         self.sync_state = OkxSyncState::Connected;
 
         Ok(())
@@ -774,6 +833,21 @@ impl ExchangeConnector for OkxConnector {
         }
         self.sync_state = OkxSyncState::Disconnected;
         Ok(())
+    }
+
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.ws_stream.as_ref().and_then(|ws| {
+            match ws.get_ref() {
+                MaybeTlsStream::Plain(tcp) => tcp.peer_addr().ok(),
+                MaybeTlsStream::Rustls(tls) => {
+                    let (io, _) = tls.get_ref();
+                    io.peer_addr().ok()
+                }
+                #[cfg(feature = "native-tls")]
+                MaybeTlsStream::NativeTls(tls) => tls.get_ref().and_then(|io| io.peer_addr().ok()),
+                _ => None,
+            }
+        })
     }
 
     async fn validate_symbol(&self, symbol: &str) -> Result<()> {

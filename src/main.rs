@@ -92,7 +92,7 @@ async fn run_application(args: Args) -> Result<()> {
     // Create optimized subscription manager with unified handlers
     let mut manager = subscription_manager::SubscriptionManager::new(subscriptions, args.verbose);
     manager
-        .spawn_all_subscriptions(stream_tx, okx_swap_registry, okx_spot_registry)
+        .spawn_all_subscriptions(stream_tx.clone(), okx_swap_registry, okx_spot_registry)
         .await?;
 
     // Start sink task based on CLI
@@ -147,6 +147,8 @@ async fn run_application(args: Args) -> Result<()> {
     // Shutdown handlers and finalize sink
     log::info!("Shutting down unified handlers and finalizing sink...");
     manager.shutdown().await;
+    // Drop the last sender so sink can observe channel close and exit
+    drop(stream_tx);
     
     match sink_handle.await {
         Ok(Ok(_)) => log::info!("Sink finalized successfully"),

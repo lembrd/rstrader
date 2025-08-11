@@ -303,17 +303,14 @@ pub async fn run_multi_stream_questdb_sink(
                 }
             }
             _ = flush_interval.tick() => {
-                // Periodic flush; report current writer & buffered record counts for visibility
+                // Periodic flush; avoid spam when nothing buffered
                 let writer_count = sink.writers.len();
                 if writer_count > 0 {
-                    let mut total_buffered = 0usize;
+                    let mut _total_buffered = 0usize;
                     for w in sink.writers.values() {
-                        total_buffered += w.buffer_len();
+                        _total_buffered += w.buffer_len();
                     }
-                    log::debug!(
-                        "QuestDB flush tick: writers={}, buffered_records={}",
-                        writer_count, total_buffered
-                    );
+                    // Silence flush tick logs entirely to avoid spam
                 }
                 if let Err(e) = sink.flush_all().await {
                     log::error!("Failed to flush QuestDB batches: {}", e);

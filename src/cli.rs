@@ -24,7 +24,7 @@ pub struct Args {
     pub sink: Sink,
 }
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug)]
 pub enum Exchange {
     #[value(name = "BINANCE_FUTURES")]
     BinanceFutures,
@@ -36,7 +36,7 @@ pub enum Exchange {
     Deribit,
 }
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
 pub enum StreamType {
     #[value(name = "L2")]
     L2,
@@ -57,16 +57,20 @@ pub struct SubscriptionSpec {
     pub stream_type: StreamType,
     pub exchange: Exchange,
     pub instrument: String,
+    /// Optional max concurrent connections for latency arbitrage per subscription
+    pub max_connections: Option<usize>,
 }
 
 impl SubscriptionSpec {
-    /// Parse subscription format: stream_type:exchange@instrument
-    /// Example: L2:OKX_SWAP@BTCUSDT
+    /// Parse subscription format: stream_type:exchange@instrument[connections]
+    /// Examples:
+    ///   L2:OKX_SWAP@BTCUSDT
+    ///   L2:BINANCE_FUTURES@BTCUSDT[10]
     pub fn parse(input: &str) -> Result<Self, String> {
         let parts: Vec<&str> = input.split(':').collect();
         if parts.len() != 2 {
             return Err(format!(
-                "Invalid format '{}'. Expected 'stream_type:exchange@instrument'",
+                "Invalid format '{}'. Expected 'stream_type:exchange@instrument[connections]'",
                 input
             ));
         }
@@ -83,7 +87,29 @@ impl SubscriptionSpec {
         }
 
         let exchange_str = exchange_parts[0];
-        let instrument = exchange_parts[1].to_string();
+        let instrument_raw = exchange_parts[1].trim();
+
+        // Support optional [N] suffix for max connections
+        let (instrument, max_connections) = if let Some(start_idx) = instrument_raw.rfind('[') {
+            if instrument_raw.ends_with(']') {
+                let base = &instrument_raw[..start_idx];
+                let inside = &instrument_raw[start_idx + 1..instrument_raw.len() - 1];
+                if base.is_empty() {
+                    return Err("Instrument cannot be empty".to_string());
+                }
+                let n: usize = inside.parse().map_err(|_| {
+                    format!("Invalid connections value '{}' in '{}'", inside, input)
+                })?;
+                if n == 0 {
+                    return Err("Connections value must be > 0".to_string());
+                }
+                (base.to_string(), Some(n))
+            } else {
+                (instrument_raw.to_string(), None)
+            }
+        } else {
+            (instrument_raw.to_string(), None)
+        };
 
         if instrument.is_empty() {
             return Err("Instrument cannot be empty".to_string());
@@ -119,6 +145,7 @@ impl SubscriptionSpec {
             stream_type,
             exchange,
             instrument,
+            max_connections,
         })
     }
 
@@ -229,16 +256,23 @@ mod tests {
         assert!(matches!(spec.stream_type, StreamType::L2));
         assert!(matches!(spec.exchange, Exchange::OkxSwap));
         assert_eq!(spec.instrument, "BTCUSDT");
+        assert_eq!(spec.max_connections, None);
 
         let spec = SubscriptionSpec::parse("TRADES:BINANCE_FUTURES@ETHUSDT").unwrap();
         assert!(matches!(spec.stream_type, StreamType::Trades));
         assert!(matches!(spec.exchange, Exchange::BinanceFutures));
         assert_eq!(spec.instrument, "ETHUSDT");
+        assert_eq!(spec.max_connections, None);
 
         let spec = SubscriptionSpec::parse("L2:OKX_SPOT@ADAUSDT").unwrap();
         assert!(matches!(spec.stream_type, StreamType::L2));
         assert!(matches!(spec.exchange, Exchange::OkxSpot));
         assert_eq!(spec.instrument, "ADAUSDT");
+
+        // With max connections suffix
+        let spec = SubscriptionSpec::parse("L2:BINANCE_FUTURES@BTCUSDT[10]").unwrap();
+        assert_eq!(spec.instrument, "BTCUSDT");
+        assert_eq!(spec.max_connections, Some(10));
     }
 
     #[test]
@@ -263,13 +297,21 @@ mod tests {
 
         // Multiple @
         assert!(SubscriptionSpec::parse("L2:OKX_SWAP@BTC@USDT").is_err());
+
+        // Invalid bracket value
+        assert!(SubscriptionSpec::parse("L2:OKX_SWAP@BTCUSDT[abc]").is_err());
+        // Zero not allowed
+        assert!(SubscriptionSpec::parse("L2:OKX_SWAP@BTCUSDT[0]").is_err());
+        // Missing closing bracket treated as plain instrument (allowed)
+        assert!(SubscriptionSpec::parse("L2:OKX_SWAP@BTCUSDT[").is_ok());
     }
 
     #[test]
     fn test_subscription_spec_parse_multiple() {
-        let specs =
-            SubscriptionSpec::parse_multiple("L2:OKX_SWAP@BTCUSDT,TRADES:BINANCE_FUTURES@ETHUSDT")
-                .unwrap();
+        let specs = SubscriptionSpec::parse_multiple(
+            "L2:OKX_SWAP@BTCUSDT,TRADES:BINANCE_FUTURES@ETHUSDT[3]",
+        )
+        .unwrap();
         assert_eq!(specs.len(), 2);
 
         assert!(matches!(specs[0].stream_type, StreamType::L2));
@@ -279,6 +321,7 @@ mod tests {
         assert!(matches!(specs[1].stream_type, StreamType::Trades));
         assert!(matches!(specs[1].exchange, Exchange::BinanceFutures));
         assert_eq!(specs[1].instrument, "ETHUSDT");
+        assert_eq!(specs[1].max_connections, Some(3));
 
         // Test with spaces
         let specs =

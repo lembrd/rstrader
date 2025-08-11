@@ -82,6 +82,9 @@ pub trait ExchangeConnector: Send + Sync {
     /// Disconnect and cleanup resources
     async fn disconnect(&mut self) -> Result<(), Self::Error>;
 
+    /// Get peer socket address if connected
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> { None }
+
     /// Check if connection is healthy
     fn is_connected(&self) -> bool {
         matches!(self.connection_status(), ConnectionStatus::Connected)

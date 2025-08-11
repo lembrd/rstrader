@@ -40,21 +40,61 @@ impl SubscriptionManager {
             // Create cancellation token for this handler
             let cancellation_token = CancellationToken::new();
             
-            // Create unified handler for this subscription
-            let handler = UnifiedHandlerFactory::create_handler(
-                subscription.clone(),
-                index,
-                self.verbose,
-                okx_swap_registry.clone(),
-                okx_spot_registry.clone(),
-                cancellation_token.clone(),
-            )?;
-
-            // Spawn single unified task instead of dual tasks
+            // If TRADES with arbitration config (max_connections set), use arbitrated runner
             let output_tx = processed_tx.clone();
-            let handler_handle = tokio::spawn(async move {
-                handler.run(output_tx).await
-            });
+            let handler_handle = if subscription.stream_type == crate::cli::StreamType::Trades
+                && subscription.max_connections.unwrap_or(1) > 1
+            {
+                let sub_clone = subscription.clone();
+                let okx_swap = okx_swap_registry.clone();
+                let okx_spot = okx_spot_registry.clone();
+                let verbose = self.verbose;
+                let arb_token = cancellation_token.clone();
+                tokio::spawn(async move {
+                    crate::pipeline::latency_arb::run_arbitrated_trades(
+                        sub_clone,
+                        index,
+                        verbose,
+                        okx_swap,
+                        okx_spot,
+                        output_tx,
+                        arb_token,
+                    )
+                    .await
+                })
+            } else if subscription.stream_type == crate::cli::StreamType::L2
+                && subscription.max_connections.unwrap_or(1) > 1
+            {
+                let sub_clone = subscription.clone();
+                let okx_swap = okx_swap_registry.clone();
+                let okx_spot = okx_spot_registry.clone();
+                let verbose = self.verbose;
+                let arb_token = cancellation_token.clone();
+                tokio::spawn(async move {
+                    crate::pipeline::latency_arb::run_arbitrated_l2(
+                        sub_clone,
+                        index,
+                        verbose,
+                        okx_swap,
+                        okx_spot,
+                        output_tx,
+                        arb_token,
+                    )
+                    .await
+                })
+            } else {
+                // Create unified handler for this subscription
+                let handler = UnifiedHandlerFactory::create_handler(
+                    subscription.clone(),
+                    index,
+                    self.verbose,
+                    okx_swap_registry.clone(),
+                    okx_spot_registry.clone(),
+                    cancellation_token.clone(),
+                )?;
+                // Spawn single unified task instead of dual tasks
+                tokio::spawn(async move { handler.run(output_tx).await })
+            };
 
             self.handler_handles.push(handler_handle);
             self.cancellation_tokens.push(cancellation_token);
@@ -111,6 +151,11 @@ impl SubscriptionManager {
         // Cancel all handlers gracefully
         for token in &self.cancellation_tokens {
             token.cancel();
+        }
+
+        // Proactively abort all running handler tasks (covers arbitrated runners without tokens)
+        for handle in &self.handler_handles {
+            handle.abort();
         }
 
         // Wait for all handles to complete with timeout

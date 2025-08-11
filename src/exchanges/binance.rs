@@ -6,7 +6,9 @@ use serde::Deserialize;
 use std::collections::VecDeque;
 use std::time::SystemTime;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{WebSocketStream, connect_async};
+use tokio_tungstenite::{WebSocketStream, connect_async, MaybeTlsStream};
+use tokio::net::lookup_host;
+use tokio::net::TcpStream;
 
 use crate::error::{AppError, Result};
 use serde_json::json;
@@ -149,6 +151,67 @@ impl BinanceFuturesConnector {
     /// Get WebSocket trade stream URL
     fn ws_trade_stream_url(&self, symbol: &str) -> String {
         format!("{}/ws/{}@trade", self.ws_url, symbol.to_lowercase())
+    }
+
+    fn parse_host_port(url: &str, default_port: u16) -> Option<(String, u16)> {
+        // Very small, dependency-free parser for wss://host[:port]/path
+        let without_scheme = url.strip_prefix("wss://").or_else(|| url.strip_prefix("ws://"))?;
+        let host_port_path = without_scheme;
+        let parts: Vec<&str> = host_port_path.splitn(2, '/').collect();
+        let host_port = parts.get(0).copied().unwrap_or("");
+        if host_port.is_empty() { return None; }
+        if let Some((host, port_str)) = host_port.split_once(':') {
+            if let Ok(port) = port_str.parse::<u16>() { return Some((host.to_string(), port)); }
+            return Some((host_port.to_string(), default_port));
+        }
+        Some((host_port.to_string(), default_port))
+    }
+
+    async fn log_dns_and_target(&self, url: &str, default_port: u16) {
+        if let Some((host, port)) = Self::parse_host_port(url, default_port) {
+            match lookup_host((host.as_str(), port)).await {
+                Ok(addrs) => {
+                    let addrs_vec: Vec<String> = addrs.map(|a| a.to_string()).collect();
+                    log::info!("[dns][binance] host={} port={} resolved={:?}", host, port, addrs_vec);
+                }
+                Err(e) => {
+                    log::warn!("[dns][binance] host={} port={} resolution failed: {}", host, port, e);
+                }
+            }
+        } else {
+            log::warn!("[dns][binance] failed to parse host from URL: {}", url);
+        }
+    }
+
+    fn log_connected_addrs(stream: &WebSocketStream<MaybeTlsStream<TcpStream>>) {
+        use tokio_tungstenite::MaybeTlsStream as MT;
+        let inner = stream.get_ref();
+        match inner {
+            MT::Plain(tcp) => {
+                if let (Ok(local), Ok(peer)) = (tcp.local_addr(), tcp.peer_addr()) {
+                    log::info!("[net][binance] connected local={} peer={}", local, peer);
+                }
+            }
+            #[allow(unused_imports)]
+            MT::Rustls(tls) => {
+                // tokio_rustls::client::TlsStream<TcpStream>
+                let (io, _session) = tls.get_ref();
+                if let (Ok(local), Ok(peer)) = (io.local_addr(), io.peer_addr()) {
+                    log::info!("[net][binance] connected local={} peer={}", local, peer);
+                }
+            }
+            #[cfg(feature = "native-tls")]
+            MT::NativeTls(tls) => {
+                if let Some(io) = tls.get_ref() {
+                    if let (Ok(local), Ok(peer)) = (io.local_addr(), io.peer_addr()) {
+                        log::info!("[net][binance] connected local={} peer={}", local, peer);
+                    }
+                }
+            }
+            _ => {
+                log::info!("[net][binance] connected (unrecognized TLS stream variant)");
+            }
+        }
     }
 
     /// Parse price level from string array
@@ -354,6 +417,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
     async fn subscribe_l2(&mut self, symbol: &str) -> Result<()> {
         let ws_url = self.ws_stream_url(symbol);
 
+        self.log_dns_and_target(&ws_url, 443).await;
         log::info!("Connecting to WebSocket: {}", ws_url);
 
         let (ws_stream, _) = connect_async(&ws_url)
@@ -361,6 +425,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
             .map_err(|e| AppError::connection(format!("WebSocket error: {}", e)))?;
 
         self.ws_stream = Some(ws_stream);
+        if let Some(ref stream) = self.ws_stream { Self::log_connected_addrs(stream); }
         self.symbol = Some(symbol.to_string());
         
         // Only set to BufferingUpdates if not already synchronized
@@ -380,6 +445,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
     async fn subscribe_trades(&mut self, symbol: &str) -> Result<()> {
         let ws_url = self.ws_trade_stream_url(symbol);
 
+        self.log_dns_and_target(&ws_url, 443).await;
         log::info!("Connecting to Binance trades WebSocket: {}", ws_url);
 
         let (ws_stream, _) = connect_async(&ws_url)
@@ -387,6 +453,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
             .map_err(|e| AppError::connection(format!("WebSocket error: {}", e)))?;
 
         self.ws_stream = Some(ws_stream);
+        if let Some(ref stream) = self.ws_stream { Self::log_connected_addrs(stream); }
         self.symbol = Some(symbol.to_string());
         
         // For trades, we don't need synchronization - set TradeStream state
@@ -569,6 +636,21 @@ impl ExchangeConnector for BinanceFuturesConnector {
         Ok(())
     }
 
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.ws_stream.as_ref().and_then(|ws| {
+            match ws.get_ref() {
+                tokio_tungstenite::MaybeTlsStream::Plain(tcp) => tcp.peer_addr().ok(),
+                tokio_tungstenite::MaybeTlsStream::Rustls(tls) => {
+                    let (io, _) = tls.get_ref();
+                    io.peer_addr().ok()
+                }
+                #[cfg(feature = "native-tls")]
+                tokio_tungstenite::MaybeTlsStream::NativeTls(tls) => tls.get_ref().and_then(|io| io.peer_addr().ok()),
+                _ => None,
+            }
+        })
+    }
+
     async fn validate_symbol(&self, _symbol: &str) -> Result<()> {
         // For now, accept all symbols - could implement validation later
         Ok(())
@@ -589,6 +671,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
     ) -> Result<()> {
         let ws_url = self.ws_trade_stream_url(symbol);
 
+        self.log_dns_and_target(&ws_url, 443).await;
         log::info!("Connecting to Binance trade WebSocket: {}", ws_url);
 
         let (ws_stream, _) = connect_async(&ws_url)
@@ -596,6 +679,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
             .map_err(|e| AppError::connection(format!("WebSocket error: {}", e)))?;
 
         self.ws_stream = Some(ws_stream);
+        if let Some(ref stream) = self.ws_stream { Self::log_connected_addrs(stream); }
         self.symbol = Some(symbol.to_string());
         self.connection_status = ConnectionStatus::Connected;
 
@@ -768,8 +852,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
             crate::error::AppError::pipeline(format!("Failed to parse Binance depth update: {}", e))
         })?;
         
-        log::debug!("Successfully parsed Binance depth update: {} bids, {} asks", 
-                   depth_update.bids.len(), depth_update.asks.len());
+        // Removed per user request to reduce log spam
 
         // Calculate parse time
         let parse_end = crate::types::time::now_micros();
