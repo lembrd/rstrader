@@ -281,12 +281,7 @@ pub enum ExchangeId {
 
 impl std::fmt::Display for ExchangeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ExchangeId::BinanceFutures => write!(f, "BINANCE_FUTURES"),
-            ExchangeId::OkxSwap => write!(f, "OKX_SWAP"),
-            ExchangeId::OkxSpot => write!(f, "OKX_SPOT"),
-            ExchangeId::Deribit => write!(f, "DERIBIT"),
-        }
+        write!(f, "{:?}", self)
     }
 }
 
@@ -380,7 +375,7 @@ pub struct Metrics {
     // Optional low-overhead histograms (disabled by default to avoid allocations)
     #[cfg(feature = "metrics-hdr")]
     #[allow(clippy::type_complexity)]
-    latency_histograms: Option<crate::metrics::LatencyHistograms>,
+    pub(crate) latency_histograms: Option<crate::metrics::LatencyHistograms>,
 }
 
 impl Metrics {

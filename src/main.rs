@@ -68,6 +68,7 @@ async fn run_application(args: Args) -> Result<()> {
     // Start metrics HTTP server (/metrics) and snapshot aggregator in background (minimal TCP server)
     let prometheus_exporter = crate::metrics::exporters::PrometheusExporter::new();
     let prom_registry = std::sync::Arc::new(prometheus_exporter);
+    let _ = crate::metrics::PROM_EXPORTER.set(prom_registry.clone());
     tokio::spawn({
         let prom_registry = prom_registry.clone();
         async move {

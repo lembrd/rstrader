@@ -94,6 +94,11 @@ impl MetricsReporter {
                 stream_type_str,
                 metrics
             );
+
+            // Publish updated snapshot and per-stream latencies via universal helper (sink-agnostic)
+            let exchange_lbl = match self.exchange { Some(e) => e, None => ExchangeId::BinanceFutures };
+            let stream_lbl = self.stream_type.clone().unwrap_or_else(|| "Unknown".to_string());
+            crate::metrics::publish_stream_metrics(&stream_lbl, exchange_lbl, &self.symbol, metrics);
             self.last_report = std::time::Instant::now();
         }
     }

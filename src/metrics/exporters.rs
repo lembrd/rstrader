@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::time::Duration;
-use prometheus::{Encoder, TextEncoder, Registry, IntGauge, Opts};
+use prometheus::{Encoder, TextEncoder, Registry, IntGauge, Opts, GaugeVec};
 use cadence::{StatsdClient, NopMetricSink, UdpMetricSink, QueuingMetricSink, Gauged, Counted};
 use std::net::UdpSocket;
 
@@ -62,19 +62,7 @@ impl<E: SnapshotExporter> Aggregator<E> {
                 let guard = metrics_ref.lock().expect("metrics lock");
                 let basic = crate::metrics::snapshot::BasicSnapshot::from(&*guard);
                 #[cfg(feature = "metrics-hdr")]
-                let hdr = metrics_ref
-                    .lock()
-                    .expect("metrics lock")
-                    .latency_histograms
-                    .as_ref()
-                    .map(|h| {
-                        // Cloning a snapshot requires &mut; we cannot snapshot & reset without mut.
-                        // Instead, return None here and rely on periodic logging from display or other APIs,
-                        // or make metrics_ref mutable in the caller if snapshotting is needed.
-                        // Keeping zero-cost path here; exporter can be enhanced later.
-                        let _ = h; None::<crate::metrics::MaybeMetricsSnapshot>
-                    })
-                    .flatten();
+                let hdr = None::<crate::metrics::MaybeMetricsSnapshot>;
                 #[cfg(not(feature = "metrics-hdr"))]
                 let hdr = None::<crate::metrics::MaybeMetricsSnapshot>;
                 (basic, hdr)
@@ -91,6 +79,17 @@ pub struct PrometheusExporter {
     processed_total: IntGauge,
     parse_errors_total: IntGauge,
     throughput: IntGauge,
+    // Per-stream quantiles (microseconds)
+    code_p50_us: GaugeVec,
+    code_p99_us: GaugeVec,
+    overall_p50_us: GaugeVec,
+    overall_p99_us: GaugeVec,
+    parse_p50_us: GaugeVec,
+    parse_p99_us: GaugeVec,
+    transform_p50_us: GaugeVec,
+    transform_p99_us: GaugeVec,
+    overhead_p50_us: GaugeVec,
+    overhead_p99_us: GaugeVec,
 }
 
 impl PrometheusExporter {
@@ -100,11 +99,51 @@ impl PrometheusExporter {
         let processed_total = IntGauge::with_opts(Opts::new("messages_processed_total", "Total messages processed")).unwrap();
         let parse_errors_total = IntGauge::with_opts(Opts::new("parse_errors_total", "Total parse errors")).unwrap();
         let throughput = IntGauge::with_opts(Opts::new("throughput_msgs_per_sec", "Throughput in messages/sec")).unwrap();
+        let code_p50_us = GaugeVec::new(Opts::new("code_latency_p50_us", "Code execution latency p50 (us)"), &[
+            "stream", "exchange", "symbol"
+        ]).unwrap();
+        let code_p99_us = GaugeVec::new(Opts::new("code_latency_p99_us", "Code execution latency p99 (us)"), &[
+            "stream", "exchange", "symbol"
+        ]).unwrap();
+        let overall_p50_us = GaugeVec::new(Opts::new("overall_latency_p50_us", "Overall latency p50 (us)"), &[
+            "stream", "exchange", "symbol"
+        ]).unwrap();
+        let overall_p99_us = GaugeVec::new(Opts::new("overall_latency_p99_us", "Overall latency p99 (us)"), &[
+            "stream", "exchange", "symbol"
+        ]).unwrap();
+        let parse_p50_us = GaugeVec::new(Opts::new("parse_latency_p50_us", "Parse latency p50 (us)"), &[
+            "stream", "exchange", "symbol"
+        ]).unwrap();
+        let parse_p99_us = GaugeVec::new(Opts::new("parse_latency_p99_us", "Parse latency p99 (us)"), &[
+            "stream", "exchange", "symbol"
+        ]).unwrap();
+        let transform_p50_us = GaugeVec::new(Opts::new("transform_latency_p50_us", "Transform latency p50 (us)"), &[
+            "stream", "exchange", "symbol"
+        ]).unwrap();
+        let transform_p99_us = GaugeVec::new(Opts::new("transform_latency_p99_us", "Transform latency p99 (us)"), &[
+            "stream", "exchange", "symbol"
+        ]).unwrap();
+        let overhead_p50_us = GaugeVec::new(Opts::new("overhead_latency_p50_us", "Overhead latency p50 (us)"), &[
+            "stream", "exchange", "symbol"
+        ]).unwrap();
+        let overhead_p99_us = GaugeVec::new(Opts::new("overhead_latency_p99_us", "Overhead latency p99 (us)"), &[
+            "stream", "exchange", "symbol"
+        ]).unwrap();
         registry.register(Box::new(recv_total.clone())).unwrap();
         registry.register(Box::new(processed_total.clone())).unwrap();
         registry.register(Box::new(parse_errors_total.clone())).unwrap();
         registry.register(Box::new(throughput.clone())).unwrap();
-        Self { registry, recv_total, processed_total, parse_errors_total, throughput }
+        registry.register(Box::new(code_p50_us.clone())).unwrap();
+        registry.register(Box::new(code_p99_us.clone())).unwrap();
+        registry.register(Box::new(overall_p50_us.clone())).unwrap();
+        registry.register(Box::new(overall_p99_us.clone())).unwrap();
+        registry.register(Box::new(parse_p50_us.clone())).unwrap();
+        registry.register(Box::new(parse_p99_us.clone())).unwrap();
+        registry.register(Box::new(transform_p50_us.clone())).unwrap();
+        registry.register(Box::new(transform_p99_us.clone())).unwrap();
+        registry.register(Box::new(overhead_p50_us.clone())).unwrap();
+        registry.register(Box::new(overhead_p99_us.clone())).unwrap();
+        Self { registry, recv_total, processed_total, parse_errors_total, throughput, code_p50_us, code_p99_us, overall_p50_us, overall_p99_us, parse_p50_us, parse_p99_us, transform_p50_us, transform_p99_us, overhead_p50_us, overhead_p99_us }
     }
 
     pub fn gather(&self) -> String {
@@ -157,6 +196,46 @@ impl SnapshotExporter for StatsdExporter {
 impl SnapshotExporter for std::sync::Arc<PrometheusExporter> {
     fn export(&self, basic: &crate::metrics::snapshot::BasicSnapshot, hdr: Option<&crate::metrics::MaybeMetricsSnapshot>) {
         (**self).export(basic, hdr)
+    }
+}
+
+impl PrometheusExporter {
+    pub fn set_stream_quantiles(&self, stream: &str, exchange: &str, symbol: &str,
+                                code_p50: u64, code_p99: u64,
+                                overall_p50: u64, overall_p99: u64,
+                                parse_p50: u64, parse_p99: u64,
+                                transform_p50: u64, transform_p99: u64,
+                                overhead_p50: u64, overhead_p99: u64) {
+        let labels = &[stream, exchange, symbol];
+        self.code_p50_us.with_label_values(labels).set(code_p50 as f64);
+        self.code_p99_us.with_label_values(labels).set(code_p99 as f64);
+        self.overall_p50_us.with_label_values(labels).set(overall_p50 as f64);
+        self.overall_p99_us.with_label_values(labels).set(overall_p99 as f64);
+        self.parse_p50_us.with_label_values(labels).set(parse_p50 as f64);
+        self.parse_p99_us.with_label_values(labels).set(parse_p99 as f64);
+        self.transform_p50_us.with_label_values(labels).set(transform_p50 as f64);
+        self.transform_p99_us.with_label_values(labels).set(transform_p99 as f64);
+        self.overhead_p50_us.with_label_values(labels).set(overhead_p50 as f64);
+        self.overhead_p99_us.with_label_values(labels).set(overhead_p99 as f64);
+    }
+
+    pub fn set_stream_quantiles_opt(&self, stream: &str, exchange: &str, symbol: &str,
+                                    code_p50: Option<u64>, code_p99: Option<u64>,
+                                    overall_p50: Option<u64>, overall_p99: Option<u64>,
+                                    parse_p50: Option<u64>, parse_p99: Option<u64>,
+                                    transform_p50: Option<u64>, transform_p99: Option<u64>,
+                                    overhead_p50: Option<u64>, overhead_p99: Option<u64>) {
+        let labels = &[stream, exchange, symbol];
+        if let Some(v) = code_p50 { self.code_p50_us.with_label_values(labels).set(v as f64); }
+        if let Some(v) = code_p99 { self.code_p99_us.with_label_values(labels).set(v as f64); }
+        if let Some(v) = overall_p50 { self.overall_p50_us.with_label_values(labels).set(v as f64); }
+        if let Some(v) = overall_p99 { self.overall_p99_us.with_label_values(labels).set(v as f64); }
+        if let Some(v) = parse_p50 { self.parse_p50_us.with_label_values(labels).set(v as f64); }
+        if let Some(v) = parse_p99 { self.parse_p99_us.with_label_values(labels).set(v as f64); }
+        if let Some(v) = transform_p50 { self.transform_p50_us.with_label_values(labels).set(v as f64); }
+        if let Some(v) = transform_p99 { self.transform_p99_us.with_label_values(labels).set(v as f64); }
+        if let Some(v) = overhead_p50 { self.overhead_p50_us.with_label_values(labels).set(v as f64); }
+        if let Some(v) = overhead_p99 { self.overhead_p99_us.with_label_values(labels).set(v as f64); }
     }
 }
 

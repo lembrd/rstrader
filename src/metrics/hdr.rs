@@ -14,6 +14,7 @@ impl Default for HistogramBounds {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct LatencyHistograms {
     pub code_us: Histogram<u64>,
     pub overall_us: Histogram<u64>,

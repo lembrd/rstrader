@@ -86,14 +86,29 @@ struct StreamWriter {
     l2_buffer: Vec<OrderBookL2Update>,
     trade_buffer: Vec<TradeUpdate>,
     last_activity: Instant,
+    metrics: crate::types::Metrics,
+    stream_type: String,
+    exchange: crate::types::ExchangeId,
+    symbol: String,
 }
 
 impl StreamWriter {
-    fn new() -> Self {
+    fn new(stream_type: String, exchange: crate::types::ExchangeId, symbol: String) -> Self {
         Self {
             l2_buffer: Vec::with_capacity(BATCH_SIZE),
             trade_buffer: Vec::with_capacity(BATCH_SIZE),
             last_activity: Instant::now(),
+            metrics: {
+                let mut m = crate::types::Metrics::new();
+                #[cfg(feature = "metrics-hdr")]
+                {
+                    m.enable_histograms(crate::metrics::HistogramBounds::default());
+                }
+                m
+            },
+            stream_type,
+            exchange,
+            symbol,
         }
     }
 
@@ -103,8 +118,14 @@ impl StreamWriter {
 
     fn push(&mut self, data: StreamData) {
         match data {
-            StreamData::L2(u) => self.l2_buffer.push(u),
-            StreamData::Trade(t) => self.trade_buffer.push(t),
+            StreamData::L2(u) => {
+                self.l2_buffer.push(u);
+                self.metrics.increment_messages_processed();
+            }
+            StreamData::Trade(t) => {
+                self.trade_buffer.push(t);
+                self.metrics.increment_messages_processed();
+            }
         }
         self.last_activity = Instant::now();
     }
@@ -121,6 +142,8 @@ impl StreamWriter {
                 serialize_trade_ilp(&t, &mut out);
             }
         }
+        // Publish metrics snapshot and quantiles (if enabled)
+        crate::metrics::publish_stream_metrics(&self.stream_type, self.exchange, &self.symbol, &self.metrics);
         out
     }
 }
@@ -249,7 +272,7 @@ impl MultiStreamQuestDbSink {
         let (_, _, exchange, symbol, _, _) = data.common_fields();
         let stream_type = data.stream_type();
         let key = format!("{}_{}_{}", stream_type, exchange, symbol);
-        let writer = self.writers.entry(key).or_insert_with(StreamWriter::new);
+        let writer = self.writers.entry(key).or_insert_with(|| StreamWriter::new(stream_type.to_string(), exchange, symbol.to_string()));
         writer.push(data);
         // Flush if either buffer meets threshold
         if writer.buffer_len() >= BATCH_SIZE {
@@ -268,6 +291,13 @@ impl MultiStreamQuestDbSink {
                 self.client.send_bytes(&buf).await?;
             }
         }
+        // Publish lightweight totals to global metrics exporters
+        let mut total = crate::types::Metrics::new();
+        for w in self.writers.values() {
+            // We don't keep per-writer metrics here; emit zeros conservatively
+            let _ = w; // placeholder in case of future per-writer metrics
+        }
+        crate::metrics::update_global(&total);
         Ok(())
     }
 

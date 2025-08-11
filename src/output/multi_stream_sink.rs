@@ -107,7 +107,7 @@ impl StreamWriter {
         self.l2_buffer.clear();
         self.metrics.increment_batches_written();
         self.last_activity = Instant::now();
-        crate::metrics::update_global(&self.metrics);
+        crate::metrics::publish_stream_metrics(&self.stream_type, self.exchange, &self.symbol, &self.metrics);
 
         log::debug!("Wrote L2 batch of {} records to Parquet", batch_size);
         Ok(())
@@ -140,7 +140,7 @@ impl StreamWriter {
         self.trade_buffer.clear();
         self.metrics.increment_batches_written();
         self.last_activity = Instant::now();
-        crate::metrics::update_global(&self.metrics);
+        crate::metrics::publish_stream_metrics(&self.stream_type, self.exchange, &self.symbol, &self.metrics);
 
         log::debug!("Wrote Trade batch of {} records to Parquet", batch_size);
         Ok(())
@@ -256,7 +256,19 @@ impl MultiStreamParquetSink {
             writer.flush_l2_batch(&mut self.file_manager).await?;
             writer.flush_trade_batch(&mut self.file_manager).await?;
         }
+        // Publish an aggregated snapshot to global metrics for exporters
+        self.publish_global_snapshot();
         Ok(())
+    }
+
+    fn publish_global_snapshot(&self) {
+        let mut total = Metrics::new();
+        for w in self.writers.values() {
+            total.messages_received += w.metrics.messages_received;
+            total.messages_processed += w.metrics.messages_processed;
+            total.parse_errors += w.metrics.parse_errors;
+        }
+        crate::metrics::update_global(&total);
     }
 
     async fn prune_idle_writers(&mut self, max_idle: Duration) -> Result<()> {
@@ -298,6 +310,9 @@ impl MultiStreamParquetSink {
             log::debug!("Closing writer: {}", key);
             writer.close().await?;
         }
+
+        // Final metrics publish
+        self.publish_global_snapshot();
 
         log::info!("Multi-stream Parquet sink shutdown complete");
         Ok(())
