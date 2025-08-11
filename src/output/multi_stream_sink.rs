@@ -31,6 +31,17 @@ struct StreamWriter {
 
 impl StreamWriter {
     fn new(stream_type: String, exchange: ExchangeId, symbol: String) -> Self {
+        let metrics = {
+            #[cfg(feature = "metrics-hdr")]
+            let mut m = Metrics::new();
+            #[cfg(not(feature = "metrics-hdr"))]
+            let m = Metrics::new();
+            #[cfg(feature = "metrics-hdr")]
+            {
+                m.enable_histograms(crate::metrics::HistogramBounds::default());
+            }
+            m
+        };
         Self {
             writer: None,
             l2_buffer: Vec::with_capacity(BATCH_SIZE),
@@ -39,7 +50,7 @@ impl StreamWriter {
             stream_type,
             exchange,
             symbol,
-            metrics: Metrics::new(),
+            metrics,
             last_activity: Instant::now(),
         }
     }

@@ -1,15 +1,15 @@
 #![allow(dead_code)]
 
-use std::collections::VecDeque;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, Duration};
 
 use crate::cli::{Exchange, SubscriptionSpec};
 use crate::error::{AppError, Result};
-use crate::exchanges::{ExchangeConnector, ProcessorFactory};
+use crate::exchanges::{ExchangeConnector, ProcessorFactory, ConnectorFactory};
+use std::time::Instant;
 use crate::exchanges::okx::InstrumentRegistry;
 use crate::types::{RawMessage, StreamData};
 use crate::pipeline::processor::MetricsReporter;
@@ -95,21 +95,8 @@ pub async fn run_arbitrated_trades(
     for conn_id in 0..max_conn {
         let okx_swap_registry = okx_swap_registry.clone();
         let okx_spot_registry = okx_spot_registry.clone();
-        let connector: Box<dyn ExchangeConnector<Error = AppError>> = match exchange {
-            Exchange::BinanceFutures => Box::new(crate::exchanges::binance::BinanceFuturesConnector::new()),
-            Exchange::OkxSwap => {
-                let reg = okx_swap_registry.clone().ok_or_else(|| AppError::connection("OKX SWAP registry not initialized".to_string()))?;
-                Box::new(crate::exchanges::okx::OkxConnector::new_swap(reg))
-            }
-            Exchange::OkxSpot => {
-                let reg = okx_spot_registry.clone().ok_or_else(|| AppError::connection("OKX SPOT registry not initialized".to_string()))?;
-                Box::new(crate::exchanges::okx::OkxConnector::new_spot(reg))
-            }
-            Exchange::Deribit => {
-                let cfg = crate::exchanges::deribit::DeribitConfig::from_env().map_err(|e| AppError::connection(format!("Failed to load Deribit config: {}", e)))?;
-                Box::new(crate::exchanges::deribit::DeribitConnector::new(cfg))
-            }
-        };
+        let connector: Box<dyn ExchangeConnector<Error = AppError>> =
+            ConnectorFactory::create_connector(exchange, okx_swap_registry, okx_spot_registry);
 
         let symbol = instrument.clone();
         let tx = raw_tx.clone();
@@ -157,10 +144,10 @@ pub async fn run_arbitrated_trades(
 
     drop(raw_tx); // keep arb alive while any tasks still hold a clone
 
-    // Dedup set for trades (exchange+symbol+trade_id) with size bound
-    const MAX_DEDUP_ENTRIES: usize = 200_000;
-    let mut seen_trades: HashSet<(crate::types::ExchangeId, String, String)> = HashSet::default();
-    let mut seen_trades_order: VecDeque<(crate::types::ExchangeId, String, String)> = VecDeque::new();
+    // Deduper for trades (exchange+symbol+trade_id) with LRU+TTL
+    use crate::pipeline::deduper::Deduper;
+    let mut trade_deduper: Deduper<(crate::types::ExchangeId, String, String)> =
+        Deduper::new(200_000, Duration::from_secs(300));
 
     // Simple per-connector accounting
     let mut wins: HashMap<usize, u64> = HashMap::default();
@@ -187,15 +174,7 @@ pub async fn run_arbitrated_trades(
         for data in stream_data {
             if let StreamData::Trade(t) = &data {
                 let key = (t.exchange, t.ticker.clone(), t.trade_id.clone());
-                if !seen_trades.insert(key.clone()) {
-                    continue; // duplicate from slower connector
-                }
-                seen_trades_order.push_back(key);
-                if seen_trades.len() > MAX_DEDUP_ENTRIES {
-                    if let Some(oldest) = seen_trades_order.pop_front() {
-                        seen_trades.remove(&oldest);
-                    }
-                }
+                if !trade_deduper.insert(key, std::time::Instant::now()) { continue; }
                 *wins.entry(conn_id).or_insert(0) += 1;
             }
 
@@ -296,28 +275,8 @@ pub async fn run_arbitrated_l2(
         let okx_spot_reg_clone = okx_spot_registry.clone();
         let handle = tokio::spawn(async move {
             // Create connector
-            let mut connector: Box<dyn ExchangeConnector<Error = AppError>> = match exchange {
-                Exchange::BinanceFutures => Box::new(crate::exchanges::binance::BinanceFuturesConnector::new()),
-                Exchange::OkxSwap => {
-                    // Use provided registry clone or fallback to new
-                    let reg = okx_swap_reg_clone.clone().unwrap_or_else(|| Arc::new(InstrumentRegistry::new()));
-                    Box::new(crate::exchanges::okx::OkxConnector::new_swap(reg))
-                }
-                Exchange::OkxSpot => {
-                    let reg = okx_spot_reg_clone.clone().unwrap_or_else(|| Arc::new(InstrumentRegistry::new()));
-                    Box::new(crate::exchanges::okx::OkxConnector::new_spot(reg))
-                }
-                Exchange::Deribit => {
-                    let cfg = match crate::exchanges::deribit::DeribitConfig::from_env() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            log::error!("[arb] deribit config error conn={}: {}", conn_id, e);
-                            return;
-                        }
-                    };
-                    Box::new(crate::exchanges::deribit::DeribitConnector::new(cfg))
-                }
-            };
+            let mut connector: Box<dyn ExchangeConnector<Error = AppError>> =
+                ConnectorFactory::create_connector(exchange, okx_swap_reg_clone, okx_spot_reg_clone);
 
             if let Err(e) = connector.connect().await {
                 log::error!("[arb][L2] connect failed conn={}: {}", conn_id, e);
@@ -374,10 +333,9 @@ pub async fn run_arbitrated_l2(
     let raw_tx_for_rotation = raw_tx.clone();
     drop(raw_tx);
 
-    // First-arrival arbitration (no continuity gating): dedupe by event key with size bound
-    const MAX_L2_DEDUP_ENTRIES: usize = 500_000;
-    let mut seen_events: HashSet<(i64, i64)> = HashSet::default(); // (first_update_id, update_id)
-    let mut seen_events_order: VecDeque<(i64, i64)> = VecDeque::new();
+    // First-arrival arbitration (no continuity gating): L2 deduper by event key with LRU+TTL
+    use crate::pipeline::deduper::Deduper as L2Deduper;
+    let mut seen_events: L2Deduper<(i64, i64)> = L2Deduper::new(500_000, Duration::from_secs(300));
     let mut first_wins: HashMap<usize, u64> = HashMap::default(); // cumulative
     let mut first_wins_window: HashMap<usize, u64> = HashMap::default(); // per-rotation window
     let mut msgs: HashMap<usize, u64> = HashMap::default();
@@ -412,21 +370,8 @@ pub async fn run_arbitrated_l2(
                 let cancel_child = cancel.child_token();
                 let cancel_child_for_task = cancel_child.clone();
                 let handle = tokio::spawn(async move {
-                    let mut connector: Box<dyn ExchangeConnector<Error = AppError>> = match exchange {
-                        Exchange::BinanceFutures => Box::new(crate::exchanges::binance::BinanceFuturesConnector::new()),
-                        Exchange::OkxSwap => {
-                            let reg = okx_swap_registry.clone().unwrap_or_else(|| Arc::new(InstrumentRegistry::new()));
-                            Box::new(crate::exchanges::okx::OkxConnector::new_swap(reg))
-                        }
-                        Exchange::OkxSpot => {
-                            let reg = okx_spot_registry.clone().unwrap_or_else(|| Arc::new(InstrumentRegistry::new()));
-                            Box::new(crate::exchanges::okx::OkxConnector::new_spot(reg))
-                        }
-                        Exchange::Deribit => {
-                            let cfg = match crate::exchanges::deribit::DeribitConfig::from_env() { Ok(c)=>c, Err(e)=>{ log::error!("[arb] deribit config error conn={}: {}", id, e); return; } };
-                            Box::new(crate::exchanges::deribit::DeribitConnector::new(cfg))
-                        }
-                    };
+                    let mut connector: Box<dyn ExchangeConnector<Error = AppError>> =
+                        ConnectorFactory::create_connector(exchange, okx_swap_registry, okx_spot_registry);
                     if let Err(e) = connector.connect().await { log::error!("[arb][L2] connect failed conn={}: {}", id, e); return; }
                     if let Err(e) = connector.subscribe_l2(&symbol).await { log::error!("[arb][L2] subscribe L2 failed conn={}: {}", id, e); return; }
                     if let Exchange::BinanceFutures = exchange {
@@ -483,13 +428,7 @@ pub async fn run_arbitrated_l2(
         // First-arrival dedupe: forward first event only; drop duplicates from other connection
         if let Some(StreamData::L2(first)) = stream_data.first() {
             let event_key = (first.first_update_id, first.update_id);
-            if seen_events.insert(event_key) {
-                seen_events_order.push_back(event_key);
-                if seen_events.len() > MAX_L2_DEDUP_ENTRIES {
-                    if let Some(oldest) = seen_events_order.pop_front() {
-                        seen_events.remove(&oldest);
-                    }
-                }
+            if seen_events.insert(event_key, std::time::Instant::now()) {
                 *first_wins.entry(conn_id).or_insert(0) += 1;
                 *first_wins_window.entry(conn_id).or_insert(0) += 1;
                 for data in stream_data {

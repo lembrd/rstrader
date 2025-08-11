@@ -11,7 +11,6 @@ use tokio::net::lookup_host;
 use tokio::net::TcpStream;
 
 use crate::error::{AppError, Result};
-use serde_json::json;
 use crate::exchanges::ExchangeConnector;
 use crate::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate, TradeSide};
 use fast_float;
@@ -46,6 +45,16 @@ pub struct BinanceDepthUpdate {
 
     #[serde(rename = "a")]
     pub asks: Vec<[String; 2]>, // Asks to be updated [price, qty]
+}
+
+/// Minimal buffered representation to avoid full JSON deserialization on the hot path
+#[derive(Debug, Clone)]
+struct BufferedDepthUpdate {
+    first_update_id: i64,
+    final_update_id: i64,
+    prev_final_update_id: i64,
+    // Original JSON text for replay to processor (single parse downstream)
+    text: String,
 }
 
 /// Binance Futures WebSocket trade message
@@ -114,7 +123,7 @@ pub struct BinanceFuturesConnector {
     connection_status: ConnectionStatus,
     sync_state: SyncState,
     symbol: Option<String>,
-    update_buffer: VecDeque<BinanceDepthUpdate>,
+    update_buffer: VecDeque<BufferedDepthUpdate>,
     base_url: String,
     ws_url: String,
 }
@@ -237,6 +246,29 @@ impl BinanceFuturesConnector {
             .map_err(|e| AppError::parse(format!("Failed to parse trade update: {}", e)))
     }
 
+    /// Fast string scan to extract "U", "u", and "pu" integer fields without JSON deserialization
+    fn scan_depth_u_fields(text: &str) -> Option<(i64, i64, i64)> {
+        fn scan_number(text: &str, key: &str) -> Option<i64> {
+            let needle = format!("\"{}\":", key);
+            let pos = text.find(&needle)?;
+            let mut i = pos + needle.len();
+            // Skip whitespace
+            let bytes = text.as_bytes();
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r') { i += 1; }
+            let start = i;
+            // Optional minus sign (Binance IDs are non-negative, but be defensive)
+            if i < bytes.len() && bytes[i] == b'-' { i += 1; }
+            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() { i += 1; }
+            if i == start { return None; }
+            text[start..i].parse::<i64>().ok()
+        }
+
+        let first_u = scan_number(text, "U")?;
+        let final_u = scan_number(text, "u")?;
+        let prev_u = scan_number(text, "pu")?;
+        Some((first_u, final_u, prev_u))
+    }
+
     /// Convert Binance trade update to internal TradeUpdate format
     fn convert_trade_update(&self, trade: &BinanceTradeUpdate, rcv_timestamp: i64, packet_id: i64) -> Result<TradeUpdate> {
         let price = fast_float::parse::<f64, _>(&trade.price)
@@ -266,7 +298,7 @@ impl BinanceFuturesConnector {
     fn process_buffered_updates(
         &mut self,
         snapshot_last_update_id: i64,
-    ) -> Result<Vec<BinanceDepthUpdate>> {
+    ) -> Result<Vec<BufferedDepthUpdate>> {
         let mut valid_updates = Vec::new();
 
         // Remove updates older than snapshot
@@ -292,15 +324,11 @@ impl BinanceFuturesConnector {
     }
 
     /// Validate update sequence
-    fn validate_update_sequence(
-        &self,
-        update: &BinanceDepthUpdate,
-        last_update_id: i64,
-    ) -> Result<()> {
-        if update.prev_final_update_id != last_update_id {
+    fn validate_update_sequence_fields(&self, prev_final_update_id: i64, last_update_id: i64) -> Result<()> {
+        if prev_final_update_id != last_update_id {
             return Err(AppError::stream(format!(
                 "Update sequence mismatch: expected pu={}, got pu={}",
-                last_update_id, update.prev_final_update_id
+                last_update_id, prev_final_update_id
             )));
         }
         Ok(())
@@ -328,24 +356,7 @@ impl BinanceFuturesConnector {
         let mut out = Vec::with_capacity(self.update_buffer.len());
         let exchange_id = ExchangeId::BinanceFutures;
         while let Some(update) = self.update_buffer.pop_front() {
-            // Manually encode to JSON using the expected Binance wire schema
-            let text = json!({
-                "e": update.event_type,
-                "E": update.event_time,
-                "T": update.transaction_time,
-                "s": update.symbol,
-                "U": update.first_update_id,
-                "u": update.final_update_id,
-                "pu": update.prev_final_update_id,
-                "b": update.bids,
-                "a": update.asks,
-            }).to_string();
-
-            out.push(RawMessage {
-                exchange_id,
-                data: text,
-                timestamp: std::time::SystemTime::now(),
-            });
+            out.push(RawMessage { exchange_id, data: update.text, timestamp: std::time::SystemTime::now() });
         }
         out
     }
@@ -490,95 +501,45 @@ impl ExchangeConnector for BinanceFuturesConnector {
                             // Trade messages don't need synchronization
                         }
                         _ => {
-                            // Try to parse as depth update for L2 streams
-                            let parse_result = self.parse_depth_update(&text);
-                            // Processing parsed message based on sync state
-                            match parse_result {
-                                Ok(update) => {
-                                    // Processing depth update
-                                    
-                                    // Handle based on current sync state
-                                    match &self.sync_state {
-                                        SyncState::BufferingUpdates => {
-                                            // Buffering update
-                                            // Buffer updates until we get snapshot
-                                            self.update_buffer.push_back(update);
-                                            // Enforce an upper bound on buffered updates to avoid unbounded memory growth
-                                            if self.update_buffer.len() > Self::MAX_BUFFERED_UPDATES {
-                                                // Drop oldest entries first to keep most recent data for reconciliation
-                                                let to_trim = self.update_buffer.len() - Self::MAX_BUFFERED_UPDATES;
-                                                for _ in 0..to_trim {
-                                                    self.update_buffer.pop_front();
-                                                }
-                                                log::warn!(
-                                                    "Binance buffer reached limit ({}). Dropped {} oldest updates to cap memory.",
-                                                    Self::MAX_BUFFERED_UPDATES,
-                                                    to_trim
-                                                );
-                                            }
-                                            // Continue buffering, don't return message yet
-                                            continue;
+                            // Minimal scan to extract U/u/pu fields without full JSON parse
+                            if let Some((first_update_id, final_update_id, prev_final_update_id)) = Self::scan_depth_u_fields(&text) {
+                                match &self.sync_state {
+                                    SyncState::BufferingUpdates => {
+                                        // Buffer updates until we get snapshot
+                                        self.update_buffer.push_back(BufferedDepthUpdate { first_update_id, final_update_id, prev_final_update_id, text: text.clone() });
+                                        if self.update_buffer.len() > Self::MAX_BUFFERED_UPDATES {
+                                            let to_trim = self.update_buffer.len() - Self::MAX_BUFFERED_UPDATES;
+                                            for _ in 0..to_trim { self.update_buffer.pop_front(); }
+                                            log::warn!("Binance buffer reached limit ({}). Dropped {} oldest updates to cap memory.", Self::MAX_BUFFERED_UPDATES, to_trim);
                                         }
-                                        SyncState::Synchronizing { last_update_id } => {
-                                            // Synchronizing with last_update_id
-                                            
-                                            // Check if this update is valid for synchronization
-                                            if update.final_update_id <= *last_update_id {
-                                                // Skip old update
-                                                // Skipping old update
-                                                continue;
-                                            }
-
-                                            // Accept updates that come after our snapshot
-                                            if update.first_update_id > *last_update_id {
-                                                // There might be a gap, but this is normal after snapshot
-                                                log::info!("Accepting update after snapshot gap: {} > {}", update.first_update_id, last_update_id);
-                                                self.sync_state = SyncState::Synchronized {
-                                                    last_update_id: update.final_update_id,
-                                                };
-                                                log::info!("Order book synchronized with gap handling");
-                                            } else if update.first_update_id <= last_update_id + 1
-                                                && update.final_update_id >= last_update_id + 1
-                                            {
-                                                // Perfect continuation
-                                                self.sync_state = SyncState::Synchronized {
-                                                    last_update_id: update.final_update_id,
-                                                };
-                                                log::info!("Order book synchronized perfectly");
-                                            } else {
-                                                // Unexpected case - log and continue
-                                                log::warn!("Unexpected sync case: first_id={}, final_id={}, expected > {}", 
-                                                    update.first_update_id, update.final_update_id, last_update_id);
-                                                self.sync_state = SyncState::Synchronized {
-                                                    last_update_id: update.final_update_id,
-                                                };
-                                                log::info!("Order book synchronized with fallback");
-                                            }
-                                        }
-                                        SyncState::Synchronized { last_update_id } => {
-                                            // Processing synchronized update
-                                            // Validate sequence
-                                            self.validate_update_sequence(&update, *last_update_id)?;
-
-                                            // Update state
-                                            self.sync_state = SyncState::Synchronized {
-                                                last_update_id: update.final_update_id,
-                                            };
-                                            // Processing update
-                                        }
-                                        _ => {
-                                            log::error!("Received update in invalid state: {:?}", self.sync_state);
-                                            return Err(AppError::stream(format!(
-                                                "Received update in invalid state: {:?}",
-                                                self.sync_state
-                                            )));
+                                        continue;
+                                    }
+                                    SyncState::Synchronizing { last_update_id } => {
+                                        if final_update_id <= *last_update_id { continue; }
+                                        if first_update_id > *last_update_id {
+                                            log::info!("Accepting update after snapshot gap: {} > {}", first_update_id, last_update_id);
+                                            self.sync_state = SyncState::Synchronized { last_update_id: final_update_id };
+                                            log::info!("Order book synchronized with gap handling");
+                                        } else if first_update_id <= last_update_id + 1 && final_update_id >= last_update_id + 1 {
+                                            self.sync_state = SyncState::Synchronized { last_update_id: final_update_id };
+                                            log::info!("Order book synchronized perfectly");
+                                        } else {
+                                            log::warn!("Unexpected sync case: first_id={}, final_id={}, expected > {}", first_update_id, final_update_id, last_update_id);
+                                            self.sync_state = SyncState::Synchronized { last_update_id: final_update_id };
+                                            log::info!("Order book synchronized with fallback");
                                         }
                                     }
+                                    SyncState::Synchronized { last_update_id } => {
+                                        self.validate_update_sequence_fields(prev_final_update_id, *last_update_id)?;
+                                        self.sync_state = SyncState::Synchronized { last_update_id: final_update_id };
+                                    }
+                                    _ => {
+                                        log::error!("Received update in invalid state: {:?}", self.sync_state);
+                                        return Err(AppError::stream(format!("Received update in invalid state: {:?}", self.sync_state)));
+                                    }
                                 }
-                                Err(_) => {
-                                    // Not a depth update, could be other message type
-                                    // Non-depth update received
-                                }
+                            } else {
+                                // Could be a non-depth update or control message; pass through
                             }
                         }
                     }

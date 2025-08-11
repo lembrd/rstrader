@@ -135,10 +135,21 @@ pub struct BaseProcessor {
 impl BaseProcessor {
     /// Create new base processor with default values
     pub fn new() -> Self {
+        let metrics = {
+            #[cfg(feature = "metrics-hdr")]
+            let mut m = crate::types::Metrics::new();
+            #[cfg(not(feature = "metrics-hdr"))]
+            let m = crate::types::Metrics::new();
+            #[cfg(feature = "metrics-hdr")]
+            {
+                m.enable_histograms(crate::metrics::HistogramBounds::default());
+            }
+            m
+        };
         Self {
             sequence_counter: 0,
             packet_counter: 0,
-            metrics: crate::types::Metrics::new(),
+            metrics,
             updates_buffer: Vec::with_capacity(20),
         }
     }
@@ -276,6 +287,34 @@ impl ProcessorFactory {
             crate::types::ExchangeId::OkxSwap => Self::create_okx_swap_processor(okx_registry),
             crate::types::ExchangeId::OkxSpot => Self::create_okx_spot_processor(okx_registry),
             crate::types::ExchangeId::Deribit => Self::create_deribit_processor(),
+        }
+    }
+}
+
+/// Factory for creating exchange connectors consistently (initial spawn and rotation)
+pub struct ConnectorFactory;
+
+impl ConnectorFactory {
+    pub fn create_connector(
+        exchange: crate::cli::Exchange,
+        okx_swap_registry: Option<std::sync::Arc<okx::InstrumentRegistry>>,
+        okx_spot_registry: Option<std::sync::Arc<okx::InstrumentRegistry>>,
+    ) -> Box<dyn ExchangeConnector<Error = crate::error::AppError>> {
+        match exchange {
+            crate::cli::Exchange::BinanceFutures => Box::new(binance::BinanceFuturesConnector::new()),
+            crate::cli::Exchange::OkxSwap => {
+                let reg = okx_swap_registry.expect("OKX SWAP registry not initialized");
+                Box::new(okx::OkxConnector::new_swap(reg))
+            }
+            crate::cli::Exchange::OkxSpot => {
+                let reg = okx_spot_registry.expect("OKX SPOT registry not initialized");
+                Box::new(okx::OkxConnector::new_spot(reg))
+            }
+            crate::cli::Exchange::Deribit => {
+                let cfg = crate::exchanges::deribit::DeribitConfig::from_env()
+                    .expect("Failed to load Deribit config");
+                Box::new(crate::exchanges::deribit::DeribitConnector::new(cfg))
+            }
         }
     }
 }

@@ -42,6 +42,10 @@ rustls = { version = "0.23.29", features = ["ring"] }
 rustc-hash = "1.1"
 tokio-util = "0.7.15"
 urlencoding = "2.1"
+hdrhistogram = "7.5"
+
+[features]
+metrics-hdr = []
 
 [dev-dependencies]
 ureq = { version = "2.9", default-features = false }

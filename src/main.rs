@@ -5,12 +5,14 @@ mod output;
 mod pipeline;
 mod subscription_manager;
 mod types;
+mod metrics;
 
 use clap::Parser;
 use cli::{Args, Sink};
 use error::{AppError, Result};
 use futures_util::FutureExt;
 use types::StreamData;
+// use std::sync::{Arc, Mutex};
 
 
 

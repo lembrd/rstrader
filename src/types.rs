@@ -330,7 +330,7 @@ pub struct PriceLevel {
 }
 
 /// Metrics for performance monitoring
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Metrics {
     pub messages_received: u64,
     pub messages_processed: u64,
@@ -376,11 +376,61 @@ pub struct Metrics {
     transform_time_count: u64,
     overhead_time_count: u64,
     packet_count: u64,
+
+    // Optional low-overhead histograms (disabled by default to avoid allocations)
+    #[cfg(feature = "metrics-hdr")]
+    #[allow(clippy::type_complexity)]
+    latency_histograms: Option<crate::metrics::LatencyHistograms>,
 }
 
 impl Metrics {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            messages_received: 0,
+            messages_processed: 0,
+            connection_attempts: 0,
+            reconnections: 0,
+            parse_errors: 0,
+            last_code_latency_us: None,
+            avg_code_latency_us: None,
+            last_overall_latency_us: None,
+            avg_overall_latency_us: None,
+            throughput_msgs_per_sec: None,
+            total_bids_processed: 0,
+            total_asks_processed: 0,
+            last_bid_count: 0,
+            last_ask_count: 0,
+            avg_bid_count: 0.0,
+            avg_ask_count: 0.0,
+            last_message_bytes: 0,
+            avg_message_bytes: 0.0,
+            total_message_bytes: 0,
+            messages_per_packet: 0.0,
+            market_data_entries_per_packet: 0.0,
+            avg_packet_size_bytes: 0.0,
+            last_parse_time_us: None,
+            avg_parse_time_us: None,
+            last_transform_time_us: None,
+            avg_transform_time_us: None,
+            last_overhead_time_us: None,
+            avg_overhead_time_us: None,
+            code_latency_count: 0,
+            overall_latency_count: 0,
+            parse_time_count: 0,
+            transform_time_count: 0,
+            overhead_time_count: 0,
+            packet_count: 0,
+            #[cfg(feature = "metrics-hdr")]
+            latency_histograms: None,
+        }
+    }
+
+    #[cfg(feature = "metrics-hdr")]
+    pub fn enable_histograms(&mut self, bounds: crate::metrics::HistogramBounds) {
+        use crate::metrics::LatencyHistograms;
+        if self.latency_histograms.is_none() {
+            self.latency_histograms = Some(LatencyHistograms::new(bounds));
+        }
     }
 
     pub fn increment_received(&mut self) {
@@ -414,6 +464,11 @@ impl Metrics {
             Some(avg) => self.avg_code_latency_us = Some(avg * 0.9 + latency_us as f64 * 0.1),
             None => self.avg_code_latency_us = Some(latency_us as f64),
         }
+
+        #[cfg(feature = "metrics-hdr")]
+        if let Some(h) = &mut self.latency_histograms {
+            h.record_code_latency(latency_us);
+        }
     }
 
     pub fn update_overall_latency(&mut self, latency_us: u64) {
@@ -425,6 +480,11 @@ impl Metrics {
             Some(avg) => self.avg_overall_latency_us = Some(avg * 0.9 + latency_us as f64 * 0.1),
             None => self.avg_overall_latency_us = Some(latency_us as f64),
         }
+
+        #[cfg(feature = "metrics-hdr")]
+        if let Some(h) = &mut self.latency_histograms {
+            h.record_overall_latency(latency_us);
+        }
     }
 
     pub fn update_parse_time(&mut self, parse_time_us: u64) {
@@ -434,6 +494,11 @@ impl Metrics {
         match self.avg_parse_time_us {
             Some(avg) => self.avg_parse_time_us = Some(avg * 0.9 + parse_time_us as f64 * 0.1),
             None => self.avg_parse_time_us = Some(parse_time_us as f64),
+        }
+
+        #[cfg(feature = "metrics-hdr")]
+        if let Some(h) = &mut self.latency_histograms {
+            h.record_parse_time(parse_time_us);
         }
     }
 
@@ -447,6 +512,11 @@ impl Metrics {
             }
             None => self.avg_transform_time_us = Some(transform_time_us as f64),
         }
+
+        #[cfg(feature = "metrics-hdr")]
+        if let Some(h) = &mut self.latency_histograms {
+            h.record_transform_time(transform_time_us);
+        }
     }
 
     pub fn update_overhead_time(&mut self, overhead_time_us: u64) {
@@ -458,6 +528,11 @@ impl Metrics {
                 self.avg_overhead_time_us = Some(avg * 0.9 + overhead_time_us as f64 * 0.1)
             }
             None => self.avg_overhead_time_us = Some(overhead_time_us as f64),
+        }
+
+        #[cfg(feature = "metrics-hdr")]
+        if let Some(h) = &mut self.latency_histograms {
+            h.record_overhead_time(overhead_time_us);
         }
     }
 
@@ -544,6 +619,12 @@ impl Metrics {
     }
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl std::fmt::Display for Metrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -585,6 +666,20 @@ impl std::fmt::Display for Metrics {
 
         if let Some(throughput) = self.throughput_msgs_per_sec {
             write!(f, ", throughput: {:.1}msg/s", throughput)?;
+        }
+
+        #[cfg(feature = "metrics-hdr")]
+        if let Some(h) = &self.latency_histograms {
+            // Non-mutating quantiles read
+            let code_p50 = h.code_us.value_at_quantile(0.50);
+            let code_p99 = h.code_us.value_at_quantile(0.99);
+            let overall_p50 = h.overall_us.value_at_quantile(0.50);
+            let overall_p99 = h.overall_us.value_at_quantile(0.99);
+            write!(
+                f,
+                ", p50/p99(us) code {} / {}, overall {} / {}",
+                code_p50, code_p99, overall_p50, overall_p99
+            )?;
         }
 
         Ok(())
