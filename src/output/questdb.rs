@@ -388,7 +388,7 @@ mod tests {
             price: 10.0,
             qty: 1.0,
         };
-        let mut w = StreamWriter::new();
+        let mut w = StreamWriter::new("L2".to_string(), ExchangeId::BinanceFutures, "BTCUSDT".to_string());
         w.push(StreamData::L2(u));
         let buf = w.serialize_and_clear();
         assert!(!buf.is_empty());
@@ -409,7 +409,7 @@ mod tests {
             price: 10.0,
             qty: 1.0,
         };
-        let mut w = StreamWriter::new();
+        let mut w = StreamWriter::new("TRADES".to_string(), ExchangeId::BinanceFutures, "BTCUSDT".to_string());
         w.push(StreamData::Trade(t));
         let buf = w.serialize_and_clear();
         assert!(!buf.is_empty());

@@ -281,7 +281,12 @@ pub enum ExchangeId {
 
 impl std::fmt::Display for ExchangeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        match self {
+            ExchangeId::BinanceFutures => write!(f, "BINANCE_FUTURES"),
+            ExchangeId::OkxSwap => write!(f, "OKX_SWAP"),
+            ExchangeId::OkxSpot => write!(f, "OKX_SPOT"),
+            ExchangeId::Deribit => write!(f, "DERIBIT"),
+        }
     }
 }
 
