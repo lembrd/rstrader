@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::VecDeque;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -85,12 +86,6 @@ pub async fn run_arbitrated_trades(
 
     // Channels from connector readers to arb
     let (raw_tx, mut raw_rx) = mpsc::channel::<(usize, RawMessage)>(10000);
-    // Channel to receive connector peer IPs
-    let (ip_tx, mut ip_rx) = mpsc::channel::<(usize, String)>(max_conn * 2);
-    // Channel to receive connector peer IPs
-    let (ip_tx, mut ip_rx) = mpsc::channel::<(usize, String)>(max_conn * 2);
-    // Channel to receive connector peer IPs
-    let (ip_tx, mut ip_rx) = mpsc::channel::<(usize, String)>(max_conn * 2);
 
     // Spawn connectors with ramp-up
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -98,6 +93,8 @@ pub async fn run_arbitrated_trades(
     let instrument = subscription.instrument.clone();
 
     for conn_id in 0..max_conn {
+        let okx_swap_registry = okx_swap_registry.clone();
+        let okx_spot_registry = okx_spot_registry.clone();
         let connector: Box<dyn ExchangeConnector<Error = AppError>> = match exchange {
             Exchange::BinanceFutures => Box::new(crate::exchanges::binance::BinanceFuturesConnector::new()),
             Exchange::OkxSwap => {
@@ -160,12 +157,14 @@ pub async fn run_arbitrated_trades(
 
     drop(raw_tx); // keep arb alive while any tasks still hold a clone
 
-    // Dedup set for trades (exchange+symbol+trade_id)
-    let mut seen_trades: HashSet<(crate::types::ExchangeId, String, String)> = HashSet::new();
+    // Dedup set for trades (exchange+symbol+trade_id) with size bound
+    const MAX_DEDUP_ENTRIES: usize = 200_000;
+    let mut seen_trades: HashSet<(crate::types::ExchangeId, String, String)> = HashSet::default();
+    let mut seen_trades_order: VecDeque<(crate::types::ExchangeId, String, String)> = VecDeque::new();
 
     // Simple per-connector accounting
-    let mut wins: HashMap<usize, u64> = HashMap::new();
-    let mut msgs: HashMap<usize, u64> = HashMap::new();
+    let mut wins: HashMap<usize, u64> = HashMap::default();
+    let mut msgs: HashMap<usize, u64> = HashMap::default();
     let mut last_report = Instant::now() - Duration::from_secs(ARB_REPORT_INTERVAL_SECS);
 
     loop {
@@ -188,8 +187,14 @@ pub async fn run_arbitrated_trades(
         for data in stream_data {
             if let StreamData::Trade(t) = &data {
                 let key = (t.exchange, t.ticker.clone(), t.trade_id.clone());
-                if !seen_trades.insert(key) {
+                if !seen_trades.insert(key.clone()) {
                     continue; // duplicate from slower connector
+                }
+                seen_trades_order.push_back(key);
+                if seen_trades.len() > MAX_DEDUP_ENTRIES {
+                    if let Some(oldest) = seen_trades_order.pop_front() {
+                        seen_trades.remove(&oldest);
+                    }
                 }
                 *wins.entry(conn_id).or_insert(0) += 1;
             }
@@ -271,7 +276,7 @@ pub async fn run_arbitrated_l2(
     }
 
     let (raw_tx, mut raw_rx) = mpsc::channel::<(usize, RawMessage)>(10000);
-    // Channel to receive connector peer IPs
+    // Channel to receive connector peer IPs (used for telemetry)
     let (ip_tx, mut ip_rx) = mpsc::channel::<(usize, String)>(max_conn * 2);
 
     let instrument = subscription.instrument.clone();
@@ -286,16 +291,20 @@ pub async fn run_arbitrated_l2(
         let symbol = instrument.clone();
         let cancel_child = cancel.child_token();
         let cancel_child_for_task = cancel_child.clone();
+        // clone registries per task to avoid moving the outer value into the first task
+        let okx_swap_reg_clone = okx_swap_registry.clone();
+        let okx_spot_reg_clone = okx_spot_registry.clone();
         let handle = tokio::spawn(async move {
             // Create connector
             let mut connector: Box<dyn ExchangeConnector<Error = AppError>> = match exchange {
                 Exchange::BinanceFutures => Box::new(crate::exchanges::binance::BinanceFuturesConnector::new()),
                 Exchange::OkxSwap => {
-                    let reg = Arc::new(InstrumentRegistry::new());
+                    // Use provided registry clone or fallback to new
+                    let reg = okx_swap_reg_clone.clone().unwrap_or_else(|| Arc::new(InstrumentRegistry::new()));
                     Box::new(crate::exchanges::okx::OkxConnector::new_swap(reg))
                 }
                 Exchange::OkxSpot => {
-                    let reg = Arc::new(InstrumentRegistry::new());
+                    let reg = okx_spot_reg_clone.clone().unwrap_or_else(|| Arc::new(InstrumentRegistry::new()));
                     Box::new(crate::exchanges::okx::OkxConnector::new_spot(reg))
                 }
                 Exchange::Deribit => {
@@ -365,15 +374,17 @@ pub async fn run_arbitrated_l2(
     let raw_tx_for_rotation = raw_tx.clone();
     drop(raw_tx);
 
-    // First-arrival arbitration (no continuity gating): dedupe by event key
-    let mut seen_events: HashSet<(i64, i64)> = HashSet::new(); // (first_update_id, update_id)
-    let mut first_wins: HashMap<usize, u64> = HashMap::new(); // cumulative
-    let mut first_wins_window: HashMap<usize, u64> = HashMap::new(); // per-rotation window
-    let mut msgs: HashMap<usize, u64> = HashMap::new();
+    // First-arrival arbitration (no continuity gating): dedupe by event key with size bound
+    const MAX_L2_DEDUP_ENTRIES: usize = 500_000;
+    let mut seen_events: HashSet<(i64, i64)> = HashSet::default(); // (first_update_id, update_id)
+    let mut seen_events_order: VecDeque<(i64, i64)> = VecDeque::new();
+    let mut first_wins: HashMap<usize, u64> = HashMap::default(); // cumulative
+    let mut first_wins_window: HashMap<usize, u64> = HashMap::default(); // per-rotation window
+    let mut msgs: HashMap<usize, u64> = HashMap::default();
     let mut last_report = Instant::now() - Duration::from_secs(ARB_REPORT_INTERVAL_SECS);
     let mut rotation_interval = tokio::time::interval(Duration::from_secs(60));
-    let mut msgs_window: HashMap<usize, u64> = HashMap::new();
-    let mut conn_ip: HashMap<usize, String> = HashMap::new();
+    let mut msgs_window: HashMap<usize, u64> = HashMap::default();
+    let mut conn_ip: HashMap<usize, String> = HashMap::default();
 
     loop {
         tokio::select! {
@@ -393,6 +404,8 @@ pub async fn run_arbitrated_l2(
                 if let Some(h) = handles.get(id) { h.abort(); }
                 // spawn replacement
                 let exchange = subscription.exchange;
+                    let okx_swap_registry = okx_swap_registry.clone();
+                    let okx_spot_registry = okx_spot_registry.clone();
                     let tx = raw_tx_for_rotation.clone();
                     let ip_tx2 = ip_tx.clone();
                 let symbol = instrument.clone();
@@ -402,11 +415,11 @@ pub async fn run_arbitrated_l2(
                     let mut connector: Box<dyn ExchangeConnector<Error = AppError>> = match exchange {
                         Exchange::BinanceFutures => Box::new(crate::exchanges::binance::BinanceFuturesConnector::new()),
                         Exchange::OkxSwap => {
-                            let reg = Arc::new(InstrumentRegistry::new());
+                            let reg = okx_swap_registry.clone().unwrap_or_else(|| Arc::new(InstrumentRegistry::new()));
                             Box::new(crate::exchanges::okx::OkxConnector::new_swap(reg))
                         }
                         Exchange::OkxSpot => {
-                            let reg = Arc::new(InstrumentRegistry::new());
+                            let reg = okx_spot_registry.clone().unwrap_or_else(|| Arc::new(InstrumentRegistry::new()));
                             Box::new(crate::exchanges::okx::OkxConnector::new_spot(reg))
                         }
                         Exchange::Deribit => {
@@ -471,6 +484,12 @@ pub async fn run_arbitrated_l2(
         if let Some(StreamData::L2(first)) = stream_data.first() {
             let event_key = (first.first_update_id, first.update_id);
             if seen_events.insert(event_key) {
+                seen_events_order.push_back(event_key);
+                if seen_events.len() > MAX_L2_DEDUP_ENTRIES {
+                    if let Some(oldest) = seen_events_order.pop_front() {
+                        seen_events.remove(&oldest);
+                    }
+                }
                 *first_wins.entry(conn_id).or_insert(0) += 1;
                 *first_wins_window.entry(conn_id).or_insert(0) += 1;
                 for data in stream_data {

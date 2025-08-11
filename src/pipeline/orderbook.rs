@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use crate::error::{AppError, Result};
 use crate::types::{OrderBookL2Update, OrderBookSnapshot, OrderSide, PriceLevel};
-use std::collections::BTreeMap;
+use std::collections::BTreeMap; // stay with BTreeMap for price ordering semantics
 
 /// Order book manager for maintaining L2 state
 pub struct OrderBookManager {

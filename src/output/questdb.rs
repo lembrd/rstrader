@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::time::Instant;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -208,8 +208,18 @@ fn push_f64_field(out: &mut Vec<u8>, key: &[u8], val: f64) {
 // bool field helper unused after schema change; keep for potential future use
 
 fn escape_string(s: &str) -> String {
-    // Minimal escaping for ILP string field
-    s.replace('"', "\\\"")
+    // Minimal ILP escaping for string field: escape quotes and spaces/commas
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            ' ' => out.push_str("\\ "),
+            ',' => out.push_str("\\,"),
+            '=' => out.push_str("\\="),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn push_string_field(out: &mut Vec<u8>, key: &[u8], val: &str) {
@@ -229,7 +239,7 @@ impl MultiStreamQuestDbSink {
     pub fn new() -> Self {
         Self {
             client: QuestDbClient::new_from_env(),
-            writers: HashMap::new(),
+            writers: HashMap::default(),
         }
     }
 

@@ -440,7 +440,7 @@ impl OkxConnector {
                     log::info!("[net][okx] connected local={} peer={}", local, peer);
                 }
             }
-            #[cfg(feature = "native-tls")]
+            #[cfg(any())]
             MaybeTlsStream::NativeTls(tls) => {
                 if let Some(io) = tls.get_ref() {
                     if let (Ok(local), Ok(peer)) = (io.local_addr(), io.peer_addr()) {
@@ -1489,7 +1489,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
                 timestamp: crate::types::time::millis_to_micros(timestamp_ms), 
                 rcv_timestamp,
                 exchange: self.exchange_id,
-                ticker: trade_data.inst_id,
+                ticker: self.convert_symbol_from_okx(&trade_data.inst_id),
                 seq_id,
                 packet_id: packet_id as i64,
                 trade_id: trade_data.trade_id,

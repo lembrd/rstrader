@@ -1,4 +1,5 @@
 use std::sync::Arc;
+// (no-op) placeholder removed; keep imports minimal in hot path
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 

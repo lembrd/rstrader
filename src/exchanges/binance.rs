@@ -200,7 +200,7 @@ impl BinanceFuturesConnector {
                     log::info!("[net][binance] connected local={} peer={}", local, peer);
                 }
             }
-            #[cfg(feature = "native-tls")]
+            #[cfg(any())]
             MT::NativeTls(tls) => {
                 if let Some(io) = tls.get_ref() {
                     if let (Ok(local), Ok(peer)) = (io.local_addr(), io.peer_addr()) {

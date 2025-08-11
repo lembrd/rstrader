@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::time::{Duration, Instant};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -73,18 +73,24 @@ impl StreamWriter {
             return Ok(());
         }
 
-        self.ensure_writer_initialized(file_manager)?;
+        self.ensure_writer_initialized(file_manager).await?;
 
         let schema = L2SchemaFactory::create_schema();
         let batch = L2RecordBatchFactory::create_record_batch(schema, &self.l2_buffer)?;
-        
-        let writer = self.writer.as_mut().unwrap();
-        // Prevent blocking the async scheduler by running blocking parquet write on a blocking thread
-        tokio::task::block_in_place(|| {
-            writer
-                .write(&batch)
-                .map_err(|e| AppError::io(format!("Failed to write L2 batch: {}", e)))
-        })?;
+
+        // Move writer into blocking thread, perform write, and bring it back
+        if let Some(writer) = self.writer.take() {
+            let handle = tokio::task::spawn_blocking(move || {
+                let mut w = writer;
+                w.write(&batch)
+                    .map_err(|e| AppError::io(format!("Failed to write L2 batch: {}", e)))?;
+                Ok::<_, AppError>(w)
+            });
+            let writer_back = handle
+                .await
+                .map_err(|e| AppError::io(format!("Join error writing L2 batch: {}", e)))??;
+            self.writer = Some(writer_back);
+        }
 
         let batch_size = self.l2_buffer.len();
         self.l2_buffer.clear();
@@ -100,17 +106,23 @@ impl StreamWriter {
             return Ok(());
         }
 
-        self.ensure_writer_initialized(file_manager)?;
+        self.ensure_writer_initialized(file_manager).await?;
 
         let schema = TradeSchemaFactory::create_schema();
         let batch = TradeRecordBatchFactory::create_record_batch(schema, &self.trade_buffer)?;
-        
-        let writer = self.writer.as_mut().unwrap();
-        tokio::task::block_in_place(|| {
-            writer
-                .write(&batch)
-                .map_err(|e| AppError::io(format!("Failed to write Trade batch: {}", e)))
-        })?;
+
+        if let Some(writer) = self.writer.take() {
+            let handle = tokio::task::spawn_blocking(move || {
+                let mut w = writer;
+                w.write(&batch)
+                    .map_err(|e| AppError::io(format!("Failed to write Trade batch: {}", e)))?;
+                Ok::<_, AppError>(w)
+            });
+            let writer_back = handle
+                .await
+                .map_err(|e| AppError::io(format!("Join error writing Trade batch: {}", e)))??;
+            self.writer = Some(writer_back);
+        }
 
         let batch_size = self.trade_buffer.len();
         self.trade_buffer.clear();
@@ -121,19 +133,21 @@ impl StreamWriter {
         Ok(())
     }
 
-    fn ensure_writer_initialized(&mut self, file_manager: &mut FileManager) -> Result<()> {
+    async fn ensure_writer_initialized(&mut self, file_manager: &mut FileManager) -> Result<()> {
         if self.writer.is_some() {
             return Ok(());
         }
 
+        let stream_type_owned = self.stream_type.clone();
         let file_path = file_manager.generate_file_path(&self.stream_type, self.exchange, &self.symbol);
+        let file_path_for_thread = file_path.clone();
 
-        // File create and writer construction are blocking; use block_in_place to avoid starving runtime
-        let writer = tokio::task::block_in_place(|| {
-            let file = std::fs::File::create(&file_path)
+        // File create and writer construction on blocking thread
+        let handle = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::create(&file_path_for_thread)
                 .map_err(|e| AppError::io(format!("Failed to create output file: {}", e)))?;
 
-            let schema = get_schema_for_stream_type(&self.stream_type);
+            let schema = get_schema_for_stream_type(&stream_type_owned);
             let props = WriterProperties::builder()
                 .set_compression(parquet::basic::Compression::SNAPPY)
                 .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
@@ -141,7 +155,10 @@ impl StreamWriter {
 
             ArrowWriter::try_new(file, schema, Some(props))
                 .map_err(|e| AppError::io(format!("Failed to create Parquet writer: {}", e)))
-        })?;
+        });
+        let writer = handle
+            .await
+            .map_err(|e| AppError::io(format!("Join error creating Parquet writer: {}", e)))??;
 
         self.writer = Some(writer);
         self.current_file_path = Some(file_path.clone());
@@ -202,7 +219,7 @@ impl MultiStreamParquetSink {
 
         Ok(Self {
             file_manager,
-            writers: HashMap::new(),
+            writers: HashMap::default(),
         })
     }
 
@@ -210,7 +227,8 @@ impl MultiStreamParquetSink {
         let (_, _, exchange, symbol, _, _) = data.common_fields();
         let stream_type = data.stream_type();
         
-        let key = format!("{}_{}_{}_{}", stream_type, exchange, symbol, "");
+        // Concise writer key to avoid unnecessary string work
+        let key = format!("{}_{}_{}", stream_type, exchange, symbol);
         
         let writer = self.writers.entry(key).or_insert_with(|| {
             StreamWriter::new(stream_type.to_string(), exchange, symbol.to_string())
@@ -228,7 +246,7 @@ impl MultiStreamParquetSink {
         Ok(())
     }
 
-    fn prune_idle_writers(&mut self, max_idle: Duration) -> Result<()> {
+    async fn prune_idle_writers(&mut self, max_idle: Duration) -> Result<()> {
         // Collect keys first to avoid mutable borrow issues
         let now = Instant::now();
         let mut to_remove: Vec<String> = Vec::new();
@@ -244,19 +262,17 @@ impl MultiStreamParquetSink {
         for key in to_remove {
             if let Some(mut writer) = self.writers.remove(&key) {
                 log::info!("Pruning idle Parquet writer: {}", key);
-                // Best-effort close in a blocking section (we're on runtime thread but closing is quick)
-                let _ = tokio::task::block_in_place(|| {
-                    writer
-                        .writer
-                        .take()
-                        .map(|mut w| {
-                            w.close().map_err(|e| AppError::io(format!(
-                                "Failed to close Parquet writer during prune: {}",
-                                e
-                            )))
-                        })
-                        .transpose()
-                });
+                // Best-effort close on blocking thread
+                if let Some(w) = writer.writer.take() {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let ww = w;
+                        ww.close().map_err(|e| AppError::io(format!(
+                            "Failed to close Parquet writer during prune: {}",
+                            e
+                        )))
+                    })
+                    .await;
+                }
             }
         }
         Ok(())
@@ -331,7 +347,7 @@ pub async fn run_multi_stream_parquet_sink(
                     return Err(e);
                 }
                 // Prune idle writers after flushing (e.g., idle for > 2 minutes)
-                if let Err(e) = sink.prune_idle_writers(Duration::from_secs(120)) {
+                if let Err(e) = sink.prune_idle_writers(Duration::from_secs(120)).await {
                     log::warn!("Pruning idle writers failed: {}", e);
                 }
             }
