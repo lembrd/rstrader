@@ -12,6 +12,7 @@ use cli::{Args, Sink};
 use error::{AppError, Result};
 use futures_util::FutureExt;
 use types::StreamData;
+// minimal HTTP server for /metrics via tokio TcpListener to avoid heavy deps
 // use std::sync::{Arc, Mutex};
 
 
@@ -63,6 +64,66 @@ async fn run_application(args: Args) -> Result<()> {
 
     // Create communication channel for unified stream data
     let (stream_tx, stream_rx) = mpsc::channel::<StreamData>(10000);
+
+    // Start metrics HTTP server (/metrics) and snapshot aggregator in background (minimal TCP server)
+    let prometheus_exporter = crate::metrics::exporters::PrometheusExporter::new();
+    let prom_registry = std::sync::Arc::new(prometheus_exporter);
+    tokio::spawn({
+        let prom_registry = prom_registry.clone();
+        async move {
+            use tokio::net::TcpListener;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = match TcpListener::bind("127.0.0.1:9898").await {
+                Ok(l) => l,
+                Err(e) => {
+                    log::warn!("failed to bind metrics listener: {}", e);
+                    return;
+                }
+            };
+            loop {
+                match listener.accept().await {
+                    Ok((mut socket, _)) => {
+                        let prom_registry = prom_registry.clone();
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 1024];
+                            let _ = socket.read(&mut buf).await;
+                            let req = std::str::from_utf8(&buf).unwrap_or("");
+                            let is_metrics = req.starts_with("GET /metrics");
+                            let body = if is_metrics { prom_registry.gather() } else { String::from("Not Found") };
+                            let status = if is_metrics { "200 OK" } else { "404 Not Found" };
+                            let response = format!(
+                                "HTTP/1.1 {}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                status,
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("metrics accept error: {}", e);
+                    }
+                }
+            }
+        }
+    });
+
+    // Aggregators (Prometheus + optional StatsD)
+    let metrics_ref = crate::metrics::GLOBAL_METRICS.clone();
+    {
+        let agg = crate::metrics::exporters::Aggregator::new(prom_registry.clone(), std::time::Duration::from_secs(5));
+        tokio::spawn(async move { agg.run(&metrics_ref).await });
+    }
+    // StatsD exporter (optional): env XTRADER_STATSD_HOST, XTRADER_STATSD_PORT
+    if let (Ok(host), Ok(port_s)) = (std::env::var("XTRADER_STATSD_HOST"), std::env::var("XTRADER_STATSD_PORT")) {
+        if let Ok(port) = port_s.parse::<u16>() {
+            let exporter = crate::metrics::exporters::StatsdExporter::new("xtrader", &host, port);
+        let metrics_ref = crate::metrics::GLOBAL_METRICS.clone();
+        let agg = crate::metrics::exporters::Aggregator::new(exporter, std::time::Duration::from_secs(5));
+        tokio::spawn(async move { agg.run(&metrics_ref).await });
+        }
+    }
 
     // Get subscriptions
     let subscriptions = args

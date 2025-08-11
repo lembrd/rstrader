@@ -238,6 +238,7 @@ pub trait ExchangeProcessor: Send + Sync {
         self.base_processor()
             .metrics
             .update_throughput(messages_per_sec);
+        crate::metrics::update_global(&self.base_processor().metrics);
     }
 }
 

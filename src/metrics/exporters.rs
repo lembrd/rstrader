@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
 use std::time::Duration;
+use prometheus::{Encoder, TextEncoder, Registry, IntGauge, Opts};
+use cadence::{StatsdClient, NopMetricSink, UdpMetricSink, QueuingMetricSink, Gauged, Counted};
+use std::net::UdpSocket;
 
 /// Trait for snapshot exporters; called on a background task only.
 pub trait SnapshotExporter: Send + Sync {
@@ -78,6 +81,82 @@ impl<E: SnapshotExporter> Aggregator<E> {
             };
             self.exporter.export(&basic, hdr.as_ref());
         }
+    }
+}
+
+/// Prometheus exporter that keeps a registry and updates gauges/counters from snapshots.
+pub struct PrometheusExporter {
+    registry: Registry,
+    recv_total: IntGauge,
+    processed_total: IntGauge,
+    parse_errors_total: IntGauge,
+    throughput: IntGauge,
+}
+
+impl PrometheusExporter {
+    pub fn new() -> Self {
+        let registry = Registry::new();
+        let recv_total = IntGauge::with_opts(Opts::new("messages_received_total", "Total messages received")).unwrap();
+        let processed_total = IntGauge::with_opts(Opts::new("messages_processed_total", "Total messages processed")).unwrap();
+        let parse_errors_total = IntGauge::with_opts(Opts::new("parse_errors_total", "Total parse errors")).unwrap();
+        let throughput = IntGauge::with_opts(Opts::new("throughput_msgs_per_sec", "Throughput in messages/sec")).unwrap();
+        registry.register(Box::new(recv_total.clone())).unwrap();
+        registry.register(Box::new(processed_total.clone())).unwrap();
+        registry.register(Box::new(parse_errors_total.clone())).unwrap();
+        registry.register(Box::new(throughput.clone())).unwrap();
+        Self { registry, recv_total, processed_total, parse_errors_total, throughput }
+    }
+
+    pub fn gather(&self) -> String {
+        let metric_families = self.registry.gather();
+        let mut buffer = Vec::new();
+        TextEncoder::new().encode(&metric_families, &mut buffer).unwrap();
+        String::from_utf8(buffer).unwrap_or_default()
+    }
+}
+
+impl SnapshotExporter for PrometheusExporter {
+    fn export(&self, basic: &crate::metrics::snapshot::BasicSnapshot, _hdr: Option<&crate::metrics::MaybeMetricsSnapshot>) {
+        // Convert deltas to counters by setting to absolute via inc_by of delta; here we set to absolute by reading previous is not trivial.
+        // For simplicity in this first pass, we just set gauges based on current snapshot where applicable and inc counters by snapshot totals.
+        self.recv_total.set(basic.messages_received as i64);
+        self.processed_total.set(basic.messages_processed as i64);
+        self.parse_errors_total.set(basic.parse_errors as i64);
+        if let Some(t) = basic.throughput_msgs_per_sec { self.throughput.set(t as i64); }
+    }
+}
+
+/// StatsD exporter using cadence with UDP sink.
+pub struct StatsdExporter {
+    client: StatsdClient,
+}
+
+impl StatsdExporter {
+    pub fn new(prefix: &str, host: &str, port: u16) -> Self {
+        let socket = UdpSocket::bind("0.0.0.0:0").ok();
+        let sink = if let Some(sock) = socket {
+            UdpMetricSink::from((host, port), sock).map(QueuingMetricSink::from).unwrap_or_else(|_| QueuingMetricSink::from(NopMetricSink))
+        } else {
+            QueuingMetricSink::from(NopMetricSink)
+        };
+        let client = StatsdClient::builder(prefix, sink).with_error_handler(|_| {}).build();
+        Self { client }
+    }
+}
+
+impl SnapshotExporter for StatsdExporter {
+    fn export(&self, basic: &crate::metrics::snapshot::BasicSnapshot, _hdr: Option<&crate::metrics::MaybeMetricsSnapshot>) {
+        let _ = self.client.count("messages_received", basic.messages_received as i64);
+        let _ = self.client.count("messages_processed", basic.messages_processed as i64);
+        let _ = self.client.count("parse_errors", basic.parse_errors as i64);
+        if let Some(t) = basic.throughput_msgs_per_sec { let _ = self.client.gauge("throughput_msgs_per_sec", t as f64); }
+    }
+}
+
+// Allow sharing PrometheusExporter via Arc between HTTP server and aggregator
+impl SnapshotExporter for std::sync::Arc<PrometheusExporter> {
+    fn export(&self, basic: &crate::metrics::snapshot::BasicSnapshot, hdr: Option<&crate::metrics::MaybeMetricsSnapshot>) {
+        (**self).export(basic, hdr)
     }
 }
 

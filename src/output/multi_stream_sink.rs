@@ -107,6 +107,7 @@ impl StreamWriter {
         self.l2_buffer.clear();
         self.metrics.increment_batches_written();
         self.last_activity = Instant::now();
+        crate::metrics::update_global(&self.metrics);
 
         log::debug!("Wrote L2 batch of {} records to Parquet", batch_size);
         Ok(())
@@ -139,6 +140,7 @@ impl StreamWriter {
         self.trade_buffer.clear();
         self.metrics.increment_batches_written();
         self.last_activity = Instant::now();
+        crate::metrics::update_global(&self.metrics);
 
         log::debug!("Wrote Trade batch of {} records to Parquet", batch_size);
         Ok(())
