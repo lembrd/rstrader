@@ -140,6 +140,44 @@ XTrader uses a unified schema for all exchanges.
 
 See `docs/data_schema.md` for the detailed schema.
 
+### XMarketId: 64-bit instrument IDs
+
+- **Goal**: deterministic `i64` for (exchange, symbol) without a mapping table
+- **Layout**: `[exchange: 8 bits][symbol_hash: 56 bits]`
+- **Hash**: XXH3-64 with fixed seed; **symbol normalization**: ASCII uppercase and trim
+- **Properties**:
+  - **Deterministic** across runs
+  - **Cross-exchange collisions** impossible (partitioned by high 8 bits)
+  - **Same-exchange collisions** astronomically unlikely for realistic sets
+
+Usage:
+```rust
+use xtrader::xmarket_id::XMarketId;
+use xtrader::types::ExchangeId;
+
+let id: i64 = XMarketId::make(ExchangeId::BinanceFutures, "BTCUSDT");
+let ex: u8 = XMarketId::exchange_from(id);
+```
+
+Validate with live markets and see speed:
+```bash
+# Runs a demo that fetches Binance Futures and OKX (SWAP/ SPOT), prints examples,
+# verifies no collisions, and measures throughput
+cargo run --release --example xmarket_demo
+
+# Integration test (requires internet)
+cargo test --test xmarket_id_integration -- --nocapture
+```
+
+Example output (abridged):
+```text
+Fetched counts: binance_futures=550 okx_swap=262 okx_spot=755
+BTCUSDT -> 130625389216350763 (0x01D0131972E3422B)
+BTC-USD-SWAP -> 193745103732232098 (0x02B0522534EE4FA2)
+Unique across all exchanges: 1567
+Throughput: ~13–16 M ids/s
+```
+
 ## Architecture overview
 
 ### Entry points
@@ -270,6 +308,35 @@ RUN_QUESTDB_TESTS=1 cargo test --test questdb_integration -- --nocapture
 - Run tests:
 ```bash
 cargo test
+```
+
+### Benchmarks (Criterion)
+- List benches:
+```bash
+cargo bench --benches -- --list
+```
+- Run a specific bench (saves reports to `target/criterion`):
+```bash
+cargo bench --bench monoseq_bench
+```
+- Open the HTML index:
+```bash
+open target/criterion/report/index.html
+```
+- Open individual group pages (examples):
+```bash
+open target/criterion/monoseq/next\(\)\ sequential/report/index.html
+open target/criterion/monoseq_concurrent/next\(\)\ 8\ threads/report/index.html
+```
+- Optional: write reports to a custom directory and save a named baseline:
+```bash
+CRITERION_HOME=./criterion_reports cargo bench --bench monoseq_bench
+open ./criterion_reports/report/index.html
+
+# Or run the bench binary directly and save a baseline
+BIN=$(ls -t target/release/deps/monoseq_bench-* | head -n 1)
+CRITERION_HOME=./criterion_reports "$BIN" --save-baseline run1
+open ./criterion_reports/report/index.html
 ```
 - Useful docs:
   - `docs/OVERVIEW.md`

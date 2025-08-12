@@ -1201,11 +1201,26 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             let timestamp_micros = crate::types::time::millis_to_micros(timestamp);
 
             // Calculate overall latency (local time vs exchange timestamp)
-            if let Some(overall_latency) = rcv_timestamp.checked_sub(timestamp_micros) {
-                if overall_latency >= 0 {
+            if let Some(overall_latency_us) = rcv_timestamp.checked_sub(timestamp_micros) {
+                if overall_latency_us >= 0 {
+                    // Record metric
                     self.base
                         .metrics
-                        .update_overall_latency(overall_latency as u64);
+                        .update_overall_latency(overall_latency_us as u64);
+
+                    // Debug: flag suspiciously tiny latencies for investigation
+                    if overall_latency_us < 1_000 {
+                        log::debug!(
+                            "[okx][lat] tiny overall latency: {}us (rcv={}, exch_ts={})",
+                            overall_latency_us, rcv_timestamp, timestamp_micros
+                        );
+                    }
+                } else {
+                    // Debug: negative means local clock ahead of exchange clock (or unit mismatch)
+                    log::debug!(
+                        "[okx][lat] negative overall latency: {}us (rcv={}, exch_ts={})",
+                        overall_latency_us, rcv_timestamp, timestamp_micros
+                    );
                 }
             }
 
@@ -1479,14 +1494,33 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
                 }
             };
 
-            // Parse timestamp 
+            // Parse timestamp (OKX provides milliseconds since epoch)
             let timestamp_ms = trade_data.timestamp.parse::<i64>().map_err(|e| {
                 crate::error::AppError::pipeline(format!("Invalid timestamp '{}': {}", trade_data.timestamp, e))
             })?;
+            let exchange_ts_us = crate::types::time::millis_to_micros(timestamp_ms);
+
+            // Calculate overall latency (local time vs exchange timestamp) for trades as well
+            if let Some(overall_latency_us) = rcv_timestamp.checked_sub(exchange_ts_us) {
+                if overall_latency_us >= 0 {
+                    self.base.metrics.update_overall_latency(overall_latency_us as u64);
+                    if overall_latency_us < 1_000 {
+                        log::debug!(
+                            "[okx][lat][trades] tiny overall latency: {}us (rcv={}, exch_ts={})",
+                            overall_latency_us, rcv_timestamp, exchange_ts_us
+                        );
+                    }
+                } else {
+                    log::debug!(
+                        "[okx][lat][trades] negative overall latency: {}us (rcv={}, exch_ts={})",
+                        overall_latency_us, rcv_timestamp, exchange_ts_us
+                    );
+                }
+            }
 
             let seq_id = self.next_sequence_id();
             let trade = crate::types::TradeUpdate {
-                timestamp: crate::types::time::millis_to_micros(timestamp_ms), 
+                timestamp: exchange_ts_us, 
                 rcv_timestamp,
                 exchange: self.exchange_id,
                 ticker: self.convert_symbol_from_okx(&trade_data.inst_id),

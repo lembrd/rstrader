@@ -26,6 +26,7 @@ arrow = "53.0"
 parquet = "53.0"
 tempfile = "3.10"
 ryu = "1.0"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Error handling
 anyhow = "1.0"
@@ -54,3 +55,8 @@ metrics-hdr = []
 [dev-dependencies]
 ureq = { version = "2.9", default-features = false }
 urlencoding = "2.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "monoseq_bench"
+harness = false

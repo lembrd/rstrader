@@ -6,6 +6,7 @@ mod pipeline;
 mod subscription_manager;
 mod types;
 mod metrics;
+pub mod monoseq;
 
 use clap::Parser;
 use cli::{Args, Sink};
