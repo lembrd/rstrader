@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use crate::error::{AppError, Result};
-use crate::types::{OrderBookL2Update, OrderBookSnapshot, OrderSide, PriceLevel};
+use crate::types::{OrderBookL2Update, OrderBookSnapshot, PriceLevel};
+use crate::oms::Side;
 use std::collections::BTreeMap; // stay with BTreeMap for price ordering semantics
 
 /// Order book manager for maintaining L2 state
@@ -106,7 +107,7 @@ impl OrderBookManager {
         let price_key = OrderedFloat::from(update.price);
 
         match update.side {
-            OrderSide::Bid => {
+            Side::Buy => {
                 if update.qty == 0.0 {
                     // Remove price level
                     self.bids.remove(&price_key);
@@ -115,7 +116,7 @@ impl OrderBookManager {
                     self.bids.insert(price_key, update.qty);
                 }
             }
-            OrderSide::Ask => {
+            Side::Sell => {
                 if update.qty == 0.0 {
                     // Remove price level
                     self.asks.remove(&price_key);
@@ -124,6 +125,7 @@ impl OrderBookManager {
                     self.asks.insert(price_key, update.qty);
                 }
             }
+            _ => {}
         }
 
         self.last_update_id = update.update_id;
@@ -354,7 +356,7 @@ mod tests {
             update_id: 101,
             first_update_id: 101,
             action: L2Action::Update,
-            side: OrderSide::Bid,
+            side: crate::oms::Side::Buy,
             price: 50000.5,
             qty: 2.0,
         };
@@ -398,7 +400,7 @@ mod tests {
             update_id: 101,
             first_update_id: 101,
             action: L2Action::Update,
-            side: OrderSide::Bid,
+            side: crate::oms::Side::Buy,
             price: 50000.0,
             qty: 0.0,
         };

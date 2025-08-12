@@ -150,7 +150,8 @@ impl RecordBatchFactory<TradeUpdate> for TradeRecordBatchFactory {
 mod tests {
     use super::*;
     use crate::output::schema::{L2SchemaFactory, SchemaFactory, TradeSchemaFactory};
-    use crate::types::{ExchangeId, L2Action, OrderSide, TradeSide};
+    use crate::types::{ExchangeId, L2Action};
+    use crate::oms::Side;
 
     #[test]
     fn test_l2_record_batch_creation() {
@@ -166,7 +167,7 @@ mod tests {
                 update_id: 123,
                 first_update_id: 122,
                 action: L2Action::Update,
-                side: OrderSide::Bid,
+                side: Side::Buy,
                 price: 50000.0,
                 qty: 1.5,
             },
@@ -190,7 +191,7 @@ mod tests {
                 packet_id: 1,
                 trade_id: "T123456".to_string(),
                 order_id: Some("O789".to_string()),
-                side: TradeSide::Buy,
+                side: Side::Buy,
                 price: 50000.0,
                 qty: 0.5,
             },

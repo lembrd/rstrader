@@ -370,7 +370,8 @@ pub async fn run_multi_stream_questdb_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ExchangeId, L2Action, OrderSide, TradeSide};
+    use crate::types::{ExchangeId, L2Action};
+    use crate::oms::Side;
 
     #[tokio::test]
     async fn test_ilp_serialize_nonempty() {
@@ -384,7 +385,7 @@ mod tests {
             update_id: 10,
             first_update_id: 9,
             action: L2Action::Update,
-            side: OrderSide::Bid,
+            side: Side::Buy,
             price: 10.0,
             qty: 1.0,
         };
@@ -405,7 +406,7 @@ mod tests {
             packet_id: 1,
             trade_id: "T1".to_string(),
             order_id: Some("O1".to_string()),
-            side: TradeSide::Buy,
+            side: Side::Buy,
             price: 10.0,
             qty: 1.0,
         };

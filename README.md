@@ -133,12 +133,24 @@ XTrader uses a unified schema for all exchanges.
 
 - L2 updates (one row per level change):
   - Common: `timestamp`, `rcv_timestamp`, `exchange`, `ticker`, `seq_id`, `packet_id`
-  - L2-specific: `action` (UPDATE/DELETE), `side` (BID/ASK), `price`, `qty`, `update_id`, `first_update_id`
+  - L2-specific: `action` (UPDATE/DELETE), `side` (BUY for bid, SELL for ask), `price`, `qty`, `update_id`, `first_update_id`
 - Trade updates:
   - Common: `timestamp`, `rcv_timestamp`, `exchange`, `ticker`, `seq_id`, `packet_id`
   - Trade-specific: `trade_id`, `order_id?`, `side` (BUY/SELL/UNKNOWN), `price`, `qty`
 
 See `docs/data_schema.md` for the detailed schema.
+
+### OMS (Order Management System) types
+
+- Unified enums and entities for order routing/handling are available under `xtrader::oms`:
+  - `Side` (BUY/SELL/UNKNOWN) — used across both L2 and trades
+  - `ExecutionType`, `OrderStatus` (with helpers `is_position_change()`, `is_alive()`)
+  - `TimeInForce`, `OrderMode`
+  - `XExecution` — unified execution report
+  - Requests: `PostRequest`, `CancelRequest`, `AmendRequest`
+  - `OrderResponse` with `OrderResponseStatus`
+- Client Order ID format: external string `xcl_{int64}`; helpers in `oms::clordid` (`format_xcl`, `parse_xcl`).
+- ID generation uses `monoseq::next_id()` (Snowflake-like, 41-bit time / 10-bit machine / 12-bit seq).
 
 ### XMarketId: 64-bit instrument IDs
 

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use serde::{Deserialize, Serialize};
+use crate::oms;
 use std::time::SystemTime;
 
 /// Unified data structure for L2 order book updates
@@ -17,7 +18,7 @@ pub struct OrderBookL2Update {
     pub update_id: i64,       // Exchange-specific update ID (Binance lastUpdateId)
     pub first_update_id: i64, // First update ID in event (Binance U field)
     pub action: L2Action,     // Action type (UPDATE for Binance)
-    pub side: OrderSide,      // BID/ASK
+    pub side: oms::Side,      // BUY (bid) / SELL (ask)
     pub price: f64,           // Price level
     pub qty: f64,             // Quantity (0 = delete level)
 }
@@ -74,7 +75,7 @@ impl OrderBookL2UpdateBuilder {
             } else {
                 L2Action::Update
             },
-            side: OrderSide::Bid,
+            side: oms::Side::Buy,
             price,
             qty,
         }
@@ -96,7 +97,7 @@ impl OrderBookL2UpdateBuilder {
             } else {
                 L2Action::Update
             },
-            side: OrderSide::Ask,
+            side: oms::Side::Sell,
             price,
             qty,
         }
@@ -123,28 +124,12 @@ pub struct TradeUpdate {
     // Trade specific fields
     pub trade_id: String,     // Exchange-specific trade ID
     pub order_id: Option<String>, // Order ID if available
-    pub side: TradeSide,      // BUY/SELL/UNKNOWN (direction of taker)
+    pub side: oms::Side,      // BUY/SELL/UNKNOWN (direction of taker)
     pub price: f64,           // Trade execution price
     pub qty: f64,             // Trade quantity
 }
 
-/// Trade side enumeration (direction of taker)
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub enum TradeSide {
-    Unknown = 0,
-    Buy = 1,   // Taker bought (aggressor was buyer)
-    Sell = -1, // Taker sold (aggressor was seller)
-}
-
-impl std::fmt::Display for TradeSide {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TradeSide::Buy => write!(f, "BUY"),
-            TradeSide::Sell => write!(f, "SELL"),
-            TradeSide::Unknown => write!(f, "UNKNOWN"),
-        }
-    }
-}
+// TradeSide unified into crate::oms::Side
 
 /// Builder for TradeUpdate to maintain consistency with L2 pattern
 pub struct TradeUpdateBuilder {
@@ -183,7 +168,7 @@ impl TradeUpdateBuilder {
     }
 
     /// Build a trade update
-    pub fn build(self, side: TradeSide, price: f64, qty: f64, _is_buyer_maker: bool) -> TradeUpdate {
+    pub fn build(self, side: oms::Side, price: f64, qty: f64, _is_buyer_maker: bool) -> TradeUpdate {
         TradeUpdate {
             timestamp: self.timestamp,
             rcv_timestamp: self.rcv_timestamp,
@@ -254,21 +239,7 @@ impl std::fmt::Display for L2Action {
     }
 }
 
-/// Order book side enumeration
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub enum OrderSide {
-    Bid = 1,
-    Ask = -1,
-}
-
-impl std::fmt::Display for OrderSide {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OrderSide::Bid => write!(f, "BID"),
-            OrderSide::Ask => write!(f, "ASK"),
-        }
-    }
-}
+// OrderSide unified into crate::oms::Side: use Buy for bid, Sell for ask
 
 /// Exchange identifier enumeration
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

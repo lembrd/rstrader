@@ -14,8 +14,9 @@ use crate::error::{AppError, Result};
 use crate::exchanges::ExchangeConnector;
 use crate::types::{
     ConnectionStatus, ExchangeId, OrderBookL2Update, OrderBookL2UpdateBuilder,
-    OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate, TradeSide,
+    OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate,
 };
+use crate::oms::Side;
 use fast_float;
 
 /// OKX WebSocket message wrapper for different types
@@ -661,8 +662,8 @@ impl OkxConnector {
         let qty = metadata.normalize_quantity(raw_size);
 
         let trade_side = match trade_data.side.as_str() {
-            "buy" => TradeSide::Buy,
-            "sell" => TradeSide::Sell,
+            "buy" => Side::Buy,
+            "sell" => Side::Sell,
             _ => return Err(AppError::parse(format!("Invalid trade side: {}", trade_data.side))),
         };
 
@@ -1486,8 +1487,8 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
             // Parse trade side
             let trade_side = match trade_data.side.as_str() {
-                "buy" => crate::types::TradeSide::Buy,
-                "sell" => crate::types::TradeSide::Sell,
+                "buy" => crate::oms::Side::Buy,
+                "sell" => crate::oms::Side::Sell,
                 _ => {
                     log::warn!("Unknown OKX trade side: {}", trade_data.side);
                     continue; // Skip this trade

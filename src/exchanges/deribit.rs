@@ -16,6 +16,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use crate::error::AppError;
 use crate::exchanges::{ExchangeConnector, ExchangeError, ExchangeProcessor};
 use crate::types::*;
+use crate::oms::Side;
 
 /// Optimized Deribit connector for microsecond-level latency
 /// Uses hybrid architecture: RPC for control, direct streaming for market data
@@ -530,8 +531,8 @@ impl DeribitConnector {
     /// Convert Deribit trade data to internal TradeUpdate format
     fn convert_trade_update(&self, trade: &DeribitTradeData, rcv_timestamp: i64, packet_id: i64) -> Result<TradeUpdate, AppError> {
         let trade_side = match trade.direction.as_str() {
-            "buy" => TradeSide::Buy,
-            "sell" => TradeSide::Sell,
+            "buy" => Side::Buy,
+            "sell" => Side::Sell,
             _ => return Err(AppError::parse(format!("Invalid trade direction: {}", trade.direction))),
         };
 
@@ -749,7 +750,7 @@ impl DeribitProcessor {
                 update_id: data.change_id as i64,
                 first_update_id: data.change_id as i64,
                 action,
-                side: OrderSide::Bid,
+                side: Side::Buy,
                 price,
                 qty: amount,
             });
@@ -779,7 +780,7 @@ impl DeribitProcessor {
                 update_id: data.change_id as i64,
                 first_update_id: data.change_id as i64,
                 action,
-                side: OrderSide::Ask,
+                side: Side::Sell,
                 price,
                 qty: amount,
             });
@@ -954,8 +955,8 @@ impl ExchangeProcessor for DeribitProcessor {
                     }
 
                     let trade_side = match trade_data.direction.as_str() {
-                        "buy" => crate::types::TradeSide::Buy,
-                        "sell" => crate::types::TradeSide::Sell,
+                        "buy" => crate::oms::Side::Buy,
+                        "sell" => crate::oms::Side::Sell,
                         _ => return Err(crate::error::AppError::Pipeline {
                             message: format!("Invalid trade direction: {}", trade_data.direction),
                         }),
@@ -1080,7 +1081,7 @@ mod tests {
         // Check first bid update
         assert_eq!(updates[0].ticker, "BTC-PERPETUAL");
         assert_eq!(updates[0].exchange, ExchangeId::Deribit);
-        assert_eq!(updates[0].side, OrderSide::Bid);
+        assert_eq!(updates[0].side as i8, Side::Buy as i8);
         assert_eq!(updates[0].price, 50000.0);
         assert_eq!(updates[0].qty, 1.5);
         assert_eq!(updates[0].action, L2Action::Update);
