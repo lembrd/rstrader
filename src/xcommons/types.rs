@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use crate::xcommons::oms;
 use std::time::SystemTime;
 
@@ -186,11 +187,8 @@ impl TradeUpdateBuilder {
 }
 
 /// Enum to identify stream types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamType {
-    L2,
-    Trade,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum StreamType { L2, Trade }
 /// Unified enum for different stream data types
 #[derive(Debug, Clone)]
 pub enum StreamData {
@@ -230,6 +228,17 @@ impl StreamData {
     }
 }
 
+impl FromStr for StreamType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "L2" => Ok(StreamType::L2),
+            "TRADES" | "TRADE" => Ok(StreamType::Trade),
+            other => Err(format!("Invalid stream type '{}'. Supported: L2, TRADES", other)),
+        }
+    }
+}
+
 impl std::fmt::Display for L2Action {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -248,6 +257,69 @@ pub enum ExchangeId {
     OkxSwap = 2,
     OkxSpot = 3,
     Deribit = 4,
+}
+
+impl FromStr for ExchangeId {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "BINANCE_FUTURES" => Ok(ExchangeId::BinanceFutures),
+            "OKX_SWAP" => Ok(ExchangeId::OkxSwap),
+            "OKX_SPOT" => Ok(ExchangeId::OkxSpot),
+            "DERIBIT" => Ok(ExchangeId::Deribit),
+            other => Err(format!("Invalid exchange '{}'. Supported: BINANCE_FUTURES, OKX_SWAP, OKX_SPOT, DERIBIT", other)),
+        }
+    }
+}
+
+/// Subscription specification (canonical, exchange-agnostic)
+#[derive(Clone, Debug)]
+pub struct SubscriptionSpec {
+    pub stream_type: StreamType,
+    pub exchange: ExchangeId,
+    pub instrument: String,
+    pub max_connections: Option<usize>,
+}
+
+impl SubscriptionSpec {
+    /// Parse subscription format: stream_type:exchange@instrument[connections]
+    pub fn parse(input: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = input.split(':').collect();
+        if parts.len() != 2 { return Err(format!("Invalid format '{}'. Expected 'stream_type:exchange@instrument[connections]'", input)); }
+
+        let stream_type = StreamType::from_str(parts[0])?;
+        let exchange_instrument = parts[1];
+        let ex_parts: Vec<&str> = exchange_instrument.split('@').collect();
+        if ex_parts.len() != 2 { return Err(format!("Invalid format '{}'. Expected 'exchange@instrument' after ':'", exchange_instrument)); }
+        let exchange = ExchangeId::from_str(ex_parts[0])?;
+        let instrument_raw = ex_parts[1].trim();
+
+        let (instrument, max_connections) = if let Some(idx) = instrument_raw.rfind('[') {
+            if instrument_raw.ends_with(']') {
+                let base = &instrument_raw[..idx];
+                let inside = &instrument_raw[idx + 1..instrument_raw.len() - 1];
+                if base.is_empty() { return Err("Instrument cannot be empty".to_string()); }
+                let n: usize = inside.parse().map_err(|_| format!("Invalid connections value '{}' in '{}'", inside, input))?;
+                if n == 0 { return Err("Connections value must be > 0".to_string()); }
+                (base.to_string(), Some(n))
+            } else { (instrument_raw.to_string(), None) }
+        } else { (instrument_raw.to_string(), None) };
+
+        if instrument.is_empty() { return Err("Instrument cannot be empty".to_string()); }
+
+        Ok(SubscriptionSpec { stream_type, exchange, instrument, max_connections })
+    }
+
+    pub fn parse_multiple(input: &str) -> Result<Vec<Self>, String> {
+        if input.trim().is_empty() { return Err("Subscriptions string cannot be empty".to_string()); }
+        let mut v = Vec::new();
+        for s in input.split(',') {
+            let t = s.trim();
+            if !t.is_empty() { v.push(Self::parse(t)?); }
+        }
+        if v.is_empty() { return Err("No valid subscriptions found".to_string()); }
+        Ok(v)
+    }
 }
 
 impl std::fmt::Display for ExchangeId {

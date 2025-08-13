@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::cli::SubscriptionSpec;
+use crate::xcommons::types::SubscriptionSpec;
 use crate::xcommons::error::Result;
 use crate::metrics;
 use crate::xcommons::types::StreamData;

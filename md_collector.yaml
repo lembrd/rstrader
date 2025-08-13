@@ -5,13 +5,11 @@ runtime:
 sink:
   type: questdb
 subscriptions:
-  - exchange: OKX_SWAP
+  - exchange: OkxSwap
     stream_type: L2
     instrument: BTCUSDT
     arb_streams_num: 2
-  - exchange: BINANCE_FUTURES
-    stream_type: TRADES
+  - exchange: BinanceFutures
+    stream_type: Trade
     instrument: ETHUSDT
     arb_streams_num: 1
-
-

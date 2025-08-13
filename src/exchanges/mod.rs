@@ -298,21 +298,21 @@ pub struct ConnectorFactory;
 
 impl ConnectorFactory {
     pub fn create_connector(
-        exchange: crate::cli::Exchange,
+        exchange: crate::xcommons::types::ExchangeId,
         okx_swap_registry: Option<std::sync::Arc<okx::InstrumentRegistry>>,
         okx_spot_registry: Option<std::sync::Arc<okx::InstrumentRegistry>>,
     ) -> Box<dyn ExchangeConnector<Error = crate::xcommons::error::AppError>> {
         match exchange {
-            crate::cli::Exchange::BinanceFutures => Box::new(binance::BinanceFuturesConnector::new()),
-            crate::cli::Exchange::OkxSwap => {
+            crate::xcommons::types::ExchangeId::BinanceFutures => Box::new(binance::BinanceFuturesConnector::new()),
+            crate::xcommons::types::ExchangeId::OkxSwap => {
                 let reg = okx_swap_registry.expect("OKX SWAP registry not initialized");
                 Box::new(okx::OkxConnector::new_swap(reg))
             }
-            crate::cli::Exchange::OkxSpot => {
+            crate::xcommons::types::ExchangeId::OkxSpot => {
                 let reg = okx_spot_registry.expect("OKX SPOT registry not initialized");
                 Box::new(okx::OkxConnector::new_spot(reg))
             }
-            crate::cli::Exchange::Deribit => {
+            crate::xcommons::types::ExchangeId::Deribit => {
                 let cfg = crate::exchanges::deribit::DeribitConfig::from_env()
                     .expect("Failed to load Deribit config");
                 Box::new(crate::exchanges::deribit::DeribitConnector::new(cfg))

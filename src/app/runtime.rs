@@ -12,7 +12,7 @@ async fn run_strategy_path(args: Args) -> Result<()> {
     // use crate::strats::md_collector::strategy::MdCollector;
     use crate::strats::naive_mm::config::NaiveMmConfig;
     use crate::strats::naive_mm::strategy::NaiveMm;
-    use crate::strats::api::{Strategy, StrategyContext};
+    use crate::strats::api::{StrategyContext, StrategyRunner};
 
 
     let config_path = args
@@ -79,7 +79,7 @@ async fn run_strategy_path(args: Args) -> Result<()> {
             crate::strats::md_collector::config::SinkSection::Questdb => EnvSinkConfig::QuestDb,
         };
         // Map config subscriptions into SubscriptionSpec and run sink (now using typed enums from YAML)
-        use crate::cli::SubscriptionSpec;
+        use crate::xcommons::types::SubscriptionSpec;
         let subscriptions: Vec<SubscriptionSpec> = cfg
             .subscriptions
             .into_iter()
@@ -105,8 +105,8 @@ async fn run_strategy_path(args: Args) -> Result<()> {
     let cfg: NaiveMmConfig = serde_yaml::from_str(&buf).map_err(|e| AppError::cli(format!("Invalid YAML for known strategies: {}", e)))?;
     let env = super::env::DefaultEnvironment::new(cfg.runtime.channel_capacity, args.verbose, prom_registry.clone());
     let ctx = StrategyContext { env: std::sync::Arc::new(env) };
-    let strat = NaiveMm;
-    strat.start(ctx, cfg).await?;
+    let strat = NaiveMm::default();
+    StrategyRunner::run(strat, ctx, cfg).await?;
     return Ok(());
 }
 

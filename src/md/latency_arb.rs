@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio::time::{sleep, Duration};
 
-use crate::cli::{Exchange, SubscriptionSpec};
+use crate::xcommons::types::{ExchangeId as Exchange, SubscriptionSpec};
 use crate::xcommons::error::{AppError, Result};
 use crate::exchanges::{ExchangeConnector, ProcessorFactory, ConnectorFactory};
 use std::time::Instant;

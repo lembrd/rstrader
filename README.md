@@ -234,36 +234,33 @@ Throughput: ~13–16 M ids/s
 
 ### Strategies
 - `src/strats/`: Strategy API and concrete strategies
-  - `src/strats/api.rs`: `Strategy`, `StrategyContext`, and registry types
+  - `src/strats/api.rs`: single-threaded Strategy API (`Strategy`, `StrategyRegistrar`, `StrategyRunner`)
   - `src/strats/md_collector/`: market data collector strategy (config + implementation)
-  
-#### Strategy API (simplified)
 
-- Strategies implement a small, high-level API and delegate low-level concerns to the application environment.
-- API:
+#### Strategy API (single-threaded, handler-first)
+
+- Strategies declare subscriptions in `configure` and implement sync handlers. A single-threaded mailbox dispatches messages to handlers. Concurrency and backpressure are handled by the runtime.
 
 ```rust
 #[async_trait]
-pub trait Strategy {
+pub trait Strategy: Send + Sync {
     type Config: DeserializeOwned + Send + Sync + 'static;
     fn name(&self) -> &'static str;
-    async fn start(&self, ctx: StrategyContext, cfg: Self::Config) -> AppResult<()>;
-    async fn stop(&self) -> AppResult<()>;
-}
-
-#[derive(Clone)]
-pub struct StrategyContext {
-    pub env: Arc<dyn AppEnvironment>,
+    async fn configure(&mut self, reg: &mut StrategyRegistrar, ctx: &StrategyContext, cfg: &Self::Config) -> AppResult<()>;
+    fn on_l2(&mut self, sub: SubscriptionId, msg: OrderBookL2Update, io: &mut StrategyIo) {}
+    fn on_trade(&mut self, sub: SubscriptionId, msg: TradeUpdate, io: &mut StrategyIo) {}
+    fn on_execution(&mut self, account_id: i64, exec: XExecution, io: &mut StrategyIo) {}
+    fn on_position(&mut self, account_id: i64, market_id: i64, pos: Position, io: &mut StrategyIo) {}
+    fn on_control(&mut self, c: StrategyControl, io: &mut StrategyIo) {}
 }
 ```
 
-Key principles:
-- Strategies should remain orchestration-only. Market data subscriptions, sinks, and trading account runners are started via `AppEnvironment`.
-- No ad-hoc string parsing in strategies: enums are parsed centrally.
+- Canonical types are defined in `xcommons::types` (no CLI duplication): `ExchangeId`, `StreamType`, `SubscriptionSpec`.
+- See `docs/UNIFIED_STRATEGY_API.md` for design and best practices.
 
-#### Typed enum parsing and YAML configs
+#### Typed enums and YAML configs
 
-- CLI enums `Exchange` and `StreamType` implement `FromStr` and derive `serde` so YAML uses constants directly.
+- `ExchangeId` and `StreamType` implement `FromStr` and `serde` so YAML uses constants directly.
 - Example (md_collector.yaml / naive_mm.yaml):
 
 ```yaml
@@ -274,7 +271,7 @@ subscriptions:
     arb_streams_num: 3
 ```
 
-Both `md_collector` and `naive_mm` map `SubscriptionItem` to `SubscriptionSpec` without string matching.
+Both `md_collector` and `naive_mm` map `SubscriptionItem` to `SubscriptionSpec` without string matching. `naive_mm` also subscribes to account executions/positions and logs messages in handlers for quick visibility.
 
 #### Environment responsibilities
 

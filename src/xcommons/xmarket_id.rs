@@ -4,6 +4,7 @@ use crate::xcommons::types::ExchangeId;
 /// XMarketId provides stable 64-bit identifiers for (exchange, symbol)
 /// using a composite scheme: high 8 bits = exchange id, low 56 bits = XXH3 hash of normalized symbol.
 /// This avoids requiring a persistent mapping table while keeping collisions negligible for practical sets.
+#[derive(Clone, Copy)]
 pub struct XMarketId;
 
 const XMARKET_SEED: u64 = 0xA3F0_D1C2_B3E4_A5F6;

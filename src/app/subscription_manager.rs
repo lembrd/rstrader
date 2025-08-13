@@ -5,7 +5,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::xcommons::error::{AppError, Result};
-use crate::cli::SubscriptionSpec;
+use crate::xcommons::types::SubscriptionSpec;
 use crate::xcommons::types::StreamData;
 use crate::md::UnifiedHandlerFactory;
 use crate::md::latency_arb;
@@ -43,7 +43,7 @@ impl SubscriptionManager {
             
             // If TRADES with arbitration config (max_connections set), use arbitrated runner
             let output_tx = processed_tx.clone();
-            let handler_handle = if subscription.stream_type == crate::cli::StreamType::Trades
+            let handler_handle = if subscription.stream_type == crate::xcommons::types::StreamType::Trade
                 && subscription.max_connections.unwrap_or(1) > 1
             {
                 let sub_clone = subscription.clone();
@@ -63,7 +63,7 @@ impl SubscriptionManager {
                     )
                     .await
                 })
-            } else if subscription.stream_type == crate::cli::StreamType::L2
+            } else if subscription.stream_type == crate::xcommons::types::StreamType::L2
                 && subscription.max_connections.unwrap_or(1) > 1
             {
                 let sub_clone = subscription.clone();
@@ -184,7 +184,7 @@ impl RegistryFactory {
     pub async fn initialize_okx_registries(
         subscriptions: &[SubscriptionSpec],
     ) -> Result<(Option<Arc<InstrumentRegistry>>, Option<Arc<InstrumentRegistry>>)> {
-        use crate::cli::Exchange;
+        use crate::xcommons::types::ExchangeId as Exchange;
         use reqwest::Client;
 
         // Check if we need each registry type

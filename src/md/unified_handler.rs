@@ -5,8 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::xcommons::error::{AppError, Result};
 use crate::exchanges::{ExchangeConnector, ExchangeProcessor};
-use crate::xcommons::types::{RawMessage, ExchangeId, StreamData};
-use crate::cli::{StreamType, SubscriptionSpec};
+use crate::xcommons::types::{RawMessage, ExchangeId, StreamData, StreamType, SubscriptionSpec};
 
 /// Unified exchange handler that combines connector and processor into a single async task
 /// This eliminates the overhead of dual task spawning and inter-task communication
@@ -88,7 +87,7 @@ impl UnifiedExchangeHandler {
             reporter.set_exchange(self.get_exchange_id());
             let stream_type_str = match self.subscription.stream_type {
                 StreamType::L2 => "L2",
-                StreamType::Trades => "TRADES",
+                StreamType::Trade => "TRADES",
             };
             reporter.set_stream_type(stream_type_str);
         }
@@ -96,7 +95,7 @@ impl UnifiedExchangeHandler {
         // Main processing loop - direct processing without intermediate channels
         match self.subscription.stream_type {
             StreamType::L2 => self.run_l2_stream(output_tx, reporter).await,
-            StreamType::Trades => self.run_trade_stream(output_tx, reporter).await,
+            StreamType::Trade => self.run_trade_stream(output_tx, reporter).await,
         }
     }
 
@@ -267,24 +266,14 @@ impl UnifiedExchangeHandler {
             rcv_timestamp,
             packet_id,
             message_bytes,
-            match self.subscription.stream_type {
-                StreamType::L2 => crate::xcommons::types::StreamType::L2,
-                StreamType::Trades => crate::xcommons::types::StreamType::Trade,
-            },
+            self.subscription.stream_type,
         )?;
         
         Ok(stream_data)
     }
 
     /// Get exchange ID for this handler
-    fn get_exchange_id(&self) -> ExchangeId {
-        match self.subscription.exchange {
-            crate::cli::Exchange::BinanceFutures => ExchangeId::BinanceFutures,
-            crate::cli::Exchange::OkxSwap => ExchangeId::OkxSwap,
-            crate::cli::Exchange::OkxSpot => ExchangeId::OkxSpot,
-            crate::cli::Exchange::Deribit => ExchangeId::Deribit,
-        }
-    }
+    fn get_exchange_id(&self) -> ExchangeId { self.subscription.exchange }
 }
 
 /// Factory for creating unified exchange handlers
@@ -300,7 +289,7 @@ impl UnifiedHandlerFactory {
         okx_spot_registry: Option<Arc<crate::exchanges::okx::InstrumentRegistry>>,
         cancellation_token: CancellationToken,
     ) -> Result<UnifiedExchangeHandler> {
-        use crate::cli::Exchange;
+        use crate::xcommons::types::ExchangeId as ExId;
         use crate::exchanges::binance::BinanceFuturesConnector;
         use crate::exchanges::okx::OkxConnector;
         use crate::exchanges::deribit::{DeribitConnector, DeribitConfig};
@@ -308,25 +297,25 @@ impl UnifiedHandlerFactory {
 
         // Create connector based on exchange type
         let connector: Box<dyn ExchangeConnector<Error = AppError>> = match subscription.exchange {
-            Exchange::BinanceFutures => {
+            ExId::BinanceFutures => {
                 log::info!("[{}] Creating Binance Futures connector", index);
                 Box::new(BinanceFuturesConnector::new())
             }
-            Exchange::OkxSwap => {
+            ExId::OkxSwap => {
                 log::info!("[{}] Creating OKX SWAP connector", index);
                 let registry = okx_swap_registry.clone().ok_or_else(|| {
                     AppError::connection("OKX SWAP registry not initialized".to_string())
                 })?;
                 Box::new(OkxConnector::new_swap(registry))
             }
-            Exchange::OkxSpot => {
+            ExId::OkxSpot => {
                 log::info!("[{}] Creating OKX SPOT connector", index);
                 let registry = okx_spot_registry.clone().ok_or_else(|| {
                     AppError::connection("OKX SPOT registry not initialized".to_string())
                 })?;
                 Box::new(OkxConnector::new_spot(registry))
             }
-            Exchange::Deribit => {
+            ExId::Deribit => {
                 log::info!("[{}] Creating Deribit connector", index);
                 let config = DeribitConfig::from_env().map_err(|e| {
                     AppError::connection(format!("Failed to load Deribit config: {}", e))
@@ -337,20 +326,20 @@ impl UnifiedHandlerFactory {
 
         // Create processor based on exchange type
         let processor = match subscription.exchange {
-            Exchange::BinanceFutures => ProcessorFactory::create_binance_processor(),
-            Exchange::OkxSwap => {
+            ExId::BinanceFutures => ProcessorFactory::create_binance_processor(),
+            ExId::OkxSwap => {
                 ProcessorFactory::create_processor(
                     crate::xcommons::types::ExchangeId::OkxSwap,
                     okx_swap_registry
                 )
             }
-            Exchange::OkxSpot => {
+            ExId::OkxSpot => {
                 ProcessorFactory::create_processor(
                     crate::xcommons::types::ExchangeId::OkxSpot,
                     okx_spot_registry
                 )
             }
-            Exchange::Deribit => ProcessorFactory::create_deribit_processor(),
+            ExId::Deribit => ProcessorFactory::create_deribit_processor(),
         };
 
         Ok(UnifiedExchangeHandler::new(

@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::cli::{Exchange, StreamType};
+use crate::xcommons::types::{ExchangeId as Exchange, StreamType};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MdCollectorConfig {

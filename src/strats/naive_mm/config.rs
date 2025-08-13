@@ -14,8 +14,8 @@ pub struct RuntimeSection { pub channel_capacity: usize }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubscriptionItem {
-    pub exchange: crate::cli::Exchange,
-    pub stream_type: crate::cli::StreamType,
+    pub exchange: crate::xcommons::types::ExchangeId,
+    pub stream_type: crate::xcommons::types::StreamType,
     pub instrument: String,
     #[serde(default = "default_arb_streams_num")]
     pub arb_streams_num: usize,
