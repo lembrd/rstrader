@@ -186,6 +186,7 @@ pub trait ExchangeAccountAdapter: Send + Sync {
     async fn subscribe_live(&self, account_id: i64, market_id: i64) -> Result<tokio::sync::mpsc::Receiver<XExecution>>;
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RestartPoint {
     pub last_ts: i64,

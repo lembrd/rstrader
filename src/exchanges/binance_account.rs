@@ -69,7 +69,7 @@ struct UserTrade {
 }
 
 #[derive(Debug, Deserialize)]
-struct ListenKeyResp { listenKey: String }
+struct ListenKeyResp { #[serde(rename = "listenKey")] listen_key: String }
 
 #[derive(Debug, Deserialize)]
 struct WsRoot {
@@ -209,7 +209,7 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                 .await;
             let listen_key = match resp {
                 Ok(resp) if resp.status().is_success() => match resp.json::<ListenKeyResp>().await {
-                    Ok(j) => j.listenKey,
+                    Ok(j) => j.listen_key,
                     Err(_) => return,
                 },
                 _ => return,
