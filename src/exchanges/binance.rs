@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+//
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -10,10 +10,10 @@ use tokio_tungstenite::{WebSocketStream, connect_async, MaybeTlsStream};
 use tokio::net::lookup_host;
 use tokio::net::TcpStream;
 
-use crate::error::{AppError, Result};
+use crate::xcommons::error::{AppError, Result};
 use crate::exchanges::ExchangeConnector;
-use crate::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate};
-use crate::oms::Side;
+use crate::xcommons::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate, OrderBookL2UpdateBuilder};
+use crate::xcommons::oms::Side;
 use fast_float;
 
 /// Binance Futures WebSocket depth update message
@@ -281,7 +281,7 @@ impl BinanceFuturesConnector {
         let trade_side = if trade.is_buyer_maker { Side::Sell } else { Side::Buy };
 
         Ok(TradeUpdate {
-            timestamp: crate::types::time::millis_to_micros(trade.trade_time),
+            timestamp: crate::xcommons::types::time::millis_to_micros(trade.trade_time),
             rcv_timestamp,
             exchange: ExchangeId::BinanceFutures,
             ticker: trade.symbol.clone(),
@@ -419,7 +419,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
             symbol: symbol.to_string(),
             last_update_id: depth_response.last_update_id,
             exchange_id: ExchangeId::BinanceFutures,
-            timestamp: crate::types::time::now_millis(),
+            timestamp: crate::xcommons::types::time::now_millis(),
             sequence: depth_response.last_update_id,
             bids,
             asks,
@@ -750,7 +750,7 @@ impl BinanceProcessor {
 }
 
 impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
-    type Error = crate::error::AppError;
+    type Error = crate::xcommons::error::AppError;
 
     fn base_processor(&mut self) -> &mut crate::exchanges::BaseProcessor {
         &mut self.base
@@ -762,12 +762,12 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
     fn process_message(
         &mut self,
-        raw_msg: crate::types::RawMessage,
+        raw_msg: crate::xcommons::types::RawMessage,
         _symbol: &str,
         rcv_timestamp: i64,
         packet_id: u64,
         message_bytes: u32,
-    ) -> std::result::Result<Vec<crate::types::OrderBookL2Update>, Self::Error> {
+    ) -> std::result::Result<Vec<crate::xcommons::types::OrderBookL2Update>, Self::Error> {
         // Track message received
         self.base.metrics.increment_received();
 
@@ -780,14 +780,14 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
             .as_micros() as i64;
 
         // Parse Binance message with timing
-        let parse_start = crate::types::time::now_micros();
+        let parse_start = crate::xcommons::types::time::now_micros();
         
         let mut data_bytes = raw_msg.data;
         
         // First try to parse as generic JSON to check for subscription responses
         let json_value: serde_json::Value = serde_json::from_slice(&mut data_bytes).map_err(|e| {
             self.base.metrics.increment_parse_errors();
-            crate::error::AppError::pipeline(format!("Failed to parse Binance JSON: {}", e))
+            crate::xcommons::error::AppError::pipeline(format!("Failed to parse Binance JSON: {}", e))
         })?;
 
 
@@ -811,19 +811,19 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         let depth_update: BinanceDepthUpdate = serde_json::from_value(json_value).map_err(|e| {
             self.base.metrics.increment_parse_errors();
             log::error!("CRITICAL: Failed to parse Binance depth update: {}", e);
-            crate::error::AppError::pipeline(format!("Failed to parse Binance depth update: {}", e))
+            crate::xcommons::error::AppError::pipeline(format!("Failed to parse Binance depth update: {}", e))
         })?;
         
         // Removed per user request to reduce log spam
 
         // Calculate parse time
-        let parse_end = crate::types::time::now_micros();
+        let parse_end = crate::xcommons::types::time::now_micros();
         if let Some(parse_time) = parse_end.checked_sub(parse_start) {
             self.base.metrics.update_parse_time(parse_time as u64);
         }
 
         // Calculate overall latency (local time vs exchange timestamp)
-        let exchange_timestamp_us = crate::types::time::millis_to_micros(depth_update.event_time);
+        let exchange_timestamp_us = crate::xcommons::types::time::millis_to_micros(depth_update.event_time);
         if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
             if overall_latency >= 0 {
                 self.base
@@ -833,7 +833,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         }
 
         // Start transformation timing
-        let transform_start = crate::types::time::now_micros();
+        let transform_start = crate::xcommons::types::time::now_micros();
 
         // Calculate overhead time (time between parse end and transform start)
         if let Some(overhead_time) = transform_start.checked_sub(parse_end) {
@@ -847,25 +847,25 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         // Reuse pre-allocated buffer
         self.base.updates_buffer.clear();
 
-        let timestamp_micros = crate::types::time::millis_to_micros(depth_update.event_time);
+        let timestamp_micros = crate::xcommons::types::time::millis_to_micros(depth_update.event_time);
 
         // Process bid updates using fast float parsing
         for bid in depth_update.bids {
             let price = fast_float::parse::<f64, _>(&bid[0]).map_err(|e| {
-                crate::error::AppError::pipeline(format!("Invalid bid price '{}': {}", bid[0], e))
+                crate::xcommons::error::AppError::pipeline(format!("Invalid bid price '{}': {}", bid[0], e))
             })?;
             let qty = fast_float::parse::<f64, _>(&bid[1]).map_err(|e| {
-                crate::error::AppError::pipeline(format!(
+                crate::xcommons::error::AppError::pipeline(format!(
                     "Invalid bid quantity '{}': {}",
                     bid[1], e
                 ))
             })?;
 
             let seq_id = self.next_sequence_id();
-            let builder = crate::types::OrderBookL2UpdateBuilder::new(
+                    let builder = crate::xcommons::types::OrderBookL2UpdateBuilder::new(
                 timestamp_micros,
                 rcv_timestamp,
-                crate::types::ExchangeId::BinanceFutures,
+                crate::xcommons::types::ExchangeId::BinanceFutures,
                 depth_update.symbol.clone(),
                 seq_id,
                 packet_id as i64,
@@ -879,20 +879,20 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         // Process ask updates using fast float parsing
         for ask in depth_update.asks {
             let price = fast_float::parse::<f64, _>(&ask[0]).map_err(|e| {
-                crate::error::AppError::pipeline(format!("Invalid ask price '{}': {}", ask[0], e))
+                crate::xcommons::error::AppError::pipeline(format!("Invalid ask price '{}': {}", ask[0], e))
             })?;
             let qty = fast_float::parse::<f64, _>(&ask[1]).map_err(|e| {
-                crate::error::AppError::pipeline(format!(
+                crate::xcommons::error::AppError::pipeline(format!(
                     "Invalid ask quantity '{}': {}",
                     ask[1], e
                 ))
             })?;
 
             let seq_id = self.next_sequence_id();
-            let builder = crate::types::OrderBookL2UpdateBuilder::new(
+                    let builder = crate::xcommons::types::OrderBookL2UpdateBuilder::new(
                 timestamp_micros,
                 rcv_timestamp,
-                crate::types::ExchangeId::BinanceFutures,
+                crate::xcommons::types::ExchangeId::BinanceFutures,
                 depth_update.symbol.clone(),
                 seq_id,
                 packet_id as i64,
@@ -904,7 +904,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         }
 
         // Calculate transformation time
-        let transform_end = crate::types::time::now_micros();
+        let transform_end = crate::xcommons::types::time::now_micros();
         if let Some(transform_time) = transform_end.checked_sub(transform_start) {
             self.base
                 .metrics
@@ -925,7 +925,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
         // Calculate CODE LATENCY: From network packet arrival to business logic ready
         // This measures the FULL time spent in Rust code processing
-        let processing_complete = crate::types::time::now_micros();
+        let processing_complete = crate::xcommons::types::time::now_micros();
         if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
             if code_latency >= 0 {
                 self.base.metrics.update_code_latency(code_latency as u64);
@@ -940,12 +940,12 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
     fn process_trade_message(
         &mut self,
-        raw_msg: crate::types::RawMessage,
+        raw_msg: crate::xcommons::types::RawMessage,
         _symbol: &str,
         rcv_timestamp: i64,
         packet_id: u64,
         message_bytes: u32,
-    ) -> std::result::Result<Vec<crate::types::TradeUpdate>, Self::Error> {
+    ) -> std::result::Result<Vec<crate::xcommons::types::TradeUpdate>, Self::Error> {
         // Track message received
         self.base.metrics.increment_received();
 
@@ -958,22 +958,22 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
             .as_micros() as i64;
 
         // Parse Binance trade message with timing
-        let parse_start = crate::types::time::now_micros();
+        let parse_start = crate::xcommons::types::time::now_micros();
         let mut data_bytes = raw_msg.data;
         let trade_update: BinanceTradeUpdate =
             serde_json::from_slice(&mut data_bytes).map_err(|e| {
                 self.base.metrics.increment_parse_errors();
-                crate::error::AppError::pipeline(format!("Failed to parse Binance trade message: {}", e))
+                crate::xcommons::error::AppError::pipeline(format!("Failed to parse Binance trade message: {}", e))
             })?;
 
         // Calculate parse time
-        let parse_end = crate::types::time::now_micros();
+        let parse_end = crate::xcommons::types::time::now_micros();
         if let Some(parse_time) = parse_end.checked_sub(parse_start) {
             self.base.metrics.update_parse_time(parse_time as u64);
         }
 
         // Calculate overall latency (local time vs exchange timestamp)
-        let exchange_timestamp_us = crate::types::time::millis_to_micros(trade_update.trade_time);
+        let exchange_timestamp_us = crate::xcommons::types::time::millis_to_micros(trade_update.trade_time);
         if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
             if overall_latency >= 0 {
                 self.base
@@ -983,7 +983,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         }
 
         // Start transformation timing
-        let transform_start = crate::types::time::now_micros();
+        let transform_start = crate::xcommons::types::time::now_micros();
 
         // Calculate overhead time (time between parse end and transform start)
         if let Some(overhead_time) = transform_start.checked_sub(parse_end) {
@@ -992,20 +992,20 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
         // Parse price and quantity
         let price = fast_float::parse::<f64, _>(&trade_update.price).map_err(|e| {
-            crate::error::AppError::pipeline(format!("Invalid trade price '{}': {}", trade_update.price, e))
+            crate::xcommons::error::AppError::pipeline(format!("Invalid trade price '{}': {}", trade_update.price, e))
         })?;
         
         let qty = fast_float::parse::<f64, _>(&trade_update.quantity).map_err(|e| {
-            crate::error::AppError::pipeline(format!("Invalid trade quantity '{}': {}", trade_update.quantity, e))
+            crate::xcommons::error::AppError::pipeline(format!("Invalid trade quantity '{}': {}", trade_update.quantity, e))
         })?;
 
-        let trade_side = if trade_update.is_buyer_maker { crate::oms::Side::Sell } else { crate::oms::Side::Buy };
+        let trade_side = if trade_update.is_buyer_maker { Side::Sell } else { Side::Buy };
 
         let seq_id = self.next_sequence_id();
-        let trade = crate::types::TradeUpdate {
-            timestamp: crate::types::time::millis_to_micros(trade_update.trade_time),
+        let trade = crate::xcommons::types::TradeUpdate {
+            timestamp: crate::xcommons::types::time::millis_to_micros(trade_update.trade_time),
             rcv_timestamp,
-            exchange: crate::types::ExchangeId::BinanceFutures,
+            exchange: crate::xcommons::types::ExchangeId::BinanceFutures,
             ticker: trade_update.symbol,
             seq_id,
             packet_id: packet_id as i64,
@@ -1017,7 +1017,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         };
 
         // Calculate transformation time
-        let transform_end = crate::types::time::now_micros();
+        let transform_end = crate::xcommons::types::time::now_micros();
         if let Some(transform_time) = transform_end.checked_sub(transform_start) {
             self.base
                 .metrics
@@ -1032,7 +1032,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         self.base.metrics.update_packet_metrics(1, 1, message_bytes);
 
         // Calculate CODE LATENCY: From network packet arrival to business logic ready
-        let processing_complete = crate::types::time::now_micros();
+        let processing_complete = crate::xcommons::types::time::now_micros();
         if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
             if code_latency >= 0 {
                 self.base.metrics.update_code_latency(code_latency as u64);

@@ -5,13 +5,13 @@ use tokio::sync::mpsc;
 
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 
-use crate::error::{AppError, Result};
+use crate::xcommons::error::{AppError, Result};
 use crate::output::{
     file_manager::FileManager,
     record_batch::{L2RecordBatchFactory, RecordBatchFactory, TradeRecordBatchFactory},
     schema::{get_schema_for_stream_type, L2SchemaFactory, SchemaFactory, TradeSchemaFactory},
 };
-use crate::types::{ExchangeId, Metrics, OrderBookL2Update, StreamData, TradeUpdate};
+use crate::xcommons::types::{ExchangeId, Metrics, OrderBookL2Update, StreamData, TradeUpdate};
 
 const BATCH_SIZE: usize = 1000;
 const FLUSH_INTERVAL_MS: u64 = 5000;
@@ -390,8 +390,8 @@ pub async fn run_multi_stream_parquet_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::L2Action;
-    use crate::oms::Side;
+    use crate::xcommons::types::L2Action;
+    use crate::xcommons::oms::Side;
     use tempfile::tempdir;
 
     #[test]

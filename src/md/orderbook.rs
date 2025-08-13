@@ -1,7 +1,7 @@
-#![allow(dead_code)]
-use crate::error::{AppError, Result};
-use crate::types::{OrderBookL2Update, OrderBookSnapshot, PriceLevel};
-use crate::oms::Side;
+//
+use crate::xcommons::error::{AppError, Result};
+use crate::xcommons::types::{OrderBookL2Update, OrderBookSnapshot, PriceLevel};
+use crate::xcommons::oms::Side;
 use std::collections::BTreeMap; // stay with BTreeMap for price ordering semantics
 
 /// Order book manager for maintaining L2 state
@@ -282,7 +282,7 @@ pub struct OrderBookStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ExchangeId, L2Action};
+    use crate::xcommons::types::{ExchangeId, L2Action};
 
     #[test]
     fn test_order_book_initialization() {
@@ -292,7 +292,7 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             last_update_id: 100,
             exchange_id: ExchangeId::BinanceFutures,
-            timestamp: crate::types::time::now_millis(),
+            timestamp: crate::xcommons::types::time::now_millis(),
             sequence: 100,
             bids: vec![
                 PriceLevel {
@@ -332,7 +332,7 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             last_update_id: 100,
             exchange_id: ExchangeId::BinanceFutures,
-            timestamp: crate::types::time::now_millis(),
+            timestamp: crate::xcommons::types::time::now_millis(),
             sequence: 100,
             bids: vec![PriceLevel {
                 price: 50000.0,
@@ -356,7 +356,7 @@ mod tests {
             update_id: 101,
             first_update_id: 101,
             action: L2Action::Update,
-            side: crate::oms::Side::Buy,
+            side: crate::xcommons::oms::Side::Buy,
             price: 50000.5,
             qty: 2.0,
         };
@@ -376,7 +376,7 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             last_update_id: 100,
             exchange_id: ExchangeId::BinanceFutures,
-            timestamp: crate::types::time::now_millis(),
+            timestamp: crate::xcommons::types::time::now_millis(),
             sequence: 100,
             bids: vec![PriceLevel {
                 price: 50000.0,
@@ -400,7 +400,7 @@ mod tests {
             update_id: 101,
             first_update_id: 101,
             action: L2Action::Update,
-            side: crate::oms::Side::Buy,
+            side: crate::xcommons::oms::Side::Buy,
             price: 50000.0,
             qty: 0.0,
         };

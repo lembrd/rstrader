@@ -1,10 +1,10 @@
-#![allow(dead_code)]
+//
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::error::{AppError, Result};
-use crate::types::ExchangeId;
+use crate::xcommons::error::{AppError, Result};
+use crate::xcommons::types::ExchangeId;
 
 /// Manages file naming and sequencing for multi-stream parquet output
 pub struct FileManager {

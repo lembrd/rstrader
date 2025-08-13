@@ -7,8 +7,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use crate::error::{AppError, Result};
-use crate::types::{OrderBookL2Update, StreamData, TradeUpdate};
+use crate::xcommons::error::{AppError, Result};
+use crate::xcommons::types::{OrderBookL2Update, StreamData, TradeUpdate, Metrics, ExchangeId};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_ILP_PORT: u16 = 9009;
@@ -86,20 +86,20 @@ struct StreamWriter {
     l2_buffer: Vec<OrderBookL2Update>,
     trade_buffer: Vec<TradeUpdate>,
     last_activity: Instant,
-    metrics: crate::types::Metrics,
+    metrics: crate::xcommons::types::Metrics,
     stream_type: String,
-    exchange: crate::types::ExchangeId,
+    exchange: crate::xcommons::types::ExchangeId,
     symbol: String,
 }
 
 impl StreamWriter {
-    fn new(stream_type: String, exchange: crate::types::ExchangeId, symbol: String) -> Self {
+    fn new(stream_type: String, exchange: crate::xcommons::types::ExchangeId, symbol: String) -> Self {
         Self {
             l2_buffer: Vec::with_capacity(BATCH_SIZE),
             trade_buffer: Vec::with_capacity(BATCH_SIZE),
             last_activity: Instant::now(),
             metrics: {
-                let mut m = crate::types::Metrics::new();
+                let mut m = crate::xcommons::types::Metrics::new();
                 #[cfg(feature = "metrics-hdr")]
                 {
                     m.enable_histograms(crate::metrics::HistogramBounds::default());
@@ -292,7 +292,7 @@ impl MultiStreamQuestDbSink {
             }
         }
         // Publish lightweight totals to global metrics exporters
-        let mut total = crate::types::Metrics::new();
+        let mut total = crate::xcommons::types::Metrics::new();
         for w in self.writers.values() {
             // We don't keep per-writer metrics here; emit zeros conservatively
             let _ = w; // placeholder in case of future per-writer metrics
@@ -370,8 +370,8 @@ pub async fn run_multi_stream_questdb_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ExchangeId, L2Action};
-    use crate::oms::Side;
+    use crate::xcommons::types::{ExchangeId, L2Action};
+    use crate::xcommons::oms::Side;
 
     #[tokio::test]
     async fn test_ilp_serialize_nonempty() {

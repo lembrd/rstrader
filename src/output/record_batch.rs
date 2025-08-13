@@ -3,8 +3,8 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
-use crate::error::{AppError, Result};
-use crate::types::{OrderBookL2Update, TradeUpdate};
+use crate::xcommons::error::{AppError, Result};
+use crate::xcommons::types::{OrderBookL2Update, TradeUpdate};
 
 /// Trait for creating Arrow record batches from different data types
 pub trait RecordBatchFactory<T> {
@@ -150,8 +150,8 @@ impl RecordBatchFactory<TradeUpdate> for TradeRecordBatchFactory {
 mod tests {
     use super::*;
     use crate::output::schema::{L2SchemaFactory, SchemaFactory, TradeSchemaFactory};
-    use crate::types::{ExchangeId, L2Action};
-    use crate::oms::Side;
+    use crate::xcommons::types::{ExchangeId, L2Action};
+    use crate::xcommons::oms::Side;
 
     #[test]
     fn test_l2_record_batch_creation() {

@@ -1,7 +1,5 @@
-use crate::{
-    error::{AppError, Result},
-    types::{Metrics, OrderBookL2Update},
-};
+use crate::xcommons::error::{AppError, Result};
+use crate::xcommons::types::{Metrics, OrderBookL2Update};
 use arrow::{
     array::{ArrayRef, Float64Array, Int64Array, StringArray, UInt64Array},
     datatypes::{DataType, Field, Schema},
@@ -12,12 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-#[allow(dead_code)]
 const BATCH_SIZE: usize = 1000;
-#[allow(dead_code)]
 const FLUSH_INTERVAL_MS: u64 = 5000;
 
-#[allow(dead_code)]
 pub struct ParquetSink {
     writer: Option<ArrowWriter<std::fs::File>>,
     schema: Arc<Schema>,
@@ -219,7 +214,6 @@ impl ParquetSink {
     }
 }
 
-#[allow(dead_code)]
 pub async fn run_parquet_sink(
     mut rx: mpsc::Receiver<OrderBookL2Update>,
     output_path: PathBuf,

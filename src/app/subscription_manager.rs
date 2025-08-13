@@ -4,10 +4,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AppError, Result};
+use crate::xcommons::error::{AppError, Result};
 use crate::cli::SubscriptionSpec;
-use crate::types::StreamData;
-use crate::pipeline::UnifiedHandlerFactory;
+use crate::xcommons::types::StreamData;
+use crate::md::UnifiedHandlerFactory;
+use crate::md::latency_arb;
 use crate::exchanges::okx::InstrumentRegistry;
 
 /// Manager for handling multiple concurrent subscriptions using unified handlers
@@ -51,7 +52,7 @@ impl SubscriptionManager {
                 let verbose = self.verbose;
                 let arb_token = cancellation_token.clone();
                 tokio::spawn(async move {
-                    crate::pipeline::latency_arb::run_arbitrated_trades(
+                    latency_arb::run_arbitrated_trades(
                         sub_clone,
                         index,
                         verbose,
@@ -71,7 +72,7 @@ impl SubscriptionManager {
                 let verbose = self.verbose;
                 let arb_token = cancellation_token.clone();
                 tokio::spawn(async move {
-                    crate::pipeline::latency_arb::run_arbitrated_l2(
+                    latency_arb::run_arbitrated_l2(
                         sub_clone,
                         index,
                         verbose,

@@ -20,8 +20,9 @@ pub struct BasicSnapshot {
     pub avg_overhead_time_us: Option<f64>,
 }
 
-impl From<&crate::types::Metrics> for BasicSnapshot {
-    fn from(m: &crate::types::Metrics) -> Self {
+use crate::xcommons::types as types;
+impl From<&types::Metrics> for BasicSnapshot {
+    fn from(m: &types::Metrics) -> Self {
         Self {
             messages_received: m.messages_received,
             messages_processed: m.messages_processed,

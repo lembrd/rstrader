@@ -23,7 +23,19 @@ High-performance, low-latency cryptocurrency market data collector written in Ru
 cargo build --release
 ```
 
-### Run
+### Run (Strategy mode - recommended)
+Run a named strategy with a YAML config:
+
+```bash
+RUST_LOG=info \
+  cargo run --release -- \
+  --strategy md_collector \
+  --config ./md_collector.yaml
+```
+
+The `md_collector.yaml` includes runtime, sink, and subscriptions (supports `arb_streams_num` for latency arbitrage).
+
+### Run (legacy CLI path)
 Provide one or more subscriptions and an output directory. Subscriptions are comma-separated and use the format:
 
 - stream_type:exchange@instrument
@@ -164,8 +176,8 @@ See `docs/data_schema.md` for the detailed schema.
 
 Usage:
 ```rust
-use xtrader::xmarket_id::XMarketId;
-use xtrader::types::ExchangeId;
+use xtrader::xcommons::xmarket_id::XMarketId;
+use xtrader::xcommons::types::ExchangeId;
 
 let id: i64 = XMarketId::make(ExchangeId::BinanceFutures, "BTCUSDT");
 let ex: u8 = XMarketId::exchange_from(id);
@@ -193,12 +205,14 @@ Throughput: ~13–16 M ids/s
 ## Architecture overview
 
 ### Entry points
-- `src/main.rs`: application lifecycle (env, logging, argument parsing, orchestration)
-- `src/cli.rs`: CLI types/validation, subscription parsing (`STREAM:EXCHANGE@INSTRUMENT`)
+- `src/main.rs`: thin entrypoint delegating to strategy runtime
+- `src/cli.rs`: CLI types/validation, subscription parsing (legacy) and strategy flags (`--strategy`, `--config`)
 
 ### Orchestration
-- `src/subscription_manager.rs`: spawns one task per subscription and manages lifecycle/shutdown
-- `src/pipeline/unified_handler.rs`: UnifiedExchangeHandler combines connector + processor into a single async task to minimize overhead
+- `src/app/runtime.rs`: strategy launcher and lifecycle
+- `src/app/env.rs`: `AppEnvironment` implementation (subscriptions, sinks, metrics, task spawning)
+- `src/app/subscription_manager.rs`: spawns one task per subscription and manages lifecycle/shutdown
+- `src/md/unified_handler.rs`: UnifiedExchangeHandler combines connector + processor into a single async task to minimize overhead
 
 ### Exchange connectors and processors
 - Connectors (WebSocket/REST + exchange-specific protocol):
@@ -209,14 +223,19 @@ Throughput: ~13–16 M ids/s
   - Factory: `ProcessorFactory` in `src/exchanges/mod.rs`
 
 ### Pipeline and types
-- `src/types.rs`: unified data structs (`OrderBookL2Update`, `TradeUpdate`, `StreamData`), enums, time helpers, and `Metrics`
-- `src/pipeline/processor.rs`: generic `StreamProcessor` and `MetricsReporter` (used by unified handler)
+- `src/xcommons/types.rs`: unified data structs (`OrderBookL2Update`, `TradeUpdate`, `StreamData`), enums, time helpers, and `Metrics`
+- `src/md/processor.rs`: generic `StreamProcessor` and `MetricsReporter` (used by unified handler)
 
 ### Output subsystem
 - `src/output/multi_stream_sink.rs`: receives unified `StreamData` across all subscriptions and writes Parquet per stream
 - `src/output/file_manager.rs`: file naming, sequence tracking, and directory handling
 - `src/output/schema.rs` & `src/output/record_batch.rs`: Arrow schemas and batch builders for L2/Trades
 - `src/output/questdb.rs`: ILP TCP batching sink (schema managed externally via SQL files)
+
+### Strategies
+- `src/strats/`: Strategy API and concrete strategies
+  - `src/strats/api.rs`: `Strategy`, `StrategyContext`, and registry types
+  - `src/strats/md_collector/`: market data collector strategy (config + implementation)
 
 ## Logging & metrics
 - Logging via `env_logger`; set `RUST_LOG` (e.g., `RUST_LOG=info`).

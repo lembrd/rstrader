@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+//
 
 use std::time::Duration;
 use prometheus::{Encoder, TextEncoder, Registry, IntGauge, Opts, GaugeVec};
@@ -54,7 +54,7 @@ pub struct Aggregator<E: SnapshotExporter> {
 impl<E: SnapshotExporter> Aggregator<E> {
     pub fn new(exporter: E, interval: Duration) -> Self { Self { exporter, interval } }
 
-    pub async fn run(&self, metrics_ref: &std::sync::Arc<std::sync::Mutex<crate::types::Metrics>>) {
+    pub async fn run(&self, metrics_ref: &std::sync::Arc<std::sync::Mutex<crate::xcommons::types::Metrics>>) {
         let mut tick = tokio::time::interval(self.interval);
         loop {
             tick.tick().await;

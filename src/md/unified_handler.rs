@@ -3,9 +3,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AppError, Result};
+use crate::xcommons::error::{AppError, Result};
 use crate::exchanges::{ExchangeConnector, ExchangeProcessor};
-use crate::types::{RawMessage, ExchangeId, StreamData};
+use crate::xcommons::types::{RawMessage, ExchangeId, StreamData};
 use crate::cli::{StreamType, SubscriptionSpec};
 
 /// Unified exchange handler that combines connector and processor into a single async task
@@ -54,7 +54,7 @@ impl UnifiedExchangeHandler {
 
         // Initialize metrics reporter if verbose mode
         let mut reporter = if self.verbose {
-            Some(crate::pipeline::processor::MetricsReporter::new(
+            Some(crate::md::processor::MetricsReporter::new(
                 self.subscription.instrument.clone(),
                 10,
             ))
@@ -87,8 +87,8 @@ impl UnifiedExchangeHandler {
         if let Some(ref mut reporter) = reporter {
             reporter.set_exchange(self.get_exchange_id());
             let stream_type_str = match self.subscription.stream_type {
-                crate::cli::StreamType::L2 => "L2",
-                crate::cli::StreamType::Trades => "TRADES",
+                StreamType::L2 => "L2",
+                StreamType::Trades => "TRADES",
             };
             reporter.set_stream_type(stream_type_str);
         }
@@ -104,7 +104,7 @@ impl UnifiedExchangeHandler {
     async fn run_l2_stream(
         &mut self,
         output_tx: mpsc::Sender<StreamData>,
-        mut reporter: Option<crate::pipeline::processor::MetricsReporter>,
+        mut reporter: Option<crate::md::processor::MetricsReporter>,
     ) -> Result<()> {
         // Subscribe FIRST to begin buffering updates on the connector side
         self.connector
@@ -196,7 +196,7 @@ impl UnifiedExchangeHandler {
     async fn run_trade_stream(
         &mut self,
         output_tx: mpsc::Sender<StreamData>,
-        mut reporter: Option<crate::pipeline::processor::MetricsReporter>,
+        mut reporter: Option<crate::md::processor::MetricsReporter>,
     ) -> Result<()> {
         // Subscribe to trades stream using the dedicated trades subscription method
         self.connector
@@ -257,7 +257,7 @@ impl UnifiedExchangeHandler {
 
     /// Process raw message directly using the exchange processor
     async fn process_raw_message(&mut self, raw_msg: RawMessage) -> Result<Vec<StreamData>> {
-        let rcv_timestamp = crate::types::time::now_micros();
+        let rcv_timestamp = crate::xcommons::types::time::now_micros();
         let packet_id = self.processor.next_packet_id();
         let message_bytes = raw_msg.data.len() as u32;
 
@@ -268,8 +268,8 @@ impl UnifiedExchangeHandler {
             packet_id,
             message_bytes,
             match self.subscription.stream_type {
-                crate::cli::StreamType::L2 => crate::types::StreamType::L2,
-                crate::cli::StreamType::Trades => crate::types::StreamType::Trade,
+                StreamType::L2 => crate::xcommons::types::StreamType::L2,
+                StreamType::Trades => crate::xcommons::types::StreamType::Trade,
             },
         )?;
         
@@ -340,13 +340,13 @@ impl UnifiedHandlerFactory {
             Exchange::BinanceFutures => ProcessorFactory::create_binance_processor(),
             Exchange::OkxSwap => {
                 ProcessorFactory::create_processor(
-                    crate::types::ExchangeId::OkxSwap,
+                    crate::xcommons::types::ExchangeId::OkxSwap,
                     okx_swap_registry
                 )
             }
             Exchange::OkxSpot => {
                 ProcessorFactory::create_processor(
-                    crate::types::ExchangeId::OkxSpot,
+                    crate::xcommons::types::ExchangeId::OkxSpot,
                     okx_spot_registry
                 )
             }

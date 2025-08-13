@@ -1,0 +1,17 @@
+strategy: md_collector
+runtime:
+  metrics_port: 9898
+  channel_capacity: 10000
+sink:
+  type: questdb
+subscriptions:
+  - exchange: OKX_SWAP
+    stream_type: L2
+    instrument: BTCUSDT
+    arb_streams_num: 2
+  - exchange: BINANCE_FUTURES
+    stream_type: TRADES
+    instrument: ETHUSDT
+    arb_streams_num: 1
+
+

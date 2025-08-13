@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+//
 
 #[cfg(feature = "metrics-hdr")]
 pub mod hdr;
@@ -26,10 +26,11 @@ pub type MaybeMetricsSnapshot = noop::MetricsSnapshot;
 
 use once_cell::sync::{Lazy, OnceCell};
 use std::sync::{Arc, Mutex};
+use crate::xcommons::types as types;
 
 // Global registry for a single process-wide Metrics instance
-pub static GLOBAL_METRICS: Lazy<Arc<Mutex<crate::types::Metrics>>> = Lazy::new(|| {
-    Arc::new(Mutex::new(crate::types::Metrics::new()))
+pub static GLOBAL_METRICS: Lazy<Arc<Mutex<types::Metrics>>> = Lazy::new(|| {
+    Arc::new(Mutex::new(types::Metrics::new()))
 });
 
 // Global Prometheus exporter handle for components to publish labeled metrics
@@ -39,9 +40,9 @@ pub static PROM_EXPORTER: OnceCell<Arc<crate::metrics::exporters::PrometheusExpo
 /// Labels: stream, exchange, symbol
 pub fn publish_stream_metrics(
     stream: &str,
-    exchange: crate::types::ExchangeId,
+    exchange: types::ExchangeId,
     symbol: &str,
-    metrics: &crate::types::Metrics,
+    metrics: &types::Metrics,
 ) {
     // Always keep the global snapshot up to date
     update_global(metrics);
@@ -103,16 +104,16 @@ pub fn publish_stream_metrics(
 /// Publish only counters/snapshot (no latency quantiles). Use this from sinks that don't record latency.
 pub fn publish_stream_counters(
     _stream: &str,
-    _exchange: crate::types::ExchangeId,
+    _exchange: types::ExchangeId,
     _symbol: &str,
-    metrics: &crate::types::Metrics,
+    metrics: &types::Metrics,
 ) {
     update_global(metrics);
 }
 
 /// Best-effort: copy selected fields into the global metrics snapshot.
 /// This performs a single lock per call and overwrites absolute fields.
-pub fn update_global(from: &crate::types::Metrics) {
+pub fn update_global(from: &types::Metrics) {
     if let Ok(mut g) = GLOBAL_METRICS.lock() {
         g.messages_received = from.messages_received;
         g.messages_processed = from.messages_processed;

@@ -9,7 +9,7 @@ pub struct Args {
         long,
         help = "Subscriptions in format stream_type:exchange@instrument (e.g., L2:OKX_SWAP@BTCUSDT,L2:BINANCE_FUTURES@ETHUSDT)"
     )]
-    pub subscriptions: String,
+    pub subscriptions: Option<String>,
 
     #[arg(long, help = "Output directory for Parquet files (used when --sink parquet)", default_value = "./test_output")]
     pub output_directory: PathBuf,
@@ -22,6 +22,12 @@ pub struct Args {
 
     #[arg(long, value_enum, default_value_t = Sink::Parquet, help = "Sink to use: parquet or questdb")]
     pub sink: Sink,
+
+    #[arg(long, help = "Run a named strategy instead of the legacy CLI path (e.g., md_collector)")]
+    pub strategy: Option<String>,
+
+    #[arg(long, help = "Path to YAML config for --strategy mode")]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -182,9 +188,11 @@ impl std::fmt::Display for StreamType {
 
 impl Args {
     pub fn validate(&self) -> anyhow::Result<()> {
-        // Validate subscriptions format
-        let _subscriptions = SubscriptionSpec::parse_multiple(&self.subscriptions)
-            .map_err(|e| anyhow::anyhow!("Invalid subscriptions format: {}", e))?;
+        // Validate subscriptions format when provided in legacy style
+        if let Some(s) = &self.subscriptions {
+            let _subscriptions = SubscriptionSpec::parse_multiple(s)
+                .map_err(|e| anyhow::anyhow!("Invalid subscriptions format: {}", e))?;
+        }
 
         // If Parquet sink, validate output directory exists or can be created
         if self.sink == Sink::Parquet {
@@ -220,7 +228,8 @@ impl Args {
     
 
     pub fn get_subscriptions(&self) -> anyhow::Result<Vec<SubscriptionSpec>> {
-        let specs = SubscriptionSpec::parse_multiple(&self.subscriptions)
+        let s = self.subscriptions.as_deref().unwrap_or("");
+        let specs = SubscriptionSpec::parse_multiple(s)
             .map_err(|e| anyhow::anyhow!("Invalid subscriptions: {}", e))?;
         Ok(specs)
     }
@@ -232,21 +241,25 @@ mod tests {
 
     fn create_valid_args() -> Args {
         Args {
-            subscriptions: "L2:OKX_SWAP@BTCUSDT".to_string(),
+            subscriptions: Some("L2:OKX_SWAP@BTCUSDT".to_string()),
             output_directory: PathBuf::from("test_output"),
             verbose: false,
             shutdown_after: None,
             sink: Sink::Parquet,
+            strategy: None,
+            config: None,
         }
     }
 
     fn create_multi_subscription_args() -> Args {
         Args {
-            subscriptions: "L2:OKX_SWAP@BTCUSDT,TRADES:BINANCE_FUTURES@ETHUSDT".to_string(),
+            subscriptions: Some("L2:OKX_SWAP@BTCUSDT,TRADES:BINANCE_FUTURES@ETHUSDT".to_string()),
             output_directory: PathBuf::from("test_output"),
             verbose: false,
             shutdown_after: None,
             sink: Sink::Parquet,
+            strategy: None,
+            config: None,
         }
     }
 
@@ -348,27 +361,27 @@ mod tests {
         assert!(args.validate().is_ok());
 
         // Invalid format should fail
-        args.subscriptions = "INVALID_FORMAT".to_string();
+        args.subscriptions = Some("INVALID_FORMAT".to_string());
         assert!(args.validate().is_err());
 
         // Invalid stream type should fail
-        args.subscriptions = "INVALID:OKX_SWAP@BTCUSDT".to_string();
+        args.subscriptions = Some("INVALID:OKX_SWAP@BTCUSDT".to_string());
         assert!(args.validate().is_err());
 
         // Invalid exchange should fail
-        args.subscriptions = "L2:INVALID_EXCHANGE@BTCUSDT".to_string();
+        args.subscriptions = Some("L2:INVALID_EXCHANGE@BTCUSDT".to_string());
         assert!(args.validate().is_err());
 
         // Multiple valid subscriptions should pass
-        args.subscriptions = "L2:OKX_SWAP@BTCUSDT,TRADES:BINANCE_FUTURES@ETHUSDT".to_string();
+        args.subscriptions = Some("L2:OKX_SWAP@BTCUSDT,TRADES:BINANCE_FUTURES@ETHUSDT".to_string());
         assert!(args.validate().is_ok());
 
         // Lowercase instruments are now allowed
-        args.subscriptions = "L2:OKX_SWAP@btcusdt".to_string();
+        args.subscriptions = Some("L2:OKX_SWAP@btcusdt".to_string());
         assert!(args.validate().is_ok());
 
         // Non-USDT instruments are now allowed  
-        args.subscriptions = "L2:OKX_SWAP@BTCEUR".to_string();
+        args.subscriptions = Some("L2:OKX_SWAP@BTCEUR".to_string());
         assert!(args.validate().is_ok());
     }
 

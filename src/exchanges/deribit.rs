@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+//
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use rustc_hash::FxHashMap;
@@ -13,10 +13,10 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
-use crate::error::AppError;
+use crate::xcommons::error::AppError;
 use crate::exchanges::{ExchangeConnector, ExchangeError, ExchangeProcessor};
-use crate::types::*;
-use crate::oms::Side;
+use crate::xcommons::types::*;
+use crate::xcommons::oms::Side;
 
 /// Optimized Deribit connector for microsecond-level latency
 /// Uses hybrid architecture: RPC for control, direct streaming for market data
@@ -540,7 +540,7 @@ impl DeribitConnector {
         let ticker = trade.instrument_name.replace('-', "");
 
         Ok(TradeUpdate {
-            timestamp: crate::types::time::millis_to_micros(trade.timestamp as i64),
+            timestamp: crate::xcommons::types::time::millis_to_micros(trade.timestamp as i64),
             rcv_timestamp,
             exchange: ExchangeId::Deribit,
             ticker,
@@ -722,7 +722,7 @@ impl DeribitProcessor {
         data: &DeribitOrderBookData,
         rcv_timestamp: i64,
         packet_id: u64,
-    ) -> Result<Vec<OrderBookL2Update>, crate::error::AppError> {
+    ) -> Result<Vec<OrderBookL2Update>, crate::xcommons::error::AppError> {
         let mut updates = Vec::with_capacity(data.bids.len() + data.asks.len());
         let timestamp = data.timestamp as i64 * 1000; // Convert to microseconds
 
@@ -791,16 +791,16 @@ impl DeribitProcessor {
 }
 
 impl ExchangeProcessor for DeribitProcessor {
-    type Error = crate::error::AppError;
+    type Error = crate::xcommons::error::AppError;
 
     fn process_message(
         &mut self,
-        raw_msg: crate::types::RawMessage,
+        raw_msg: crate::xcommons::types::RawMessage,
         _symbol: &str,
         rcv_timestamp: i64,
         packet_id: u64,
         message_bytes: u32,
-    ) -> Result<Vec<crate::types::OrderBookL2Update>, Self::Error> {
+    ) -> Result<Vec<crate::xcommons::types::OrderBookL2Update>, Self::Error> {
         // Track message received
         self.base_processor.metrics.increment_received();
 
@@ -812,16 +812,16 @@ impl ExchangeProcessor for DeribitProcessor {
             .as_micros() as i64;
 
         // Start parsing timer
-        let parse_start = crate::types::time::now_micros();
+        let parse_start = crate::xcommons::types::time::now_micros();
 
         // Parse the notification
         let notification: DeribitNotification =
-            serde_json::from_slice(&raw_msg.data).map_err(|e| crate::error::AppError::Pipeline {
+            serde_json::from_slice(&raw_msg.data).map_err(|e| crate::xcommons::error::AppError::Pipeline {
                 message: format!("Failed to parse Deribit message: {}", e),
             })?;
 
         // Calculate parse time
-        let parse_end = crate::types::time::now_micros();
+        let parse_end = crate::xcommons::types::time::now_micros();
         if let Some(parse_time) = parse_end.checked_sub(parse_start) {
             self.base_processor.metrics.update_parse_time(parse_time as u64);
         }
@@ -830,11 +830,11 @@ impl ExchangeProcessor for DeribitProcessor {
             // Check if this is an order book update
             if notification.params.channel.starts_with("book.") {
                 // Start transformation timer
-                let transform_start = crate::types::time::now_micros();
+                let transform_start = crate::xcommons::types::time::now_micros();
 
                 let order_book_data: DeribitOrderBookData =
                     serde_json::from_value(notification.params.data).map_err(|e| {
-                        crate::error::AppError::Pipeline {
+                        crate::xcommons::error::AppError::Pipeline {
                             message: format!("Failed to parse Deribit order book data: {}", e),
                         }
                     })?;
@@ -851,7 +851,7 @@ impl ExchangeProcessor for DeribitProcessor {
                     self.process_order_book_data(&order_book_data, rcv_timestamp, packet_id)?;
 
                 // Calculate transformation time
-                let transform_end = crate::types::time::now_micros();
+                let transform_end = crate::xcommons::types::time::now_micros();
                 if let Some(transform_time) = transform_end.checked_sub(transform_start) {
                     self.base_processor
                         .metrics
@@ -881,7 +881,7 @@ impl ExchangeProcessor for DeribitProcessor {
                 );
 
                 // Calculate CODE LATENCY: From network packet arrival to business logic ready
-                let processing_complete = crate::types::time::now_micros();
+                let processing_complete = crate::xcommons::types::time::now_micros();
                 if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
                     if code_latency >= 0 {
                         self.base_processor.metrics.update_code_latency(code_latency as u64);
@@ -897,12 +897,12 @@ impl ExchangeProcessor for DeribitProcessor {
 
     fn process_trade_message(
         &mut self,
-        raw_msg: crate::types::RawMessage,
+        raw_msg: crate::xcommons::types::RawMessage,
         _symbol: &str,
         rcv_timestamp: i64,
         packet_id: u64,
         message_bytes: u32,
-    ) -> Result<Vec<crate::types::TradeUpdate>, Self::Error> {
+    ) -> Result<Vec<crate::xcommons::types::TradeUpdate>, Self::Error> {
         // Track message received
         self.base_processor.metrics.increment_received();
 
@@ -914,16 +914,16 @@ impl ExchangeProcessor for DeribitProcessor {
             .as_micros() as i64;
 
         // Start parsing timer
-        let parse_start = crate::types::time::now_micros();
+        let parse_start = crate::xcommons::types::time::now_micros();
 
         // Parse the notification
         let notification: DeribitNotification =
-            serde_json::from_slice(&raw_msg.data).map_err(|e| crate::error::AppError::Pipeline {
+            serde_json::from_slice(&raw_msg.data).map_err(|e| crate::xcommons::error::AppError::Pipeline {
                 message: format!("Failed to parse Deribit trade message: {}", e),
             })?;
 
         // Calculate parse time
-        let parse_end = crate::types::time::now_micros();
+        let parse_end = crate::xcommons::types::time::now_micros();
         if let Some(parse_time) = parse_end.checked_sub(parse_start) {
             self.base_processor.metrics.update_parse_time(parse_time as u64);
         }
@@ -932,12 +932,12 @@ impl ExchangeProcessor for DeribitProcessor {
             // Check if this is a trade update
             if notification.params.channel.starts_with("trades.") {
                 // Start transformation timer
-                let transform_start = crate::types::time::now_micros();
+                let transform_start = crate::xcommons::types::time::now_micros();
 
                 // Parse trade data - it comes as an array
                 let trade_data_array: Vec<DeribitTradeData> =
                     serde_json::from_value(notification.params.data).map_err(|e| {
-                        crate::error::AppError::Pipeline {
+                        crate::xcommons::error::AppError::Pipeline {
                             message: format!("Failed to parse Deribit trade data: {}", e),
                         }
                     })?;
@@ -947,7 +947,7 @@ impl ExchangeProcessor for DeribitProcessor {
                 // Process each trade in the array
                 for trade_data in trade_data_array {
                     // Calculate overall latency (exchange timestamp to receive timestamp)
-                    let exchange_timestamp_us = crate::types::time::millis_to_micros(trade_data.timestamp as i64);
+                    let exchange_timestamp_us = crate::xcommons::types::time::millis_to_micros(trade_data.timestamp as i64);
                     if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
                         if overall_latency >= 0 {
                             self.base_processor.metrics.update_overall_latency(overall_latency as u64);
@@ -955,9 +955,9 @@ impl ExchangeProcessor for DeribitProcessor {
                     }
 
                     let trade_side = match trade_data.direction.as_str() {
-                        "buy" => crate::oms::Side::Buy,
-                        "sell" => crate::oms::Side::Sell,
-                        _ => return Err(crate::error::AppError::Pipeline {
+                        "buy" => Side::Buy,
+                        "sell" => Side::Sell,
+                        _ => return Err(crate::xcommons::error::AppError::Pipeline {
                             message: format!("Invalid trade direction: {}", trade_data.direction),
                         }),
                     };
@@ -966,10 +966,10 @@ impl ExchangeProcessor for DeribitProcessor {
                     let ticker = trade_data.instrument_name.replace('-', "");
 
                     let seq_id = self.next_sequence_id();
-                    let trade = crate::types::TradeUpdate {
-                        timestamp: crate::types::time::millis_to_micros(trade_data.timestamp as i64),
+                    let trade = crate::xcommons::types::TradeUpdate {
+                        timestamp: crate::xcommons::types::time::millis_to_micros(trade_data.timestamp as i64),
                         rcv_timestamp,
-                        exchange: crate::types::ExchangeId::Deribit,
+                        exchange: crate::xcommons::types::ExchangeId::Deribit,
                         ticker,
                         seq_id,
                         packet_id: packet_id as i64,
@@ -985,7 +985,7 @@ impl ExchangeProcessor for DeribitProcessor {
                 }
 
                 // Calculate transformation time
-                let transform_end = crate::types::time::now_micros();
+                let transform_end = crate::xcommons::types::time::now_micros();
                 if let Some(transform_time) = transform_end.checked_sub(transform_start) {
                     self.base_processor
                         .metrics
@@ -1001,7 +1001,7 @@ impl ExchangeProcessor for DeribitProcessor {
                 self.base_processor.metrics.update_packet_metrics(1, trade_count, message_bytes);
 
                 // Calculate CODE LATENCY: From network packet arrival to business logic ready
-                let processing_complete = crate::types::time::now_micros();
+                let processing_complete = crate::xcommons::types::time::now_micros();
                 if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
                     if code_latency >= 0 {
                         self.base_processor.metrics.update_code_latency(code_latency as u64);

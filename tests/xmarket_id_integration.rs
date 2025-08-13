@@ -1,5 +1,5 @@
-use xtrader::xmarket_id::XMarketId;
-use xtrader::types::ExchangeId;
+use xtrader::xcommons::xmarket_id::XMarketId;
+use xtrader::xcommons::types::ExchangeId;
 
 // Fetch Binance Futures symbols via /fapi/v1/exchangeInfo
 async fn fetch_binance_futures_symbols() -> anyhow::Result<Vec<String>> {

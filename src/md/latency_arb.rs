@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+//
 
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
@@ -7,12 +7,12 @@ use tokio_util::sync::CancellationToken;
 use tokio::time::{sleep, Duration};
 
 use crate::cli::{Exchange, SubscriptionSpec};
-use crate::error::{AppError, Result};
+use crate::xcommons::error::{AppError, Result};
 use crate::exchanges::{ExchangeConnector, ProcessorFactory, ConnectorFactory};
 use std::time::Instant;
 use crate::exchanges::okx::InstrumentRegistry;
-use crate::types::{RawMessage, StreamData};
-use crate::pipeline::processor::MetricsReporter;
+use crate::xcommons::types::{RawMessage, StreamData};
+use crate::md::processor::MetricsReporter;
 
 /// Per-subscription arbitration configuration
 #[derive(Debug, Clone, Copy, Default)]
@@ -35,7 +35,7 @@ impl LatencyArbGroup {
 
     /// Accept a raw message from a connector (placeholder API to be wired later)
     pub fn on_raw_message(&mut self, _connector_id: usize, _raw: RawMessage) {
-        // TODO: implement arbitration logic
+        // Arbitration logic placeholder: will be wired with selection rules
     }
 }
 
@@ -64,11 +64,11 @@ pub async fn run_arbitrated_trades(
     let processor = match subscription.exchange {
         Exchange::BinanceFutures => ProcessorFactory::create_binance_processor(),
         Exchange::OkxSwap => ProcessorFactory::create_processor(
-            crate::types::ExchangeId::OkxSwap,
+            crate::xcommons::types::ExchangeId::OkxSwap,
             okx_swap_registry.clone(),
         ),
         Exchange::OkxSpot => ProcessorFactory::create_processor(
-            crate::types::ExchangeId::OkxSpot,
+            crate::xcommons::types::ExchangeId::OkxSpot,
             okx_spot_registry.clone(),
         ),
         Exchange::Deribit => ProcessorFactory::create_deribit_processor(),
@@ -79,7 +79,7 @@ pub async fn run_arbitrated_trades(
     // Metrics reporter (matches unified handler behavior)
     let mut reporter = if verbose { Some(MetricsReporter::new(subscription.instrument.clone(), 10)) } else { None };
     if let Some(ref mut rep) = reporter {
-        let ex = match subscription.exchange { Exchange::BinanceFutures => crate::types::ExchangeId::BinanceFutures, Exchange::OkxSwap => crate::types::ExchangeId::OkxSwap, Exchange::OkxSpot => crate::types::ExchangeId::OkxSpot, Exchange::Deribit => crate::types::ExchangeId::Deribit };
+        let ex = match subscription.exchange { Exchange::BinanceFutures => crate::xcommons::types::ExchangeId::BinanceFutures, Exchange::OkxSwap => crate::xcommons::types::ExchangeId::OkxSwap, Exchange::OkxSpot => crate::xcommons::types::ExchangeId::OkxSpot, Exchange::Deribit => crate::xcommons::types::ExchangeId::Deribit };
         rep.set_exchange(ex);
         rep.set_stream_type("TRADES");
     }
@@ -150,8 +150,8 @@ pub async fn run_arbitrated_trades(
     drop(raw_tx);
 
     // Deduper for trades (exchange+symbol+trade_id) with LRU+TTL
-    use crate::pipeline::deduper::Deduper;
-    let mut trade_deduper: Deduper<(crate::types::ExchangeId, String, String)> =
+    use crate::md::deduper::Deduper;
+    let mut trade_deduper: Deduper<(crate::xcommons::types::ExchangeId, String, String)> =
         Deduper::new(200_000, Duration::from_secs(300));
 
     // Simple per-connector accounting
@@ -216,7 +216,7 @@ pub async fn run_arbitrated_trades(
         let Some((conn_id, raw_msg)) = next else { break; };
         if verbose { log::debug!("[arb][L2][{}] recv from conn={}", index, conn_id); }
         // Process through processor (unified path) as Trade stream
-        let rcv_timestamp = crate::types::time::now_micros();
+        let rcv_timestamp = crate::xcommons::types::time::now_micros();
         let packet_id = processor.next_packet_id();
         let message_bytes = raw_msg.data.len() as u32;
         let stream_data = processor.process_unified_message(
@@ -225,7 +225,7 @@ pub async fn run_arbitrated_trades(
             rcv_timestamp,
             packet_id,
             message_bytes,
-            crate::types::StreamType::Trade,
+            crate::xcommons::types::StreamType::Trade,
         )?;
 
         for data in stream_data {
@@ -296,11 +296,11 @@ pub async fn run_arbitrated_l2(
     let processor = match subscription.exchange {
         Exchange::BinanceFutures => ProcessorFactory::create_binance_processor(),
         Exchange::OkxSwap => ProcessorFactory::create_processor(
-            crate::types::ExchangeId::OkxSwap,
+            crate::xcommons::types::ExchangeId::OkxSwap,
             okx_swap_registry.clone(),
         ),
         Exchange::OkxSpot => ProcessorFactory::create_processor(
-            crate::types::ExchangeId::OkxSpot,
+            crate::xcommons::types::ExchangeId::OkxSpot,
             okx_spot_registry.clone(),
         ),
         Exchange::Deribit => ProcessorFactory::create_deribit_processor(),
@@ -310,7 +310,7 @@ pub async fn run_arbitrated_l2(
     // Metrics reporter for L2
     let mut reporter = if verbose { Some(MetricsReporter::new(subscription.instrument.clone(), 10)) } else { None };
     if let Some(ref mut rep) = reporter {
-        let ex = match subscription.exchange { Exchange::BinanceFutures => crate::types::ExchangeId::BinanceFutures, Exchange::OkxSwap => crate::types::ExchangeId::OkxSwap, Exchange::OkxSpot => crate::types::ExchangeId::OkxSpot, Exchange::Deribit => crate::types::ExchangeId::Deribit };
+        let ex = match subscription.exchange { Exchange::BinanceFutures => crate::xcommons::types::ExchangeId::BinanceFutures, Exchange::OkxSwap => crate::xcommons::types::ExchangeId::OkxSwap, Exchange::OkxSpot => crate::xcommons::types::ExchangeId::OkxSpot, Exchange::Deribit => crate::xcommons::types::ExchangeId::Deribit };
         rep.set_exchange(ex);
         rep.set_stream_type("L2");
     }
@@ -395,7 +395,7 @@ pub async fn run_arbitrated_l2(
     drop(raw_tx);
 
     // First-arrival arbitration (no continuity gating): L2 deduper by event key with LRU+TTL
-    use crate::pipeline::deduper::Deduper as L2Deduper;
+    use crate::md::deduper::Deduper as L2Deduper;
     let mut seen_events: L2Deduper<(i64, i64)> = L2Deduper::new(500_000, Duration::from_secs(300));
     let mut first_wins: HashMap<usize, u64> = HashMap::default(); // cumulative
     let mut first_wins_window: HashMap<usize, u64> = HashMap::default(); // per-rotation window
@@ -474,7 +474,7 @@ pub async fn run_arbitrated_l2(
                 let Some((conn_id, raw_msg)) = msg else { break; };
                 // drain any ip updates
                 while let Ok((id, ip)) = ip_rx.try_recv() { conn_ip.insert(id, ip); }
-                let rcv_timestamp = crate::types::time::now_micros();
+        let rcv_timestamp = crate::xcommons::types::time::now_micros();
                 let packet_id = processor.next_packet_id();
                 let message_bytes = raw_msg.data.len() as u32;
                 let stream_data = processor.process_unified_message(
@@ -483,7 +483,7 @@ pub async fn run_arbitrated_l2(
                     rcv_timestamp,
                     packet_id,
                     message_bytes,
-                    crate::types::StreamType::L2,
+                    crate::xcommons::types::StreamType::L2,
                 )?;
 
         // First-arrival dedupe: forward first event only; drop duplicates from other connection

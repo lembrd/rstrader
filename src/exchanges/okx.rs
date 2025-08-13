@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+//
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
@@ -10,13 +10,13 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tokio::net::lookup_host;
 
-use crate::error::{AppError, Result};
+use crate::xcommons::error::{AppError, Result};
 use crate::exchanges::ExchangeConnector;
-use crate::types::{
+use crate::xcommons::types::{
     ConnectionStatus, ExchangeId, OrderBookL2Update, OrderBookL2UpdateBuilder,
     OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate,
 };
-use crate::oms::Side;
+use crate::xcommons::oms::Side;
 use fast_float;
 
 /// OKX WebSocket message wrapper for different types
@@ -579,7 +579,7 @@ impl OkxConnector {
                 AppError::parse(format!("Invalid timestamp '{}': {}", data.timestamp, e))
             })?;
 
-            let timestamp_micros = crate::types::time::millis_to_micros(timestamp);
+            let timestamp_micros = crate::xcommons::types::time::millis_to_micros(timestamp);
             let seq_id = data.seq_id.unwrap_or(0);
             let first_update_id = data.prev_seq_id.unwrap_or(seq_id);
 
@@ -674,7 +674,7 @@ impl OkxConnector {
         let ticker = self.convert_symbol_from_okx(&trade_data.inst_id);
 
         Ok(TradeUpdate {
-            timestamp: crate::types::time::millis_to_micros(timestamp),
+            timestamp: crate::xcommons::types::time::millis_to_micros(timestamp),
             rcv_timestamp,
             exchange: self.exchange_id,
             ticker,
@@ -1026,7 +1026,7 @@ pub fn create_okx_spot_connector() -> OkxConnector {
 pub struct OkxProcessor {
     base: crate::exchanges::BaseProcessor,
     okx_registry: Option<std::sync::Arc<InstrumentRegistry>>,
-    exchange_id: crate::types::ExchangeId,
+    exchange_id: crate::xcommons::types::ExchangeId,
     // Performance optimizations
     symbol_cache: std::collections::HashMap<String, String>, // Cache for symbol conversions
     metadata_cache: std::collections::HashMap<String, InstrumentMetadata>, // Cache for metadata lookups
@@ -1036,7 +1036,7 @@ pub struct OkxProcessor {
 
 impl OkxProcessor {
     pub fn new(
-        exchange_id: crate::types::ExchangeId,
+        exchange_id: crate::xcommons::types::ExchangeId,
         registry: Option<std::sync::Arc<InstrumentRegistry>>,
     ) -> Self {
         Self {
@@ -1080,7 +1080,7 @@ impl OkxProcessor {
     /// Convert symbol to OKX format returning owned string (for avoiding borrow conflicts)
     fn convert_symbol_to_okx_format_owned(&self, symbol: &str) -> String {
         match self.exchange_id {
-            crate::types::ExchangeId::OkxSwap => {
+            crate::xcommons::types::ExchangeId::OkxSwap => {
                 // For SWAP: BTC-USDT-SWAP
                 if symbol.ends_with("USDT") {
                     let base = &symbol[..symbol.len() - 4];
@@ -1092,7 +1092,7 @@ impl OkxProcessor {
                     symbol.to_string()
                 }
             }
-            crate::types::ExchangeId::OkxSpot => {
+            crate::xcommons::types::ExchangeId::OkxSpot => {
                 // For SPOT: BTC-USDT
                 if symbol.ends_with("USDT") {
                     let base = &symbol[..symbol.len() - 4];
@@ -1111,7 +1111,7 @@ impl OkxProcessor {
     /// Convert OKX symbol format back to standard format
     fn convert_symbol_from_okx(&self, okx_symbol: &str) -> String {
         match self.exchange_id {
-            crate::types::ExchangeId::OkxSwap => {
+            crate::xcommons::types::ExchangeId::OkxSwap => {
                 // Convert BTC-USDT-SWAP -> BTCUSDT
                 if let Some(base_part) = okx_symbol.strip_suffix("-SWAP") {
                     base_part.replace('-', "")
@@ -1119,7 +1119,7 @@ impl OkxProcessor {
                     okx_symbol.replace('-', "")
                 }
             }
-            crate::types::ExchangeId::OkxSpot => {
+            crate::xcommons::types::ExchangeId::OkxSpot => {
                 // Convert BTC-USDT -> BTCUSDT
                 okx_symbol.replace('-', "")
             }
@@ -1129,7 +1129,7 @@ impl OkxProcessor {
 }
 
 impl crate::exchanges::ExchangeProcessor for OkxProcessor {
-    type Error = crate::error::AppError;
+    type Error = crate::xcommons::error::AppError;
 
     fn base_processor(&mut self) -> &mut crate::exchanges::BaseProcessor {
         &mut self.base
@@ -1141,12 +1141,12 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
     fn process_message(
         &mut self,
-        raw_msg: crate::types::RawMessage,
+        raw_msg: crate::xcommons::types::RawMessage,
         symbol: &str,
         rcv_timestamp: i64,
         packet_id: u64,
         message_bytes: u32,
-    ) -> std::result::Result<Vec<crate::types::OrderBookL2Update>, Self::Error> {
+    ) -> std::result::Result<Vec<crate::xcommons::types::OrderBookL2Update>, Self::Error> {
         // Track message received
         self.base.metrics.increment_received();
 
@@ -1161,7 +1161,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         // Parse OKX message JSON
         let okx_message: OkxMessage = serde_json::from_slice(&raw_msg.data).map_err(|e| {
             self.base.metrics.increment_parse_errors();
-            crate::error::AppError::pipeline(format!("Failed to parse OKX message JSON: {}", e))
+            crate::xcommons::error::AppError::pipeline(format!("Failed to parse OKX message JSON: {}", e))
         })?;
 
         let depth_update = match okx_message {
@@ -1172,7 +1172,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             }
             OkxMessage::Error { .. } => {
                 self.base.metrics.increment_parse_errors();
-                return Err(crate::error::AppError::pipeline(
+                return Err(crate::xcommons::error::AppError::pipeline(
                     "OKX error message received".to_string(),
                 ));
             }
@@ -1182,7 +1182,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         self.base.updates_buffer.clear();
 
         // Start transformation timing
-        let transform_start = crate::types::time::now_micros();
+        let transform_start = crate::xcommons::types::time::now_micros();
 
         // Get OKX symbol format for metadata lookup once (avoid borrowing issues)
         let okx_symbol = self.convert_symbol_to_okx_format_owned(symbol);
@@ -1193,13 +1193,13 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
         for data in &depth_update.data {
             let timestamp = data.timestamp.parse::<i64>().map_err(|e| {
-                crate::error::AppError::parse(format!(
+                crate::xcommons::error::AppError::parse(format!(
                     "Invalid timestamp '{}': {}",
                     data.timestamp, e
                 ))
             })?;
 
-            let timestamp_micros = crate::types::time::millis_to_micros(timestamp);
+            let timestamp_micros = crate::xcommons::types::time::millis_to_micros(timestamp);
 
             // Calculate overall latency (local time vs exchange timestamp)
             if let Some(overall_latency_us) = rcv_timestamp.checked_sub(timestamp_micros) {
@@ -1232,7 +1232,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             if let Some(prev) = self.last_seq_id {
                 if let Some(prev_seq) = data.prev_seq_id {
                     if prev_seq != prev {
-                        return Err(crate::error::AppError::pipeline(
+                        return Err(crate::xcommons::error::AppError::pipeline(
                             format!("OKX sequence gap: prev_seq_id={} last_seq_id={}", prev_seq, prev),
                         ));
                     }
@@ -1248,13 +1248,13 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             for bid_entry in &data.bids {
                 if bid_entry.len() >= 2 {
                     let price = fast_float::parse::<f64, _>(&bid_entry[0]).map_err(|e| {
-                        crate::error::AppError::pipeline(format!(
+                        crate::xcommons::error::AppError::pipeline(format!(
                             "Invalid bid price '{}': {}",
                             bid_entry[0], e
                         ))
                     })?;
                     let raw_size = fast_float::parse::<f64, _>(&bid_entry[1]).map_err(|e| {
-                        crate::error::AppError::pipeline(format!(
+                        crate::xcommons::error::AppError::pipeline(format!(
                             "Invalid bid size '{}': {}",
                             bid_entry[1], e
                         ))
@@ -1282,7 +1282,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
                     };
 
                     let sequence_id = self.next_sequence_id();
-                    let builder = crate::types::OrderBookL2UpdateBuilder::new(
+                    let builder = crate::xcommons::types::OrderBookL2UpdateBuilder::new(
                         timestamp_micros,
                         rcv_timestamp,
                         self.exchange_id,
@@ -1303,13 +1303,13 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             for ask_entry in &data.asks {
                 if ask_entry.len() >= 2 {
                     let price = fast_float::parse::<f64, _>(&ask_entry[0]).map_err(|e| {
-                        crate::error::AppError::pipeline(format!(
+                        crate::xcommons::error::AppError::pipeline(format!(
                             "Invalid ask price '{}': {}",
                             ask_entry[0], e
                         ))
                     })?;
                     let raw_size = fast_float::parse::<f64, _>(&ask_entry[1]).map_err(|e| {
-                        crate::error::AppError::pipeline(format!(
+                        crate::xcommons::error::AppError::pipeline(format!(
                             "Invalid ask size '{}': {}",
                             ask_entry[1], e
                         ))
@@ -1337,7 +1337,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
                     };
 
                     let sequence_id = self.next_sequence_id();
-                    let builder = crate::types::OrderBookL2UpdateBuilder::new(
+                    let builder = crate::xcommons::types::OrderBookL2UpdateBuilder::new(
                         timestamp_micros,
                         rcv_timestamp,
                         self.exchange_id,
@@ -1356,7 +1356,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         }
 
         // Calculate transformation time
-        let transform_end = crate::types::time::now_micros();
+        let transform_end = crate::xcommons::types::time::now_micros();
         if let Some(transform_time) = transform_end.checked_sub(transform_start) {
             self.base
                 .metrics
@@ -1382,7 +1382,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
         // Calculate CODE LATENCY: From network packet arrival to business logic ready
         // This measures the FULL time spent in Rust code processing
-        let processing_complete = crate::types::time::now_micros();
+        let processing_complete = crate::xcommons::types::time::now_micros();
         if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
             if code_latency >= 0 {
                 self.base.metrics.update_code_latency(code_latency as u64);
@@ -1395,12 +1395,12 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
     fn process_trade_message(
         &mut self,
-        raw_msg: crate::types::RawMessage,
+        raw_msg: crate::xcommons::types::RawMessage,
         _symbol: &str,
         rcv_timestamp: i64,
         packet_id: u64,
         message_bytes: u32,
-    ) -> std::result::Result<Vec<crate::types::TradeUpdate>, Self::Error> {
+    ) -> std::result::Result<Vec<crate::xcommons::types::TradeUpdate>, Self::Error> {
         // Track message received
         self.base.metrics.increment_received();
 
@@ -1413,13 +1413,13 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             .as_micros() as i64;
 
         // Parse OKX message with timing
-        let parse_start = crate::types::time::now_micros();
+        let parse_start = crate::xcommons::types::time::now_micros();
         let mut data_bytes = raw_msg.data;
         
         // First try to parse as generic OKX message to handle different types
         let okx_message: serde_json::Value = serde_json::from_slice(&mut data_bytes).map_err(|e| {
             self.base.metrics.increment_parse_errors();
-            crate::error::AppError::pipeline(format!("Failed to parse OKX message: {}", e))
+            crate::xcommons::error::AppError::pipeline(format!("Failed to parse OKX message: {}", e))
         })?;
 
         // Check if this is a subscription confirmation or error message
@@ -1445,17 +1445,17 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         // If no event field, this should be a data message - parse as trade update
         let trade_message: OkxTradeUpdate = serde_json::from_value(okx_message).map_err(|e| {
             self.base.metrics.increment_parse_errors();
-            crate::error::AppError::pipeline(format!("Failed to parse OKX trade data: {}", e))
+            crate::xcommons::error::AppError::pipeline(format!("Failed to parse OKX trade data: {}", e))
         })?;
 
         // Calculate parse time
-        let parse_end = crate::types::time::now_micros();
+        let parse_end = crate::xcommons::types::time::now_micros();
         if let Some(parse_time) = parse_end.checked_sub(parse_start) {
             self.base.metrics.update_parse_time(parse_time as u64);
         }
 
         // Start transformation timing
-        let transform_start = crate::types::time::now_micros();
+        let transform_start = crate::xcommons::types::time::now_micros();
 
         // Calculate overhead time (time between parse end and transform start)
         if let Some(overhead_time) = transform_start.checked_sub(parse_end) {
@@ -1468,27 +1468,27 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         for trade_data in trade_message.data {
             // Parse price and size using fast_float for performance
             let price = fast_float::parse::<f64, _>(&trade_data.price).map_err(|e| {
-                crate::error::AppError::pipeline(format!("Invalid trade price '{}': {}", trade_data.price, e))
+                crate::xcommons::error::AppError::pipeline(format!("Invalid trade price '{}': {}", trade_data.price, e))
             })?;
 
             // Handle size conversion based on exchange type
             let size = if let Some(ref _registry) = self.okx_registry {
                 // Use registry for contract size conversion if available
                 let size = fast_float::parse::<f64, _>(&trade_data.size).map_err(|e| {
-                    crate::error::AppError::pipeline(format!("Invalid trade size '{}': {}", trade_data.size, e))
+                    crate::xcommons::error::AppError::pipeline(format!("Invalid trade size '{}': {}", trade_data.size, e))
                 })?;
                 // TODO: Apply contract multiplier if needed
                 size
             } else {
                 fast_float::parse::<f64, _>(&trade_data.size).map_err(|e| {
-                    crate::error::AppError::pipeline(format!("Invalid trade size '{}': {}", trade_data.size, e))
+                    crate::xcommons::error::AppError::pipeline(format!("Invalid trade size '{}': {}", trade_data.size, e))
                 })?
             };
 
             // Parse trade side
             let trade_side = match trade_data.side.as_str() {
-                "buy" => crate::oms::Side::Buy,
-                "sell" => crate::oms::Side::Sell,
+                "buy" => Side::Buy,
+                "sell" => Side::Sell,
                 _ => {
                     log::warn!("Unknown OKX trade side: {}", trade_data.side);
                     continue; // Skip this trade
@@ -1497,9 +1497,9 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
             // Parse timestamp (OKX provides milliseconds since epoch)
             let timestamp_ms = trade_data.timestamp.parse::<i64>().map_err(|e| {
-                crate::error::AppError::pipeline(format!("Invalid timestamp '{}': {}", trade_data.timestamp, e))
+                crate::xcommons::error::AppError::pipeline(format!("Invalid timestamp '{}': {}", trade_data.timestamp, e))
             })?;
-            let exchange_ts_us = crate::types::time::millis_to_micros(timestamp_ms);
+            let exchange_ts_us = crate::xcommons::types::time::millis_to_micros(timestamp_ms);
 
             // Calculate overall latency (local time vs exchange timestamp) for trades as well
             if let Some(overall_latency_us) = rcv_timestamp.checked_sub(exchange_ts_us) {
@@ -1520,7 +1520,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             }
 
             let seq_id = self.next_sequence_id();
-            let trade = crate::types::TradeUpdate {
+            let trade = crate::xcommons::types::TradeUpdate {
                 timestamp: exchange_ts_us, 
                 rcv_timestamp,
                 exchange: self.exchange_id,
@@ -1539,7 +1539,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         }
 
         // Calculate transformation time
-        let transform_end = crate::types::time::now_micros();
+        let transform_end = crate::xcommons::types::time::now_micros();
         if let Some(transform_time) = transform_end.checked_sub(transform_start) {
             self.base.metrics.update_transform_time(transform_time as u64);
         }
@@ -1553,7 +1553,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         self.base.metrics.update_packet_metrics(1, trades_count, message_bytes);
 
         // Calculate CODE LATENCY: From network packet arrival to business logic ready
-        let processing_complete = crate::types::time::now_micros();
+        let processing_complete = crate::xcommons::types::time::now_micros();
         if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
             if code_latency >= 0 {
                 self.base.metrics.update_code_latency(code_latency as u64);

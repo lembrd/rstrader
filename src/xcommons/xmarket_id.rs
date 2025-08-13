@@ -1,5 +1,5 @@
 use xxhash_rust::xxh3::xxh3_64_with_seed;
-use crate::types::ExchangeId;
+use crate::xcommons::types::ExchangeId;
 
 /// XMarketId provides stable 64-bit identifiers for (exchange, symbol)
 /// using a composite scheme: high 8 bits = exchange id, low 56 bits = XXH3 hash of normalized symbol.

@@ -1,5 +1,7 @@
 #![allow(dead_code)]
-use crate::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, RawMessage};
+use crate::xcommons::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, RawMessage};
+use crate::xcommons::error as error;
+use crate::xcommons::types as types;
 use async_trait::async_trait;
 
 pub mod binance;
@@ -128,8 +130,8 @@ pub trait ExchangeConnector: Send + Sync {
 pub struct BaseProcessor {
     pub sequence_counter: i64,
     pub packet_counter: i64,
-    pub metrics: crate::types::Metrics,
-    pub updates_buffer: Vec<crate::types::OrderBookL2Update>,
+    pub metrics: crate::xcommons::types::Metrics,
+    pub updates_buffer: Vec<crate::xcommons::types::OrderBookL2Update>,
 }
 
 impl BaseProcessor {
@@ -137,9 +139,9 @@ impl BaseProcessor {
     pub fn new() -> Self {
         let metrics = {
             #[cfg(feature = "metrics-hdr")]
-            let mut m = crate::types::Metrics::new();
+            let mut m = crate::xcommons::types::Metrics::new();
             #[cfg(not(feature = "metrics-hdr"))]
-            let m = crate::types::Metrics::new();
+            let m = crate::xcommons::types::Metrics::new();
             #[cfg(feature = "metrics-hdr")]
             {
                 m.enable_histograms(crate::metrics::HistogramBounds::default());
@@ -169,41 +171,41 @@ pub trait ExchangeProcessor: Send + Sync {
     /// Process raw message and return normalized updates
     fn process_message(
         &mut self,
-        raw_msg: crate::types::RawMessage,
+        raw_msg: crate::xcommons::types::RawMessage,
         symbol: &str,
         rcv_timestamp: i64,
         packet_id: u64,
         message_bytes: u32,
-    ) -> Result<Vec<crate::types::OrderBookL2Update>, Self::Error>;
+    ) -> Result<Vec<crate::xcommons::types::OrderBookL2Update>, Self::Error>;
 
     /// Process raw trade message and return normalized trade updates
     fn process_trade_message(
         &mut self,
-        raw_msg: crate::types::RawMessage,
+        raw_msg: crate::xcommons::types::RawMessage,
         symbol: &str,
         rcv_timestamp: i64,
         packet_id: u64,
         message_bytes: u32,
-    ) -> Result<Vec<crate::types::TradeUpdate>, Self::Error>;
+    ) -> Result<Vec<crate::xcommons::types::TradeUpdate>, Self::Error>;
 
     /// Process raw message and return unified stream data
     fn process_unified_message(
         &mut self,
-        raw_msg: crate::types::RawMessage,
+        raw_msg: crate::xcommons::types::RawMessage,
         symbol: &str,
         rcv_timestamp: i64,
         packet_id: u64,
         message_bytes: u32,
-        stream_type: crate::types::StreamType,
-    ) -> Result<Vec<crate::types::StreamData>, Self::Error> {
+        stream_type: crate::xcommons::types::StreamType,
+    ) -> Result<Vec<crate::xcommons::types::StreamData>, Self::Error> {
         match stream_type {
-            crate::types::StreamType::L2 => {
+            crate::xcommons::types::StreamType::L2 => {
                 let l2_updates = self.process_message(raw_msg, symbol, rcv_timestamp, packet_id, message_bytes)?;
-                Ok(l2_updates.into_iter().map(crate::types::StreamData::L2).collect())
+                Ok(l2_updates.into_iter().map(crate::xcommons::types::StreamData::L2).collect())
             }
-            crate::types::StreamType::Trade => {
+            crate::xcommons::types::StreamType::Trade => {
                 let trade_updates = self.process_trade_message(raw_msg, symbol, rcv_timestamp, packet_id, message_bytes)?;
-                Ok(trade_updates.into_iter().map(crate::types::StreamData::Trade).collect())
+                Ok(trade_updates.into_iter().map(crate::xcommons::types::StreamData::Trade).collect())
             }
         }
     }
@@ -215,7 +217,7 @@ pub trait ExchangeProcessor: Send + Sync {
     fn base_processor_ref(&self) -> &BaseProcessor;
 
     /// Get processor metrics
-    fn metrics(&self) -> &crate::types::Metrics {
+    fn metrics(&self) -> &crate::xcommons::types::Metrics {
         &self.base_processor_ref().metrics
     }
 
@@ -247,7 +249,7 @@ pub struct ProcessorFactory;
 
 impl ProcessorFactory {
     /// Create processor for Binance Futures
-    pub fn create_binance_processor() -> Box<dyn ExchangeProcessor<Error = crate::error::AppError>>
+    pub fn create_binance_processor() -> Box<dyn ExchangeProcessor<Error = crate::xcommons::error::AppError>>
     {
         Box::new(binance::BinanceProcessor::new())
     }
@@ -255,9 +257,9 @@ impl ProcessorFactory {
     /// Create processor for OKX SWAP
     pub fn create_okx_swap_processor(
         registry: Option<std::sync::Arc<okx::InstrumentRegistry>>,
-    ) -> Box<dyn ExchangeProcessor<Error = crate::error::AppError>> {
+    ) -> Box<dyn ExchangeProcessor<Error = crate::xcommons::error::AppError>> {
         Box::new(okx::OkxProcessor::new(
-            crate::types::ExchangeId::OkxSwap,
+            crate::xcommons::types::ExchangeId::OkxSwap,
             registry,
         ))
     }
@@ -265,29 +267,29 @@ impl ProcessorFactory {
     /// Create processor for OKX SPOT
     pub fn create_okx_spot_processor(
         registry: Option<std::sync::Arc<okx::InstrumentRegistry>>,
-    ) -> Box<dyn ExchangeProcessor<Error = crate::error::AppError>> {
+    ) -> Box<dyn ExchangeProcessor<Error = crate::xcommons::error::AppError>> {
         Box::new(okx::OkxProcessor::new(
-            crate::types::ExchangeId::OkxSpot,
+            crate::xcommons::types::ExchangeId::OkxSpot,
             registry,
         ))
     }
 
     /// Create processor for Deribit
-    pub fn create_deribit_processor() -> Box<dyn ExchangeProcessor<Error = crate::error::AppError>>
+    pub fn create_deribit_processor() -> Box<dyn ExchangeProcessor<Error = crate::xcommons::error::AppError>>
     {
         Box::new(deribit::DeribitProcessor::new())
     }
 
     /// Create processor by exchange ID
     pub fn create_processor(
-        exchange_id: crate::types::ExchangeId,
+        exchange_id: crate::xcommons::types::ExchangeId,
         okx_registry: Option<std::sync::Arc<okx::InstrumentRegistry>>,
-    ) -> Box<dyn ExchangeProcessor<Error = crate::error::AppError>> {
+    ) -> Box<dyn ExchangeProcessor<Error = crate::xcommons::error::AppError>> {
         match exchange_id {
-            crate::types::ExchangeId::BinanceFutures => Self::create_binance_processor(),
-            crate::types::ExchangeId::OkxSwap => Self::create_okx_swap_processor(okx_registry),
-            crate::types::ExchangeId::OkxSpot => Self::create_okx_spot_processor(okx_registry),
-            crate::types::ExchangeId::Deribit => Self::create_deribit_processor(),
+            crate::xcommons::types::ExchangeId::BinanceFutures => Self::create_binance_processor(),
+            crate::xcommons::types::ExchangeId::OkxSwap => Self::create_okx_swap_processor(okx_registry),
+            crate::xcommons::types::ExchangeId::OkxSpot => Self::create_okx_spot_processor(okx_registry),
+            crate::xcommons::types::ExchangeId::Deribit => Self::create_deribit_processor(),
         }
     }
 }
@@ -300,7 +302,7 @@ impl ConnectorFactory {
         exchange: crate::cli::Exchange,
         okx_swap_registry: Option<std::sync::Arc<okx::InstrumentRegistry>>,
         okx_spot_registry: Option<std::sync::Arc<okx::InstrumentRegistry>>,
-    ) -> Box<dyn ExchangeConnector<Error = crate::error::AppError>> {
+    ) -> Box<dyn ExchangeConnector<Error = crate::xcommons::error::AppError>> {
         match exchange {
             crate::cli::Exchange::BinanceFutures => Box::new(binance::BinanceFuturesConnector::new()),
             crate::cli::Exchange::OkxSwap => {

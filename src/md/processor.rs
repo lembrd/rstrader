@@ -1,20 +1,20 @@
-#![allow(dead_code)]
+//
 use tokio::sync::mpsc;
 
-use crate::error::{AppError, Result};
-use crate::types::{Metrics, OrderBookL2Update, RawMessage, time};
+use crate::xcommons::error::{AppError, Result};
+use crate::xcommons::types::{Metrics, OrderBookL2Update, RawMessage, time};
 // Exchange-specific processors now implement ExchangeProcessor trait
-use crate::types::ExchangeId;
+use crate::xcommons::types::ExchangeId;
 
 /// Stream processor for transforming raw messages to unified format
 /// Now uses trait-based architecture for exchange-specific processing
 pub struct StreamProcessor {
-    processor: Box<dyn crate::exchanges::ExchangeProcessor<Error = crate::error::AppError>>,
+    processor: Box<dyn crate::exchanges::ExchangeProcessor<Error = crate::xcommons::error::AppError>>,
 }
 
 impl StreamProcessor {
     pub fn new(
-        processor: Box<dyn crate::exchanges::ExchangeProcessor<Error = crate::error::AppError>>,
+        processor: Box<dyn crate::exchanges::ExchangeProcessor<Error = crate::xcommons::error::AppError>>,
     ) -> Self {
         Self { processor }
     }
