@@ -28,6 +28,11 @@ parquet = "53.0"
 tempfile = "3.10"
 ryu = "1.0"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+deadpool-postgres = "0.12"
 
 # Error handling
 anyhow = "1.0"

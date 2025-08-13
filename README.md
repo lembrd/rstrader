@@ -236,6 +236,70 @@ Throughput: ~13–16 M ids/s
 - `src/strats/`: Strategy API and concrete strategies
   - `src/strats/api.rs`: `Strategy`, `StrategyContext`, and registry types
   - `src/strats/md_collector/`: market data collector strategy (config + implementation)
+  
+#### Strategy API (simplified)
+
+- Strategies implement a small, high-level API and delegate low-level concerns to the application environment.
+- API:
+
+```rust
+#[async_trait]
+pub trait Strategy {
+    type Config: DeserializeOwned + Send + Sync + 'static;
+    fn name(&self) -> &'static str;
+    async fn start(&self, ctx: StrategyContext, cfg: Self::Config) -> AppResult<()>;
+    async fn stop(&self) -> AppResult<()>;
+}
+
+#[derive(Clone)]
+pub struct StrategyContext {
+    pub env: Arc<dyn AppEnvironment>,
+}
+```
+
+Key principles:
+- Strategies should remain orchestration-only. Market data subscriptions, sinks, and trading account runners are started via `AppEnvironment`.
+- No ad-hoc string parsing in strategies: enums are parsed centrally.
+
+#### Typed enum parsing and YAML configs
+
+- CLI enums `Exchange` and `StreamType` implement `FromStr` and derive `serde` so YAML uses constants directly.
+- Example (md_collector.yaml / naive_mm.yaml):
+
+```yaml
+subscriptions:
+  - exchange: BINANCE_FUTURES
+    stream_type: L2
+    instrument: BTCUSDT
+    arb_streams_num: 3
+```
+
+Both `md_collector` and `naive_mm` map `SubscriptionItem` to `SubscriptionSpec` without string matching.
+
+#### Environment responsibilities
+
+- `AppEnvironment` provides:
+  - `start_subscriptions(subscriptions: Vec<SubscriptionSpec>) -> mpsc::Receiver<StreamData>`
+  - `start_sink(config: EnvSinkConfig, rx) -> JoinHandle<Result<()>>`
+  - `start_binance_futures_accounts(params: BinanceAccountParams) -> Vec<JoinHandle<()>>`
+
+Strategies call these to start data flow and account runners. Example (naive_mm):
+
+```rust
+let _runners = ctx.env.start_binance_futures_accounts(BinanceAccountParams {
+    api_key: cfg.binance.api_key.clone(),
+    secret: cfg.binance.secret.clone(),
+    account_id: cfg.binance.account_id,
+    start_epoch_ts: cfg.binance.start_epoch_ts,
+    fee_bps: cfg.binance.fee_bps,
+    contract_size: cfg.binance.contract_size,
+    symbols: cfg.binance.symbols.clone(),
+})?;
+```
+
+#### Position fees: exchange-provided overrides
+
+- `Position` now supports `trade_with_fee(qty, px, Option<f64>)`. When an exchange provides an explicit fee (or rebate), it is applied in place of computed fee; reversals are handled correctly. `AccountState` uses this per execution.
 
 ## Logging & metrics
 - Logging via `env_logger`; set `RUST_LOG` (e.g., `RUST_LOG=info`).

@@ -140,6 +140,29 @@ impl Position {
         }
     }
 
+    /// Execute a trade and optionally override the computed fee with an exchange-provided fee.
+    /// When `exchange_fee` is Some(f), the internally computed fee is replaced by `f`.
+    /// This avoids double-counting while preserving existing PnL/position updates.
+    pub fn trade_with_fee(&mut self, requested_quantity: f64, trade_price: f64, exchange_fee: Option<f64>) {
+        // Perform the normal trade including default fee computation
+        self.trade(requested_quantity, trade_price);
+
+        if let Some(fee_override) = exchange_fee {
+            let abs_qty = requested_quantity.abs();
+            let base_fee = self.fee_percent * abs_qty * trade_price * self.contract_size;
+            // Remove the base fee that was applied in trade()
+            if base_fee != 0.0 {
+                self.fees -= base_fee;
+                self.realized += base_fee;
+            }
+            // Apply the exchange-provided fee
+            if fee_override != 0.0 {
+                self.fees += fee_override;
+                self.realized -= fee_override;
+            }
+        }
+    }
+
     pub fn trade_quote(&mut self, bid: f64, ask: f64, quantity: f64) {
         assert!(bid < ask, "BID={}, ASK={}", bid, ask);
         let price = if quantity > 0.0 { ask } else { bid };
@@ -252,6 +275,40 @@ mod tests {
         assert!(approx_eq(p.fees, 1.0, 1e-12));
         assert!(approx_eq(p.realized, -1.0, 1e-12));
         assert!(approx_eq(p.bps(), -10.0, 1e-12));
+    }
+
+    #[test]
+    fn test_trade_with_fee_override_no_reversal() {
+        let mut p = Position::new(0.001, 1.0); // 10 bps base fee
+        p.trade_with_fee(10.0, 100.0, Some(0.5));
+        // Base fee would be 0.001 * 10 * 100 = 1.0, but exchange provided 0.5
+        assert!(approx_eq(p.fees, 0.5, 1e-12));
+        assert!(approx_eq(p.realized, -0.5, 1e-12));
+    }
+
+    #[test]
+    fn test_trade_with_fee_override_reversal() {
+        let mut p = Position::new(0.001, 1.0); // 10 bps base fee
+        // Open long 5 @ 100 with computed fee
+        p.trade_with_fee(5.0, 100.0, None);
+        // Now sell 10 @ 110 with exchange fee override 0.5 (reversal)
+        p.trade_with_fee(-10.0, 110.0, Some(0.5));
+
+        // After reversal: amount = -5, avp = 110
+        assert!(approx_eq(p.amount, -5.0, 1e-12));
+        assert!(approx_eq(p.avp, 110.0, 1e-12));
+        // Realized: close 5 at 110 vs 100 = +50, fees: first trade 0.5, second override 0.5 → net -1.0
+        assert!(approx_eq(p.fees, 1.0, 1e-12));
+        assert!(approx_eq(p.realized, 49.0, 1e-9));
+    }
+
+    #[test]
+    fn test_trade_with_rebate_override() {
+        let mut p = Position::new(0.001, 1.0);
+        // Trade with negative fee (rebate)
+        p.trade_with_fee(10.0, 100.0, Some(-0.25));
+        assert!(approx_eq(p.fees, -0.25, 1e-12));
+        assert!(approx_eq(p.realized, 0.25, 1e-12));
     }
 }
 

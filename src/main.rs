@@ -6,9 +6,10 @@ mod app;
 mod strats;
 mod md;
 mod xcommons;
+mod trading;
 
 use clap::Parser;
-use cli::{Args, Sink};
+use cli::Args;
 use crate::xcommons::error::{AppError, Result};
 // minimal HTTP server for /metrics via tokio TcpListener to avoid heavy deps
 // use std::sync::{Arc, Mutex};

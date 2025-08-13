@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use crate::cli::{Exchange, StreamType};
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MdCollectorConfig {
     pub runtime: RuntimeSection,
@@ -21,8 +23,8 @@ pub enum SinkSection { Parquet { output_dir: std::path::PathBuf }, Questdb }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubscriptionItem {
-    pub exchange: String,
-    pub stream_type: String,
+    pub exchange: Exchange,
+    pub stream_type: StreamType,
     pub instrument: String,
     #[serde(default = "default_arb_streams_num")] 
     pub arb_streams_num: usize,

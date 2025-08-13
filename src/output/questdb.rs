@@ -8,7 +8,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::xcommons::error::{AppError, Result};
-use crate::xcommons::types::{OrderBookL2Update, StreamData, TradeUpdate, Metrics, ExchangeId};
+use crate::xcommons::types::{OrderBookL2Update, StreamData, TradeUpdate};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_ILP_PORT: u16 = 9009;
@@ -99,12 +99,16 @@ impl StreamWriter {
             trade_buffer: Vec::with_capacity(BATCH_SIZE),
             last_activity: Instant::now(),
             metrics: {
-                let mut m = crate::xcommons::types::Metrics::new();
                 #[cfg(feature = "metrics-hdr")]
                 {
+                    let mut m = crate::xcommons::types::Metrics::new();
                     m.enable_histograms(crate::metrics::HistogramBounds::default());
+                    m
                 }
-                m
+                #[cfg(not(feature = "metrics-hdr"))]
+                {
+                    crate::xcommons::types::Metrics::new()
+                }
             },
             stream_type,
             exchange,
@@ -292,7 +296,7 @@ impl MultiStreamQuestDbSink {
             }
         }
         // Publish lightweight totals to global metrics exporters
-        let mut total = crate::xcommons::types::Metrics::new();
+        let total = crate::xcommons::types::Metrics::new();
         for w in self.writers.values() {
             // We don't keep per-writer metrics here; emit zeros conservatively
             let _ = w; // placeholder in case of future per-writer metrics

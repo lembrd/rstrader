@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod md;
 pub mod exchanges;
 pub mod cli;
+pub mod trading;
 
 // no legacy re-exports in new codebase
 

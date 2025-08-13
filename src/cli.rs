@@ -1,4 +1,6 @@
 use clap::{Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -30,23 +32,29 @@ pub struct Args {
     pub config: Option<PathBuf>,
 }
 
-#[derive(ValueEnum, Clone, Copy, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Exchange {
     #[value(name = "BINANCE_FUTURES")]
+    #[serde(rename = "BINANCE_FUTURES")]
     BinanceFutures,
     #[value(name = "OKX_SWAP")]
+    #[serde(rename = "OKX_SWAP")]
     OkxSwap,
     #[value(name = "OKX_SPOT")]
+    #[serde(rename = "OKX_SPOT")]
     OkxSpot,
     #[value(name = "DERIBIT")]
+    #[serde(rename = "DERIBIT")]
     Deribit,
 }
 
-#[derive(ValueEnum, Clone, Debug, PartialEq)]
+#[derive(ValueEnum, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StreamType {
     #[value(name = "L2")]
+    #[serde(rename = "L2")]
     L2,
     #[value(name = "TRADES")]
+    #[serde(rename = "TRADES")]
     Trades,
 }
 // removed duplicate Sink definition (single definition remains above)
@@ -121,31 +129,11 @@ impl SubscriptionSpec {
             return Err("Instrument cannot be empty".to_string());
         }
 
-        // Parse stream type
-        let stream_type = match stream_type_str {
-            "L2" => StreamType::L2,
-            "TRADES" => StreamType::Trades,
-            _ => {
-                return Err(format!(
-                    "Invalid stream type '{}'. Supported: L2, TRADES",
-                    stream_type_str
-                ));
-            }
-        };
-
-        // Parse exchange
-        let exchange = match exchange_str {
-            "BINANCE_FUTURES" => Exchange::BinanceFutures,
-            "OKX_SWAP" => Exchange::OkxSwap,
-            "OKX_SPOT" => Exchange::OkxSpot,
-            "DERIBIT" => Exchange::Deribit,
-            _ => {
-                return Err(format!(
-                    "Invalid exchange '{}'. Supported: BINANCE_FUTURES, OKX_SWAP, OKX_SPOT, DERIBIT",
-                    exchange_str
-                ));
-            }
-        };
+        // Parse stream type and exchange using FromStr impls
+        let stream_type = <StreamType as std::str::FromStr>::from_str(stream_type_str)
+            .map_err(|e| format!("{}", e))?;
+        let exchange = <Exchange as std::str::FromStr>::from_str(exchange_str)
+            .map_err(|e| format!("{}", e))?;
 
         Ok(SubscriptionSpec {
             stream_type,
@@ -174,6 +162,32 @@ impl SubscriptionSpec {
         }
 
         Ok(subscriptions)
+    }
+}
+
+impl FromStr for StreamType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "L2" => Ok(StreamType::L2),
+            "TRADES" => Ok(StreamType::Trades),
+            other => Err(format!("Invalid stream type '{}'. Supported: L2, TRADES", other)),
+        }
+    }
+}
+
+impl FromStr for Exchange {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "BINANCE_FUTURES" => Ok(Exchange::BinanceFutures),
+            "OKX_SWAP" => Ok(Exchange::OkxSwap),
+            "OKX_SPOT" => Ok(Exchange::OkxSpot),
+            "DERIBIT" => Ok(Exchange::Deribit),
+            other => Err(format!("Invalid exchange '{}'. Supported: BINANCE_FUTURES, OKX_SWAP, OKX_SPOT, DERIBIT", other)),
+        }
     }
 }
 

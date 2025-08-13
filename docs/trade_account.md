@@ -50,8 +50,8 @@ id                       BIGSERIAL PRIMARY KEY
 account_id               BIGINT NOT NULL
 exchange                 TEXT NOT NULL
 instrument               TEXT NOT NULL            -- symbol or instrument id
-exchange_execution_id    TEXT                     -- unique per exchange/account when available
-exchange_order_id        TEXT
+xmarket_id               BIGINT NOT NULL          -- Hashed id from XMarketId
+exchange_execution_id    TEXT NOT NULL            -- unique per exchange/account/instrument
 exchange_ts              TIMESTAMPTZ NOT NULL
 side                     SMALLINT NOT NULL        -- 1=BUY, -1=SELL, 0=NONE
 execution_type           INTEGER NOT NULL         -- int enum: e.g., 0=FILL,1=DELIVERY,2=FUNDING,...
@@ -64,24 +64,9 @@ exchange_sequence        BIGINT                   -- when exchange provides orde
 inserted_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 
 -- idempotency and fast lookups
-UNIQUE (account_id, exchange, exchange_execution_id) WHERE exchange_execution_id IS NOT NULL
+UNIQUE (account_id, xmarket_id, exchange_execution_id, exchange_ts) 
 INDEX (account_id, exchange_ts, exchange_sequence, id)
 ```
-
-2) logs — requests/responses for post/cancel/amend
-
-```
-id                       BIGSERIAL PRIMARY KEY
-account_id               BIGINT NOT NULL
-exchange                 TEXT NOT NULL
-request_type             TEXT NOT NULL            -- post/cancel/amend
-request                  JSONB NOT NULL
-response                 JSONB
-status                   TEXT NOT NULL            -- success/error
-created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
-```
-
-Optional (recommended for faster restarts): `position_snapshots(account_id, instrument, snapshot_time, amount, avp, realized, fees, trades_count, quote_volume, ...)` with PK `(account_id, instrument, snapshot_time)`. On startup, load the latest snapshot per instrument and replay only newer executions.
 
 
 ### Implementation notes
@@ -93,6 +78,3 @@ Optional (recommended for faster restarts): `position_snapshots(account_id, inst
   - OKX: prefer official sequence if provided; otherwise `exchange_ts` + `fill_id`.
   - DERIBIT: use sequence when available; otherwise `exchange_ts` + `trade_id`.
 - Live buffering: keep a bounded buffer by time/size; on switch, discard any items with `exchange_ts` ≤ `last_ts` and then drain the rest in order.
-- Security: store `api_key`, `secret`, and `passphrase` encrypted at rest; never log secrets. Redact sensitive fields in `logs`.
-- Backfill paging: stop backfill when the next page would produce executions with `exchange_ts` ≤ `last_ts`. Persist as you go to avoid re-fetching.
-- Monitoring: export counters for duplicates, ordering corrections, and replay lag vs. `last_ts`.

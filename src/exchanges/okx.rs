@@ -1169,7 +1169,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             .as_micros() as i64;
 
         // Parse OKX message JSON
-        let okx_message: OkxMessage = serde_json::from_slice(&raw_msg.data).map_err(|e| {
+        let okx_message: OkxMessage = serde_json::from_slice(&raw_msg.data).map_err(|_e| {
             self.base.metrics.increment_parse_errors();
             crate::xcommons::error::AppError::pipeline(ERROR_JSON_PARSE.to_string())
         })?;
@@ -1257,10 +1257,10 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             // Process bids with unit conversion
             for bid_entry in &data.bids {
                 if bid_entry.len() >= 2 {
-                    let price = fast_float::parse::<f64, _>(&bid_entry[0]).map_err(|e| {
+                    let price = fast_float::parse::<f64, _>(&bid_entry[0]).map_err(|_e| {
                         crate::xcommons::error::AppError::pipeline(ERROR_PRICE_PARSE.to_string())
                     })?;
-                    let raw_size = fast_float::parse::<f64, _>(&bid_entry[1]).map_err(|e| {
+                    let raw_size = fast_float::parse::<f64, _>(&bid_entry[1]).map_err(|_e| {
                         crate::xcommons::error::AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
                     })?;
 
@@ -1306,10 +1306,10 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             // Process asks with unit conversion
             for ask_entry in &data.asks {
                 if ask_entry.len() >= 2 {
-                    let price = fast_float::parse::<f64, _>(&ask_entry[0]).map_err(|e| {
+                    let price = fast_float::parse::<f64, _>(&ask_entry[0]).map_err(|_e| {
                         crate::xcommons::error::AppError::pipeline(ERROR_PRICE_PARSE.to_string())
                     })?;
-                    let raw_size = fast_float::parse::<f64, _>(&ask_entry[1]).map_err(|e| {
+                    let raw_size = fast_float::parse::<f64, _>(&ask_entry[1]).map_err(|_e| {
                         crate::xcommons::error::AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
                     })?;
 

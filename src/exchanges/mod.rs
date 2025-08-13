@@ -1,12 +1,11 @@
 #![allow(dead_code)]
 use crate::xcommons::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, RawMessage};
-use crate::xcommons::error as error;
-use crate::xcommons::types as types;
 use async_trait::async_trait;
 
 pub mod binance;
 pub mod deribit;
 pub mod okx;
+pub mod binance_account;
 
 /// Error types for exchange operations
 #[allow(dead_code)]

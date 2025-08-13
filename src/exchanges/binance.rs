@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 
 use crate::xcommons::error::{AppError, Result};
 use crate::exchanges::ExchangeConnector;
-use crate::xcommons::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate, OrderBookL2UpdateBuilder};
+use crate::xcommons::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate};
 use crate::xcommons::oms::Side;
 
 // Static error messages to avoid allocations in hot paths
@@ -795,7 +795,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         let mut data_bytes = raw_msg.data;
         
         // First try to parse as generic JSON to check for subscription responses
-        let json_value: serde_json::Value = serde_json::from_slice(&mut data_bytes).map_err(|e| {
+        let json_value: serde_json::Value = serde_json::from_slice(&mut data_bytes).map_err(|_e| {
             self.base.metrics.increment_parse_errors();
             crate::xcommons::error::AppError::pipeline(ERROR_JSON_PARSE.to_string())
         })?;
@@ -861,10 +861,10 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
         // Process bid updates using fast float parsing
         for bid in depth_update.bids {
-            let price = fast_float::parse::<f64, _>(&bid[0]).map_err(|e| {
+            let price = fast_float::parse::<f64, _>(&bid[0]).map_err(|_e| {
                 crate::xcommons::error::AppError::pipeline(ERROR_PRICE_PARSE.to_string())
             })?;
-            let qty = fast_float::parse::<f64, _>(&bid[1]).map_err(|e| {
+            let qty = fast_float::parse::<f64, _>(&bid[1]).map_err(|_e| {
                 crate::xcommons::error::AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
             })?;
 
@@ -885,10 +885,10 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
         // Process ask updates using fast float parsing
         for ask in depth_update.asks {
-            let price = fast_float::parse::<f64, _>(&ask[0]).map_err(|e| {
+            let price = fast_float::parse::<f64, _>(&ask[0]).map_err(|_e| {
                 crate::xcommons::error::AppError::pipeline(ERROR_PRICE_PARSE.to_string())
             })?;
-            let qty = fast_float::parse::<f64, _>(&ask[1]).map_err(|e| {
+            let qty = fast_float::parse::<f64, _>(&ask[1]).map_err(|_e| {
                 crate::xcommons::error::AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
             })?;
 
@@ -965,7 +965,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         let parse_start = crate::xcommons::types::time::now_micros();
         let mut data_bytes = raw_msg.data;
         let trade_update: BinanceTradeUpdate =
-            serde_json::from_slice(&mut data_bytes).map_err(|e| {
+            serde_json::from_slice(&mut data_bytes).map_err(|_e| {
                 self.base.metrics.increment_parse_errors();
                 crate::xcommons::error::AppError::pipeline(ERROR_TRADE_PARSE.to_string())
             })?;
@@ -995,11 +995,11 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         }
 
         // Parse price and quantity
-        let price = fast_float::parse::<f64, _>(&trade_update.price).map_err(|e| {
+        let price = fast_float::parse::<f64, _>(&trade_update.price).map_err(|_e| {
             crate::xcommons::error::AppError::pipeline(ERROR_PRICE_PARSE.to_string())
         })?;
         
-        let qty = fast_float::parse::<f64, _>(&trade_update.quantity).map_err(|e| {
+        let qty = fast_float::parse::<f64, _>(&trade_update.quantity).map_err(|_e| {
             crate::xcommons::error::AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
         })?;
 

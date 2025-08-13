@@ -1,0 +1,24 @@
+# naive_mm.yaml
+
+strategy: naive_mm
+
+runtime:
+  channel_capacity: 10000
+
+subscriptions: []
+
+binance:
+  api_key: "ABIIYlDOo5HLuqgvqXANYbfJNd1unmsDrV9A2JHgjjLfwwuLASMMwNV9quhooGfq"
+  secret: "G8ywM72hKFPr1Qad5lCk7hTw3HVHGYYXPk6K612EW0woFq22dFX2eEOToVqt4Fq7"
+  account_id: 1
+
+  start_epoch_ts: "2025-07-01T00:00:00Z"
+
+  fee_bps: -0.5
+  contract_size: 1.0
+
+  symbols:
+    - BTCUSDT
+    
+
+
