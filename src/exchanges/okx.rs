@@ -4,6 +4,16 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::VecDeque;
+use lru::LruCache;
+use std::num::NonZeroUsize;
+
+// Static error messages to avoid allocations in hot paths
+const ERROR_JSON_PARSE: &str = "Failed to parse OKX message JSON";
+const ERROR_PRICE_PARSE: &str = "Invalid price format";
+const ERROR_QUANTITY_PARSE: &str = "Invalid quantity format";
+const ERROR_TIMESTAMP_PARSE: &str = "Invalid timestamp format";
+const ERROR_WEBSOCKET: &str = "WebSocket connection error";
+const ERROR_SEQUENCE_GAP: &str = "OKX sequence gap detected";
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::TcpStream;
@@ -1027,9 +1037,9 @@ pub struct OkxProcessor {
     base: crate::exchanges::BaseProcessor,
     okx_registry: Option<std::sync::Arc<InstrumentRegistry>>,
     exchange_id: crate::xcommons::types::ExchangeId,
-    // Performance optimizations
-    symbol_cache: std::collections::HashMap<String, String>, // Cache for symbol conversions
-    metadata_cache: std::collections::HashMap<String, InstrumentMetadata>, // Cache for metadata lookups
+    // Performance optimizations with bounded caches
+    symbol_cache: LruCache<String, String>, // Bounded cache for symbol conversions
+    metadata_cache: LruCache<String, InstrumentMetadata>, // Bounded cache for metadata lookups
     string_buffer: String, // Pre-allocated buffer for string operations
     last_seq_id: Option<i64>,
 }
@@ -1043,9 +1053,9 @@ impl OkxProcessor {
             base: crate::exchanges::BaseProcessor::new(),
             okx_registry: registry,
             exchange_id,
-            // Performance optimizations
-            symbol_cache: std::collections::HashMap::with_capacity(16), // Pre-allocate for common symbols
-            metadata_cache: std::collections::HashMap::with_capacity(16), // Cache frequently used metadata
+            // Performance optimizations with bounded caches
+            symbol_cache: LruCache::new(NonZeroUsize::new(64).unwrap()), // Bounded cache for 64 symbols
+            metadata_cache: LruCache::new(NonZeroUsize::new(32).unwrap()), // Bounded cache for 32 metadata entries
             string_buffer: String::with_capacity(32), // Pre-allocate buffer for string operations
             last_seq_id: None,
         }
@@ -1067,7 +1077,7 @@ impl OkxProcessor {
         if let Some(ref registry) = self.okx_registry {
             if let Ok(metadata) = registry.get_metadata(okx_symbol) {
                 let cloned_metadata = metadata.clone();
-                self.metadata_cache.insert(okx_symbol.to_string(), cloned_metadata.clone());
+                self.metadata_cache.put(okx_symbol.to_string(), cloned_metadata.clone());
                 Some(cloned_metadata)
             } else {
                 None
@@ -1161,7 +1171,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         // Parse OKX message JSON
         let okx_message: OkxMessage = serde_json::from_slice(&raw_msg.data).map_err(|e| {
             self.base.metrics.increment_parse_errors();
-            crate::xcommons::error::AppError::pipeline(format!("Failed to parse OKX message JSON: {}", e))
+            crate::xcommons::error::AppError::pipeline(ERROR_JSON_PARSE.to_string())
         })?;
 
         let depth_update = match okx_message {
@@ -1248,16 +1258,10 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             for bid_entry in &data.bids {
                 if bid_entry.len() >= 2 {
                     let price = fast_float::parse::<f64, _>(&bid_entry[0]).map_err(|e| {
-                        crate::xcommons::error::AppError::pipeline(format!(
-                            "Invalid bid price '{}': {}",
-                            bid_entry[0], e
-                        ))
+                        crate::xcommons::error::AppError::pipeline(ERROR_PRICE_PARSE.to_string())
                     })?;
                     let raw_size = fast_float::parse::<f64, _>(&bid_entry[1]).map_err(|e| {
-                        crate::xcommons::error::AppError::pipeline(format!(
-                            "Invalid bid size '{}': {}",
-                            bid_entry[1], e
-                        ))
+                        crate::xcommons::error::AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
                     })?;
 
                     // Apply unit conversion if metadata available
@@ -1303,16 +1307,10 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             for ask_entry in &data.asks {
                 if ask_entry.len() >= 2 {
                     let price = fast_float::parse::<f64, _>(&ask_entry[0]).map_err(|e| {
-                        crate::xcommons::error::AppError::pipeline(format!(
-                            "Invalid ask price '{}': {}",
-                            ask_entry[0], e
-                        ))
+                        crate::xcommons::error::AppError::pipeline(ERROR_PRICE_PARSE.to_string())
                     })?;
                     let raw_size = fast_float::parse::<f64, _>(&ask_entry[1]).map_err(|e| {
-                        crate::xcommons::error::AppError::pipeline(format!(
-                            "Invalid ask size '{}': {}",
-                            ask_entry[1], e
-                        ))
+                        crate::xcommons::error::AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
                     })?;
 
                     // Apply unit conversion if metadata available

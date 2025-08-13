@@ -11,13 +11,13 @@ async fn run_strategy_path(args: Args) -> Result<()> {
     use crate::strats::md_collector::config::MdCollectorConfig;
     use crate::strats::md_collector::strategy::MdCollector;
     use crate::strats::api::{Strategy, StrategyContext};
-    use std::fs;
+
 
     let config_path = args
         .config
         .as_ref()
         .ok_or_else(|| AppError::cli("--config is required for --strategy"))?;
-    let buf = fs::read_to_string(config_path).map_err(|e| AppError::cli(format!("Failed to read config {}: {}", config_path.display(), e)))?;
+    let buf = tokio::fs::read_to_string(config_path).await.map_err(|e| AppError::cli(format!("Failed to read config {}: {}", config_path.display(), e)))?;
     let cfg: MdCollectorConfig = serde_yaml::from_str(&buf).map_err(|e| AppError::cli(format!("Invalid YAML: {}", e)))?;
 
     // metrics and exporters + HTTP server
@@ -29,32 +29,71 @@ async fn run_strategy_path(args: Args) -> Result<()> {
         let agg = crate::metrics::exporters::Aggregator::new(prom_registry.clone(), std::time::Duration::from_secs(5));
         tokio::spawn(async move { agg.run(&metrics_ref).await });
     }
+    // Start bounded HTTP server for metrics using tokio TcpListener with connection limits
     tokio::spawn({
         let prom_registry = prom_registry.clone();
         async move {
             use tokio::net::TcpListener;
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            
             let listener = match TcpListener::bind("127.0.0.1:9898").await {
                 Ok(l) => l,
                 Err(e) => { log::warn!("failed to bind metrics listener: {}", e); return; }
             };
+            
+            let active_connections = Arc::new(AtomicUsize::new(0));
+            const MAX_CONNECTIONS: usize = 10;
+            
             loop {
                 match listener.accept().await {
-                    Ok((mut socket, _)) => {
+                    Ok((mut socket, addr)) => {
+                        let current_connections = active_connections.fetch_add(1, Ordering::AcqRel);
+                        
+                        if current_connections >= MAX_CONNECTIONS {
+                            log::warn!("Metrics server: connection limit reached, dropping connection from {}", addr);
+                            active_connections.fetch_sub(1, Ordering::AcqRel);
+                            continue;
+                        }
+                        
                         let prom_registry = prom_registry.clone();
+                        let active_connections = active_connections.clone();
                         tokio::spawn(async move {
+                            let _guard = scopeguard::guard((), |_| {
+                                active_connections.fetch_sub(1, Ordering::AcqRel);
+                            });
+                            
                             let mut buf = [0u8; 1024];
-                            let _ = socket.read(&mut buf).await;
-                            let req = std::str::from_utf8(&buf).unwrap_or("");
-                            let is_metrics = req.starts_with("GET /metrics");
-                            let body = if is_metrics { prom_registry.gather() } else { String::from("Not Found") };
-                            let status = if is_metrics { "200 OK" } else { "404 Not Found" };
-                            let response = format!(
-                                "HTTP/1.1 {}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                status, body.len(), body
-                            );
-                            let _ = socket.write_all(response.as_bytes()).await;
-                            let _ = socket.shutdown().await;
+                            match socket.read(&mut buf).await {
+                                Ok(_) => {
+                                    let req = std::str::from_utf8(&buf).unwrap_or("");
+                                    let is_metrics = req.starts_with("GET /metrics");
+                                    let body = if is_metrics { prom_registry.gather() } else { "Not Found".to_string() };
+                                    let status = if is_metrics { "200 OK" } else { "404 Not Found" };
+                                    
+                                    // Use static response format to avoid allocations
+                                    let response = if is_metrics {
+                                        format!("HTTP/1.1 200 OK
+Content-Type: text/plain; version=0.0.4
+Content-Length: {}
+Connection: close
+
+{}", body.len(), body)
+                                    } else {
+                                        "HTTP/1.1 404 Not Found
+Content-Type: text/plain
+Content-Length: 9
+Connection: close
+
+Not Found".to_string()
+                                    };
+                                    
+                                    let _ = socket.write_all(response.as_bytes()).await;
+                                    let _ = socket.shutdown().await;
+                                }
+                                Err(_) => {} // Connection error, just close
+                            }
                         });
                     }
                     Err(e) => { log::warn!("metrics accept error: {}", e); }
