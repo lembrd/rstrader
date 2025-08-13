@@ -14,3 +14,4 @@ CREATE TABLE IF NOT EXISTS l2_updates (
 ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, exchange, ticker, side, price, update_id);
 
 
+

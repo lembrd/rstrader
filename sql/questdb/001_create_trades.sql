@@ -13,3 +13,4 @@ CREATE TABLE IF NOT EXISTS trades (
 ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, exchange, ticker, trade_id);
 
 
+

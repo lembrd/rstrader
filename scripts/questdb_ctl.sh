@@ -6,7 +6,7 @@ set -euo pipefail
 #   ./scripts/questdb_ctl.sh start   [--host HOST] [--http-port 9000] [--ilp-port 9009] [--pg-port 8812] [--ilp-http-port 9003] [--data-dir ./.questdb_data] [--name xtrader_questdb]
 #   ./scripts/questdb_ctl.sh stop    [--name xtrader_questdb]
 #   ./scripts/questdb_ctl.sh status  [--name xtrader_questdb]
-#   ./scripts/questdb_ctl.sh init    [--host HOST] [--http-port 9000] [--sql-dir ./sql]
+#   ./scripts/questdb_ctl.sh init    [--host HOST] [--http-port 9000] [--sql-dir ./sql/questdb]
 
 CMD="${1:-}"
 shift || true
@@ -19,7 +19,7 @@ PG_PORT="8812"
 ILP_HTTP_PORT="9003"
 DATA_DIR="${PWD}/.questdb_data"
 CONTAINER_NAME="xtrader_questdb"
-SQL_DIR="${PWD}/sql"
+SQL_DIR="${PWD}/sql/questdb"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
