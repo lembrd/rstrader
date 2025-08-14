@@ -75,6 +75,12 @@ impl StreamWriter {
                     self.flush_trade_batch(file_manager).await?;
                 }
             }
+            StreamData::Obs(_snapshot) => {
+                // For now, OBS passthrough is not written; could be added with a new schema factory
+                // Keeping it a no-op preserves sink performance and avoids schema churn.
+                self.metrics.increment_messages_processed();
+                self.last_activity = Instant::now();
+            }
         }
         Ok(())
     }

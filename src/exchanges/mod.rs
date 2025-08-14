@@ -206,6 +206,11 @@ pub trait ExchangeProcessor: Send + Sync {
                 let trade_updates = self.process_trade_message(raw_msg, symbol, rcv_timestamp, packet_id, message_bytes)?;
                 Ok(trade_updates.into_iter().map(crate::xcommons::types::StreamData::Trade).collect())
             }
+            crate::xcommons::types::StreamType::Obs => {
+                // OBS piggybacks on L2; upstream should never call with Obs. Fallback to L2.
+                let l2_updates = self.process_message(raw_msg, symbol, rcv_timestamp, packet_id, message_bytes)?;
+                Ok(l2_updates.into_iter().map(crate::xcommons::types::StreamData::L2).collect())
+            }
         }
     }
 

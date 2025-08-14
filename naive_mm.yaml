@@ -5,7 +5,13 @@ strategy: naive_mm
 runtime:
   channel_capacity: 10000
 
-subscriptions: []
+subscriptions: 
+  - exchange: BinanceFutures
+    stream_type: Obs
+    instrument: BTCUSDT
+    arb_streams_num: 1
+
+
 
 binance:
   api_key: "ABIIYlDOo5HLuqgvqXANYbfJNd1unmsDrV9A2JHgjjLfwwuLASMMwNV9quhooGfq"

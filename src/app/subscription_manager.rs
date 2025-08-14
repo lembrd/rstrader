@@ -10,6 +10,8 @@ use crate::xcommons::types::StreamData;
 use crate::md::UnifiedHandlerFactory;
 use crate::md::latency_arb;
 use crate::exchanges::okx::InstrumentRegistry;
+use crate::xcommons::types::OrderBookSnapshot;
+use crate::md::orderbook::OrderBookManager;
 
 /// Manager for handling multiple concurrent subscriptions using unified handlers
 pub struct SubscriptionManager {
@@ -20,6 +22,36 @@ pub struct SubscriptionManager {
 }
 
 impl SubscriptionManager {
+    fn spawn_obs_adapter(
+        instrument: String,
+        mut l2_rx: mpsc::Receiver<StreamData>,
+        forward: mpsc::Sender<StreamData>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        tokio::spawn(async move {
+            let mut ob = OrderBookManager::new(instrument);
+            while let Some(data) = l2_rx.recv().await {
+                if let StreamData::L2(u) = data {
+                    let _ = ob.apply_update(&u);
+                    let bids = ob.top_bids(10);
+                    let asks = ob.top_asks(10);
+                    let snapshot = OrderBookSnapshot {
+                        exchange_id: u.exchange,
+                        symbol: u.ticker.clone(),
+                        last_update_id: u.update_id,
+                        timestamp: u.rcv_timestamp,
+                        sequence: u.seq_id,
+                        bids,
+                        asks,
+                    };
+                    if let Err(e) = forward.send(StreamData::Obs(snapshot)).await {
+                        log::error!("OBS forward failed: {}", e);
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
     pub fn new(subscriptions: Vec<SubscriptionSpec>, verbose: bool) -> Self {
         Self {
             subscriptions,
@@ -37,16 +69,50 @@ impl SubscriptionManager {
         okx_swap_registry: Option<Arc<InstrumentRegistry>>,
         okx_spot_registry: Option<Arc<InstrumentRegistry>>,
     ) -> Result<()> {
-        for (index, subscription) in self.subscriptions.iter().enumerate() {
+        for (index, subscription) in self.subscriptions.clone().into_iter().enumerate() {
             // Create cancellation token for this handler
             let cancellation_token = CancellationToken::new();
             
             // If TRADES with arbitration config (max_connections set), use arbitrated runner
             let output_tx = processed_tx.clone();
-            let handler_handle = if subscription.stream_type == crate::xcommons::types::StreamType::Trade
+            // OBS piggybacks on L2 for execution; normalize here to ensure arb path works
+            let mut effective_sub = subscription.clone();
+            if effective_sub.stream_type == crate::xcommons::types::StreamType::Obs {
+                effective_sub.stream_type = crate::xcommons::types::StreamType::L2;
+            }
+            let handler_handle = if subscription.stream_type == crate::xcommons::types::StreamType::Obs
+                && effective_sub.max_connections.unwrap_or(1) > 1
+            {
+                // OBS with arbitration: run L2 arb into local channel, adapt to snapshots, forward OBS
+                let (l2_tx, mut l2_rx) = mpsc::channel::<StreamData>(10_000);
+                let sub_clone = effective_sub.clone();
+                let okx_swap = okx_swap_registry.clone();
+                let okx_spot = okx_spot_registry.clone();
+                let verbose = self.verbose;
+                let arb_token = cancellation_token.clone();
+                let forward = processed_tx.clone();
+                let _arb_guard = tokio::spawn(async move {
+                    let _ = latency_arb::run_arbitrated_l2(
+                        sub_clone,
+                        index,
+                        verbose,
+                        okx_swap,
+                        okx_spot,
+                        l2_tx,
+                        arb_token,
+                    ).await;
+                });
+                let _obs_handle: tokio::task::JoinHandle<Result<()>> = Self::spawn_obs_adapter(
+                    effective_sub.instrument.clone(),
+                    l2_rx,
+                    forward,
+                );
+                // Return a harmless handle type-compatible with others
+                tokio::spawn(async move { Ok(()) })
+            } else if effective_sub.stream_type == crate::xcommons::types::StreamType::Trade
                 && subscription.max_connections.unwrap_or(1) > 1
             {
-                let sub_clone = subscription.clone();
+                let sub_clone = effective_sub.clone();
                 let okx_swap = okx_swap_registry.clone();
                 let okx_spot = okx_spot_registry.clone();
                 let verbose = self.verbose;
@@ -63,10 +129,30 @@ impl SubscriptionManager {
                     )
                     .await
                 })
-            } else if subscription.stream_type == crate::xcommons::types::StreamType::L2
+            } else if subscription.stream_type == crate::xcommons::types::StreamType::Obs
+                && !(effective_sub.max_connections.unwrap_or(1) > 1)
+            {
+                // OBS without arbitration: run unified L2 handler into local channel, adapt to snapshot
+                let (l2_tx, mut l2_rx) = mpsc::channel::<StreamData>(10_000);
+                let handler = UnifiedHandlerFactory::create_handler(
+                    effective_sub.clone(),
+                    index,
+                    self.verbose,
+                    okx_swap_registry.clone(),
+                    okx_spot_registry.clone(),
+                    cancellation_token.clone(),
+                )?;
+                let forward = processed_tx.clone();
+                let _l2_guard = tokio::spawn(async move { let _ = handler.run(l2_tx).await; });
+                Self::spawn_obs_adapter(
+                    effective_sub.instrument.clone(),
+                    l2_rx,
+                    forward,
+                )
+            } else if effective_sub.stream_type == crate::xcommons::types::StreamType::L2
                 && subscription.max_connections.unwrap_or(1) > 1
             {
-                let sub_clone = subscription.clone();
+                let sub_clone = effective_sub.clone();
                 let okx_swap = okx_swap_registry.clone();
                 let okx_spot = okx_spot_registry.clone();
                 let verbose = self.verbose;
@@ -86,7 +172,7 @@ impl SubscriptionManager {
             } else {
                 // Create unified handler for this subscription
                 let handler = UnifiedHandlerFactory::create_handler(
-                    subscription.clone(),
+                    effective_sub.clone(),
                     index,
                     self.verbose,
                     okx_swap_registry.clone(),

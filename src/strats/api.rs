@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::app::env::{AppEnvironment, BinanceAccountParams};
 use crate::xcommons::error::Result as AppResult;
-use crate::xcommons::types::{ExchangeId, OrderBookL2Update, StreamData, TradeUpdate, StreamType as CoreStreamType, SubscriptionSpec};
+use crate::xcommons::types::{ExchangeId, OrderBookL2Update, StreamData, TradeUpdate, StreamType as CoreStreamType, SubscriptionSpec, OrderBookSnapshot};
 use crate::xcommons::position::Position;
 use crate::xcommons::oms::XExecution;
 
@@ -33,6 +33,7 @@ pub enum StrategyMessage {
     MarketDataTrade { sub: SubscriptionId, msg: TradeUpdate },
     Execution { account_id: i64, exec: XExecution },
     Position { account_id: i64, market_id: i64, pos: Position },
+    Obs { sub: SubscriptionId, snapshot: OrderBookSnapshot },
     Control(StrategyControl),
 }
 
@@ -54,6 +55,7 @@ pub trait Strategy: Send + Sync {
     fn on_trade(&mut self, _sub: SubscriptionId, _msg: TradeUpdate, _io: &mut StrategyIo) {}
     fn on_execution(&mut self, _account_id: i64, _exec: XExecution, _io: &mut StrategyIo) {}
     fn on_position(&mut self, _account_id: i64, _market_id: i64, _pos: Position, _io: &mut StrategyIo) {}
+    fn on_obs(&mut self, _sub: SubscriptionId, _snapshot: OrderBookSnapshot, _io: &mut StrategyIo) {}
     fn on_control(&mut self, _c: StrategyControl, _io: &mut StrategyIo) {}
 }
 
@@ -78,6 +80,14 @@ impl<'a> StrategyRegistrar<'a> {
     }
 
     pub fn subscribe_trades(&mut self, spec: SubscriptionSpec) -> SubscriptionId {
+        let id = SubscriptionId(self.next_id);
+        self.next_id += 1;
+        self.pending_subs.push((id, spec));
+        id
+    }
+
+    pub fn subscribe_obs(&mut self, spec: SubscriptionSpec) -> SubscriptionId {
+        // Keep OBS logical type here; environment will convert to L2 for execution and emit OBS snapshots
         let id = SubscriptionId(self.next_id);
         self.next_id += 1;
         self.pending_subs.push((id, spec));
@@ -136,6 +146,12 @@ impl StrategyRunner {
                         let key = (CoreStreamType::Trade, msg.exchange, msg.ticker.clone());
                         if let Some(&sid) = key_to_subid.get(&key) {
                             let _ = forward_tx.try_send(StrategyMessage::MarketDataTrade { sub: sid, msg });
+                        }
+                    }
+                    StreamData::Obs(snapshot) => {
+                        let key = (CoreStreamType::Obs, snapshot.exchange_id, snapshot.symbol.clone());
+                        if let Some(&sid) = key_to_subid.get(&key) {
+                            let _ = forward_tx.try_send(StrategyMessage::Obs { sub: sid, snapshot });
                         }
                     }
                 }
@@ -216,6 +232,7 @@ impl StrategyRunner {
                 StrategyMessage::MarketDataTrade { sub, msg } => strategy.on_trade(sub, msg, &mut io),
                 StrategyMessage::Execution { account_id, exec } => strategy.on_execution(account_id, exec, &mut io),
                 StrategyMessage::Position { account_id, market_id, pos } => strategy.on_position(account_id, market_id, pos, &mut io),
+                StrategyMessage::Obs { sub, snapshot } => strategy.on_obs(sub, snapshot, &mut io),
                 StrategyMessage::Control(c) => strategy.on_control(c, &mut io),
             }
         }

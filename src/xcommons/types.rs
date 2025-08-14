@@ -188,12 +188,13 @@ impl TradeUpdateBuilder {
 
 /// Enum to identify stream types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
-pub enum StreamType { L2, Trade }
+pub enum StreamType { L2, Trade, Obs }
 /// Unified enum for different stream data types
 #[derive(Debug, Clone)]
 pub enum StreamData {
     L2(OrderBookL2Update),
     Trade(TradeUpdate),
+    Obs(OrderBookSnapshot),
 }
 
 impl StreamData {
@@ -202,6 +203,7 @@ impl StreamData {
         match self {
             StreamData::L2(_) => "L2",
             StreamData::Trade(_) => "TRADES",
+            StreamData::Obs(_) => "OBS",
         }
     }
 
@@ -224,6 +226,14 @@ impl StreamData {
                 update.seq_id,
                 update.packet_id,
             ),
+            StreamData::Obs(snapshot) => (
+                snapshot.timestamp,
+                snapshot.timestamp,
+                snapshot.exchange_id,
+                &snapshot.symbol,
+                snapshot.sequence,
+                0,
+            ),
         }
     }
 }
@@ -234,6 +244,7 @@ impl FromStr for StreamType {
         match s.trim().to_ascii_uppercase().as_str() {
             "L2" => Ok(StreamType::L2),
             "TRADES" | "TRADE" => Ok(StreamType::Trade),
+            "OBS" => Ok(StreamType::Obs),
             other => Err(format!("Invalid stream type '{}'. Supported: L2, TRADES", other)),
         }
     }

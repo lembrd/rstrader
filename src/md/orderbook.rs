@@ -94,9 +94,9 @@ impl OrderBookManager {
         }
 
         // Validate update sequence
-        if update.update_id <= self.last_update_id {
-            log::debug!(
-                "Skipping old update: {} <= {}",
+        if update.update_id < self.last_update_id {
+            log::trace!(
+                "Skipping old update: {} < {}",
                 update.update_id,
                 self.last_update_id
             );

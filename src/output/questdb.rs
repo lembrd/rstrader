@@ -130,6 +130,10 @@ impl StreamWriter {
                 self.trade_buffer.push(t);
                 self.metrics.increment_messages_processed();
             }
+            StreamData::Obs(_snapshot) => {
+                // Ignore OBS for QuestDB for now
+                self.metrics.increment_messages_processed();
+            }
         }
         self.last_activity = Instant::now();
     }

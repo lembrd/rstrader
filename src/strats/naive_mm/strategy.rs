@@ -4,23 +4,26 @@ use crate::app::env::BinanceAccountParams;
 use crate::xcommons::types::SubscriptionSpec;
 use crate::strats::api::{Strategy, StrategyContext, StrategyRegistrar, SubscriptionId, StrategyIo};
 use crate::xcommons::error::Result as AppResult;
-use crate::xcommons::types::{OrderBookL2Update, TradeUpdate};
+use crate::xcommons::types::{OrderBookL2Update, TradeUpdate, OrderBookSnapshot};
 use crate::xcommons::oms::XExecution;
 use crate::xcommons::position::Position;
+use std::collections::HashMap;
 
 use super::config::NaiveMmConfig;
 
 pub struct NaiveMm {
     fair_px: f64,
+    obs_last_print_us: HashMap<SubscriptionId, i64>,
 }
 
 impl Default for NaiveMm {
-    fn default() -> Self { Self { fair_px: 0.0 } }
+    fn default() -> Self { Self { fair_px: 0.0, obs_last_print_us: HashMap::new() } }
 }
 
 #[async_trait]
 impl Strategy for NaiveMm {
     type Config = NaiveMmConfig;
+    
 
     fn name(&self) -> &'static str { "naive_mm" }
 
@@ -31,6 +34,9 @@ impl Strategy for NaiveMm {
             match spec.stream_type {
                 crate::xcommons::types::StreamType::L2 => { let _ = reg.subscribe_l2(spec); }
                 crate::xcommons::types::StreamType::Trade => { let _ = reg.subscribe_trades(spec); }
+                crate::xcommons::types::StreamType::Obs => {
+                    let _ = reg.subscribe_obs(spec.clone());
+                }
             }
         }
 
@@ -47,8 +53,32 @@ impl Strategy for NaiveMm {
         Ok(())
     }
 
-    fn on_l2(&mut self, _sub: SubscriptionId, msg: OrderBookL2Update, _io: &mut StrategyIo) {
-        self.fair_px = msg.price;
+    fn on_l2(&mut self, _sub: SubscriptionId, msg: OrderBookL2Update, _io: &mut StrategyIo) { self.fair_px = msg.price; }
+
+    fn on_obs(&mut self, sub: SubscriptionId, snapshot: OrderBookSnapshot, _io: &mut StrategyIo) {
+        const PRINT_INTERVAL_US: i64 = 5_000_000; // 5 seconds
+        let now_us = crate::xcommons::types::time::now_micros();
+        let last_us = *self.obs_last_print_us.get(&sub).unwrap_or(&0);
+        if now_us - last_us < PRINT_INTERVAL_US { return; }
+        self.obs_last_print_us.insert(sub, now_us);
+        // print from framework-provided snapshot
+        // Build truncated top 10 rows and print
+        let mut bids = snapshot.bids.clone();
+        let mut asks = snapshot.asks.clone();
+        bids.sort_by(|a,b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+        asks.sort_by(|a,b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+        let rows = 10usize;
+        log::info!("[OBS] {} top10:", snapshot.symbol);
+        log::info!("{:<12} {:<14} | {:<14} {:<12}", "bid_amt", "bid_px", "ask_px", "ask_amt");
+        for i in 0..rows {
+            let (bid_px, bid_qty) = if i < bids.len() { (bids[i].price, bids[i].qty) } else { (0.0, 0.0) };
+            let (ask_px, ask_qty) = if i < asks.len() { (asks[i].price, asks[i].qty) } else { (0.0, 0.0) };
+            if bid_qty == 0.0 && ask_qty == 0.0 { continue; }
+            log::info!(
+                "{:<12.4} {:<14.4} | {:<14.4} {:<12.4}",
+                bid_qty, bid_px, ask_px, ask_qty
+            );
+        }
     }
 
     fn on_trade(&mut self, _sub: SubscriptionId, _msg: TradeUpdate, _io: &mut StrategyIo) {}

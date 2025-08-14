@@ -88,6 +88,7 @@ impl UnifiedExchangeHandler {
             let stream_type_str = match self.subscription.stream_type {
                 StreamType::L2 => "L2",
                 StreamType::Trade => "TRADES",
+                StreamType::Obs => "OBS",
             };
             reporter.set_stream_type(stream_type_str);
         }
@@ -96,6 +97,7 @@ impl UnifiedExchangeHandler {
         match self.subscription.stream_type {
             StreamType::L2 => self.run_l2_stream(output_tx, reporter).await,
             StreamType::Trade => self.run_trade_stream(output_tx, reporter).await,
+            StreamType::Obs => self.run_l2_stream(output_tx, reporter).await, // OBS piggybacks on L2
         }
     }
 
