@@ -90,6 +90,10 @@ pub struct PrometheusExporter {
     transform_p99_us: GaugeVec,
     overhead_p50_us: GaugeVec,
     overhead_p99_us: GaugeVec,
+    // Strategy-level gauges
+    strategy_pnl: GaugeVec,
+    strategy_amount: GaugeVec,
+    strategy_bps: GaugeVec,
 }
 
 impl PrometheusExporter {
@@ -129,6 +133,16 @@ impl PrometheusExporter {
         let overhead_p99_us = GaugeVec::new(Opts::new("overhead_latency_p99_us", "Overhead latency p99 (us)"), &[
             "stream", "exchange", "symbol"
         ]).unwrap();
+        // Strategy metrics
+        let strategy_pnl = GaugeVec::new(Opts::new("strategy_pnl", "Mark-to-market PnL for strategy"), &[
+            "strategy", "symbol"
+        ]).unwrap();
+        let strategy_amount = GaugeVec::new(Opts::new("strategy_position_amount", "Current position amount"), &[
+            "strategy", "symbol"
+        ]).unwrap();
+        let strategy_bps = GaugeVec::new(Opts::new("strategy_bps", "Realized PnL in bps"), &[
+            "strategy", "symbol"
+        ]).unwrap();
         registry.register(Box::new(recv_total.clone())).unwrap();
         registry.register(Box::new(processed_total.clone())).unwrap();
         registry.register(Box::new(parse_errors_total.clone())).unwrap();
@@ -143,7 +157,10 @@ impl PrometheusExporter {
         registry.register(Box::new(transform_p99_us.clone())).unwrap();
         registry.register(Box::new(overhead_p50_us.clone())).unwrap();
         registry.register(Box::new(overhead_p99_us.clone())).unwrap();
-        Self { registry, recv_total, processed_total, parse_errors_total, throughput, code_p50_us, code_p99_us, overall_p50_us, overall_p99_us, parse_p50_us, parse_p99_us, transform_p50_us, transform_p99_us, overhead_p50_us, overhead_p99_us }
+        registry.register(Box::new(strategy_pnl.clone())).unwrap();
+        registry.register(Box::new(strategy_amount.clone())).unwrap();
+        registry.register(Box::new(strategy_bps.clone())).unwrap();
+        Self { registry, recv_total, processed_total, parse_errors_total, throughput, code_p50_us, code_p99_us, overall_p50_us, overall_p99_us, parse_p50_us, parse_p99_us, transform_p50_us, transform_p99_us, overhead_p50_us, overhead_p99_us, strategy_pnl, strategy_amount, strategy_bps }
     }
 
     pub fn gather(&self) -> String {
@@ -236,6 +253,14 @@ impl PrometheusExporter {
         if let Some(v) = transform_p99 { self.transform_p99_us.with_label_values(labels).set(v as f64); }
         if let Some(v) = overhead_p50 { self.overhead_p50_us.with_label_values(labels).set(v as f64); }
         if let Some(v) = overhead_p99 { self.overhead_p99_us.with_label_values(labels).set(v as f64); }
+    }
+
+    /// Update strategy-level gauges in one call (fast, no allocations besides label lookup)
+    pub fn set_strategy_metrics(&self, strategy: &str, symbol: &str, pnl: f64, amount: f64, bps: f64) {
+        let labels = &[strategy, symbol];
+        self.strategy_pnl.with_label_values(labels).set(pnl);
+        self.strategy_amount.with_label_values(labels).set(amount);
+        self.strategy_bps.with_label_values(labels).set(bps);
     }
 }
 

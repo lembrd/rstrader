@@ -136,6 +136,14 @@ impl Strategy for NaiveMm {
         let best_ask_opt = snapshot.asks.iter().min_by(|a,b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
         let (best_bid, best_ask) = match (best_bid_opt, best_ask_opt) { (Some(b), Some(a)) => (b, a), _ => return };
         let mid_price = (best_bid.price * best_ask.qty + best_ask.price * best_bid.qty) / (best_bid.qty + best_ask.qty);
+        // Fast strategy metrics push: mm PnL, amount, bps (non-blocking best-effort)
+        if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+            let market_id = XMarketId::make(snapshot.exchange_id, &snapshot.symbol);
+            let pos = self.positions.get(&market_id).cloned().unwrap_or_else(|| crate::xcommons::position::Position::new(0.0, 1.0));
+            let pnl = pos.current_pnl(mid_price);
+            let bps = pos.bps();
+            prom.set_strategy_metrics(self.name(), &snapshot.symbol, pnl, pos.amount, bps);
+        }
         let spread_bps = self.spread_bps;
         let displace_bps = self.displace_bps;
         let lot = self.lot_size;
