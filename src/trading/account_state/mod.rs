@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::cmp::Ordering;
 
 use crate::xcommons::error::{Result, AppError};
-use crate::xcommons::oms::{Side, XExecution};
+use crate::xcommons::oms::{Side, XExecution, OrderRequest, OrderResponse};
 use crate::xcommons::position::Position;
 use crate::xcommons::oms::{OrderStatus, OrderMode, TimeInForce};
 use crate::xcommons::types::ExchangeId;
@@ -184,6 +184,9 @@ pub trait ExchangeAccountAdapter: Send + Sync {
 
     /// Subscribe to live executions stream; should yield idempotent XExecution items
     async fn subscribe_live(&self, account_id: i64, market_id: i64) -> Result<tokio::sync::mpsc::Receiver<XExecution>>;
+
+    /// Send an order management request (post, cancel, cancel all) and return a unified OrderResponse
+    async fn send_request(&self, req: OrderRequest) -> Result<OrderResponse>;
 }
 
 #[allow(dead_code)]
@@ -205,6 +208,8 @@ pub struct AccountState {
     // broadcast channels for external subscribers
     exec_tx: broadcast::Sender<XExecution>,
     pos_tx: broadcast::Sender<(i64, Position)>,
+    /// Forward REST order responses to strategy via broadcast
+    resp_tx: broadcast::Sender<OrderResponse>,
 }
 
 impl AccountState {
@@ -223,6 +228,7 @@ impl AccountState {
             live_buffer: HashMap::new(),
             exec_tx: broadcast::channel(1024).0,
             pos_tx: broadcast::channel(1024).0,
+            resp_tx: broadcast::channel(1024).0,
         }
     }
 
@@ -471,6 +477,13 @@ impl AccountState {
     // Subscriptions for external consumers (strategy)
     pub fn subscribe_executions(&self) -> broadcast::Receiver<XExecution> { self.exec_tx.subscribe() }
     pub fn subscribe_positions(&self) -> broadcast::Receiver<(i64, Position)> { self.pos_tx.subscribe() }
+    pub fn subscribe_order_responses(&self) -> broadcast::Receiver<OrderResponse> { self.resp_tx.subscribe() }
+
+    pub async fn send_request(&self, req: OrderRequest) -> Result<OrderResponse> {
+        let resp = self.adapter.send_request(req).await?;
+        let _ = self.resp_tx.send(resp.clone());
+        Ok(resp)
+    }
 }
 
 

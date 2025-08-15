@@ -12,10 +12,20 @@ subscriptions:
     arb_streams_num: 1
 
 
+displace_th_bps: 1.0
+spread_bps: 2.0
+lot_size: 0.004
 
 binance:
   api_key: "ABIIYlDOo5HLuqgvqXANYbfJNd1unmsDrV9A2JHgjjLfwwuLASMMwNV9quhooGfq"
   secret: "G8ywM72hKFPr1Qad5lCk7hTw3HVHGYYXPk6K612EW0woFq22dFX2eEOToVqt4Fq7"
+
+  ed25519_key: "5spbppGxHkEGy9WiWhoUvTtCNffBhh1BBpMmCvx5ksUv4mUJpbbcL4qrgm0VeDZr"
+  ed25519_secret: >
+    -----BEGIN PRIVATE KEY-----
+    MC4CAQAwBQYDK2VwBCIEIMJZ6rUFDStiPvcANMiwdO9ysnskZ75APgboBwQsH7VD
+    -----END PRIVATE KEY-----
+
   account_id: 1
 
   start_epoch_ts: "2025-07-01T00:00:00Z"

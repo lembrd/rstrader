@@ -2,14 +2,18 @@ use serde::Deserialize;
 use serde::de::{Deserializer, Error as DeError};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct NaiveMmConfig {
     pub runtime: RuntimeSection,
     pub subscriptions: Vec<SubscriptionItem>,
     pub binance: BinanceSection,
+    #[serde(default = "default_max_position")] pub max_position: f64,
+    #[serde(default = "default_lot_size")] pub lot_size: f64,
+    #[serde(default = "default_spread_bps")] pub spread_bps: f64,
+    #[serde(default = "default_displace_th_bps")] pub displace_th_bps: f64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct RuntimeSection { pub channel_capacity: usize }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -23,10 +27,19 @@ pub struct SubscriptionItem {
 
 fn default_arb_streams_num() -> usize { 1 }
 
-#[derive(Debug, Clone, Deserialize)]
+fn default_max_position() -> f64 { 0.015 }
+fn default_lot_size() -> f64 { 0.005 }
+fn default_spread_bps() -> f64 { 1.5 }
+fn default_displace_th_bps() -> f64 { 1.0 }
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct BinanceSection {
     pub api_key: String,
     pub secret: String,
+    #[serde(default)]
+    pub ed25519_key: Option<String>,
+    #[serde(default)]
+    pub ed25519_secret: Option<String>,
     pub account_id: i64,
     #[serde(deserialize_with = "deserialize_start_epoch_ts")]
     pub start_epoch_ts: i64,

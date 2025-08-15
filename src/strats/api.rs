@@ -9,7 +9,8 @@ use crate::app::env::{AppEnvironment, BinanceAccountParams};
 use crate::xcommons::error::Result as AppResult;
 use crate::xcommons::types::{ExchangeId, OrderBookL2Update, StreamData, TradeUpdate, StreamType as CoreStreamType, SubscriptionSpec, OrderBookSnapshot};
 use crate::xcommons::position::Position;
-use crate::xcommons::oms::XExecution;
+use crate::xcommons::oms::{XExecution, OrderRequest, OrderResponse};
+use crate::trading::account_state::ExchangeAccountAdapter;
 
 #[derive(Clone)]
 pub struct StrategyContext {
@@ -34,11 +35,13 @@ pub enum StrategyMessage {
     Execution { account_id: i64, exec: XExecution },
     Position { account_id: i64, market_id: i64, pos: Position },
     Obs { sub: SubscriptionId, snapshot: OrderBookSnapshot },
+    OrderResponse(OrderResponse),
     Control(StrategyControl),
 }
 
 pub struct StrategyIo<'a> {
     pub env: &'a dyn AppEnvironment,
+    pub order_txs: std::collections::HashMap<String, tokio::sync::mpsc::Sender<OrderRequest>>, // symbol -> tx
 }
 
 #[async_trait]
@@ -159,6 +162,7 @@ impl StrategyRunner {
         });
 
         // Start account runners and forward executions/positions into strategy mailbox
+        let mut order_txs: HashMap<String, tokio::sync::mpsc::Sender<OrderRequest>> = HashMap::new();
         if !accounts.is_empty() {
             use crate::trading::account_state::{AccountState, PostgresExecutionsDatastore};
             use crate::exchanges::binance_account::BinanceFuturesAccountAdapter;
@@ -182,6 +186,8 @@ impl StrategyRunner {
                     params.api_key.clone(),
                     params.secret.clone(),
                     params.symbols.clone(),
+                    params.ed25519_key.clone(),
+                    params.ed25519_secret.clone(),
                 ));
                 for symbol in params.symbols.iter().cloned() {
                     let adapter = adapter.clone();
@@ -192,6 +198,9 @@ impl StrategyRunner {
                     let fee_bps = params.fee_bps;
                     let contract_size = params.contract_size;
                     let market_id = XMarketId::make(ExchangeId::BinanceFutures, &symbol);
+                    let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<OrderRequest>(1024);
+                    order_txs.insert(symbol.clone(), req_tx);
+                    let adapter_req = adapter.clone();
                     tokio::spawn(async move {
                         let mut account = AccountState::new(
                             account_id,
@@ -202,6 +211,7 @@ impl StrategyRunner {
                         // Forward exec/pos into strategy mailbox
                         let mut exec_rx = account.subscribe_executions();
                         let mut pos_rx = account.subscribe_positions();
+                        let mut resp_rx = account.subscribe_order_responses();
                         let ftx = forward_tx.clone();
                         tokio::spawn(async move {
                             loop {
@@ -212,7 +222,20 @@ impl StrategyRunner {
                                     Ok((mid, pos)) = pos_rx.recv() => {
                                         let _ = ftx.try_send(StrategyMessage::Position { account_id, market_id: mid, pos });
                                     }
+                                    Ok(resp) = resp_rx.recv() => {
+                                        let _ = ftx.try_send(StrategyMessage::OrderResponse(resp));
+                                    }
                                     else => break,
+                                }
+                            }
+                        });
+                        // Bridge order requests to exchange adapter API directly
+                        let ftx2 = forward_tx.clone();
+                        tokio::spawn(async move {
+                            while let Some(req) = req_rx.recv().await {
+                                match adapter_req.send_request(req).await {
+                                    Ok(resp) => { let _ = ftx2.try_send(StrategyMessage::OrderResponse(resp)); }
+                                    Err(e) => { log::error!("[StrategyRunner] send_request error for {}: {}", market_id, e); }
                                 }
                             }
                         });
@@ -225,7 +248,7 @@ impl StrategyRunner {
         }
 
         // Single-threaded dispatch loop
-        let mut io = StrategyIo { env: ctx.env.as_ref() };
+        let mut io = StrategyIo { env: ctx.env.as_ref(), order_txs };
         while let Some(m) = rx.recv().await {
             match m {
                 StrategyMessage::MarketDataL2 { sub, msg } => strategy.on_l2(sub, msg, &mut io),
@@ -233,6 +256,7 @@ impl StrategyRunner {
                 StrategyMessage::Execution { account_id, exec } => strategy.on_execution(account_id, exec, &mut io),
                 StrategyMessage::Position { account_id, market_id, pos } => strategy.on_position(account_id, market_id, pos, &mut io),
                 StrategyMessage::Obs { sub, snapshot } => strategy.on_obs(sub, snapshot, &mut io),
+                StrategyMessage::OrderResponse(_r) => {},
                 StrategyMessage::Control(c) => strategy.on_control(c, &mut io),
             }
         }

@@ -119,6 +119,8 @@ impl AppEnvironment for DefaultEnvironment {
             params.api_key.clone(),
             params.secret.clone(),
             params.symbols.clone(),
+            params.ed25519_key.clone(),
+            params.ed25519_secret.clone(),
         ));
 
         let mut runners = Vec::new();
@@ -184,8 +186,10 @@ pub enum EnvSinkConfig {
 
 #[derive(Clone, Debug)]
 pub struct BinanceAccountParams {
-    pub api_key: String,
-    pub secret: String,
+    pub api_key: String,      // REST (HMAC) apiKey
+    pub secret: String,       // REST (HMAC) secret
+    pub ed25519_key: Option<String>,     // WS API ed25519 public key (base64 or hex)
+    pub ed25519_secret: Option<String>,  // WS API ed25519 private key (hex)
     pub account_id: i64,
     pub start_epoch_ts: i64,
     pub fee_bps: f64,
