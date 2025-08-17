@@ -24,6 +24,7 @@ async fn run_strategy_path(args: Args) -> Result<()> {
     let prometheus_exporter = crate::metrics::exporters::PrometheusExporter::new();
     let prom_registry = std::sync::Arc::new(prometheus_exporter);
     let _ = crate::metrics::PROM_EXPORTER.set(prom_registry.clone());
+    // Histograms are always enabled in Metrics::new()
     let metrics_ref = crate::metrics::GLOBAL_METRICS.clone();
     {
         let agg = crate::metrics::exporters::Aggregator::new(prom_registry.clone(), std::time::Duration::from_secs(5));

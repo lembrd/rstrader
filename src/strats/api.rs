@@ -59,6 +59,7 @@ pub trait Strategy: Send + Sync {
     fn on_execution(&mut self, _account_id: i64, _exec: XExecution, _io: &mut StrategyIo) {}
     fn on_position(&mut self, _account_id: i64, _market_id: i64, _pos: Position, _io: &mut StrategyIo) {}
     fn on_obs(&mut self, _sub: SubscriptionId, _snapshot: OrderBookSnapshot, _io: &mut StrategyIo) {}
+    fn on_order_response(&mut self, _resp: OrderResponse, _io: &mut StrategyIo) {}
     fn on_control(&mut self, _c: StrategyControl, _io: &mut StrategyIo) {}
 }
 
@@ -256,7 +257,7 @@ impl StrategyRunner {
                 StrategyMessage::Execution { account_id, exec } => strategy.on_execution(account_id, exec, &mut io),
                 StrategyMessage::Position { account_id, market_id, pos } => strategy.on_position(account_id, market_id, pos, &mut io),
                 StrategyMessage::Obs { sub, snapshot } => strategy.on_obs(sub, snapshot, &mut io),
-                StrategyMessage::OrderResponse(_r) => {},
+                StrategyMessage::OrderResponse(r) => strategy.on_order_response(r, &mut io),
                 StrategyMessage::Control(c) => strategy.on_control(c, &mut io),
             }
         }

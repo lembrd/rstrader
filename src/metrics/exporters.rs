@@ -1,7 +1,7 @@
 //
 
 use std::time::Duration;
-use prometheus::{Encoder, TextEncoder, Registry, IntGauge, Opts, GaugeVec};
+use prometheus::{Encoder, TextEncoder, Registry, IntGauge, Opts, GaugeVec, IntCounterVec};
 use cadence::{StatsdClient, NopMetricSink, UdpMetricSink, QueuingMetricSink, Gauged, Counted};
 use std::net::UdpSocket;
 
@@ -17,21 +17,14 @@ impl SnapshotExporter for LogExporter {
     fn export(&self, basic: &crate::metrics::snapshot::BasicSnapshot, hdr: Option<&crate::metrics::MaybeMetricsSnapshot>) {
         #[allow(unused_variables)]
         let hdr_str = {
-            #[cfg(feature = "metrics-hdr")]
-            {
-                if let Some(h) = hdr {
-                    format!(
-                        " | p50/p99 us: code {} / {}, overall {} / {}",
-                        h.code_p50, h.code_p99, h.overall_p50, h.overall_p99
-                    )
-                } else {
-                    String::new()
-                }
+            if let Some(h) = hdr {
+                format!(
+                    " | p50/p99 us: code {} / {}, overall {} / {}",
+                    h.code_p50, h.code_p99, h.overall_p50, h.overall_p99
+                )
+            } else {
+                String::new()
             }
-            #[cfg(not(feature = "metrics-hdr"))]
-            let _ = hdr; // suppress unused when feature disabled
-            #[cfg(not(feature = "metrics-hdr"))]
-            String::new()
         };
 
         log::info!(
@@ -61,9 +54,6 @@ impl<E: SnapshotExporter> Aggregator<E> {
             let (basic, hdr) = {
                 let guard = metrics_ref.lock().expect("metrics lock");
                 let basic = crate::metrics::snapshot::BasicSnapshot::from(&*guard);
-                #[cfg(feature = "metrics-hdr")]
-                let hdr = None::<crate::metrics::MaybeMetricsSnapshot>;
-                #[cfg(not(feature = "metrics-hdr"))]
                 let hdr = None::<crate::metrics::MaybeMetricsSnapshot>;
                 (basic, hdr)
             };
@@ -94,6 +84,23 @@ pub struct PrometheusExporter {
     strategy_pnl: GaugeVec,
     strategy_amount: GaugeVec,
     strategy_bps: GaugeVec,
+    // Strategy latency (us) gauges
+    strat_tick_to_trade_p50: GaugeVec,
+    strat_tick_to_trade_p99: GaugeVec,
+    strat_tick_to_cancel_p50: GaugeVec,
+    strat_tick_to_cancel_p99: GaugeVec,
+    strat_code_p50: GaugeVec,
+    strat_code_p99: GaugeVec,
+    strat_network_p50: GaugeVec,
+    strat_network_p99: GaugeVec,
+    // Explicit post/cancel latencies (full, incl. network)
+    strat_post_p50: GaugeVec,
+    strat_post_p99: GaugeVec,
+    strat_cancel_p50: GaugeVec,
+    strat_cancel_p99: GaugeVec,
+    // Request counters
+    strat_post_requests_total: IntCounterVec,
+    strat_cancel_requests_total: IntCounterVec,
 }
 
 impl PrometheusExporter {
@@ -143,6 +150,23 @@ impl PrometheusExporter {
         let strategy_bps = GaugeVec::new(Opts::new("strategy_bps", "Realized PnL in bps"), &[
             "strategy", "symbol"
         ]).unwrap();
+        // Strategy latency
+        let strat_tick_to_trade_p50 = GaugeVec::new(Opts::new("strategy_tick_to_trade_p50_us", "Tick-to-trade p50 (us)"), &["strategy","symbol"]).unwrap();
+        let strat_tick_to_trade_p99 = GaugeVec::new(Opts::new("strategy_tick_to_trade_p99_us", "Tick-to-trade p99 (us)"), &["strategy","symbol"]).unwrap();
+        let strat_tick_to_cancel_p50 = GaugeVec::new(Opts::new("strategy_tick_to_cancel_p50_us", "Tick-to-cancel p50 (us)"), &["strategy","symbol"]).unwrap();
+        let strat_tick_to_cancel_p99 = GaugeVec::new(Opts::new("strategy_tick_to_cancel_p99_us", "Tick-to-cancel p99 (us)"), &["strategy","symbol"]).unwrap();
+        let strat_code_p50 = GaugeVec::new(Opts::new("strategy_code_latency_p50_us", "Strategy code latency p50 (us)"), &["strategy","symbol"]).unwrap();
+        let strat_code_p99 = GaugeVec::new(Opts::new("strategy_code_latency_p99_us", "Strategy code latency p99 (us)"), &["strategy","symbol"]).unwrap();
+        let strat_network_p50 = GaugeVec::new(Opts::new("strategy_network_latency_p50_us", "Strategy network latency p50 (us)"), &["strategy","symbol"]).unwrap();
+        let strat_network_p99 = GaugeVec::new(Opts::new("strategy_network_latency_p99_us", "Strategy network latency p99 (us)"), &["strategy","symbol"]).unwrap();
+        // New explicit post/cancel gauges
+        let strat_post_p50 = GaugeVec::new(Opts::new("strategy_post_latency_p50_us", "Strategy post latency p50 (us)"), &["strategy","symbol"]).unwrap();
+        let strat_post_p99 = GaugeVec::new(Opts::new("strategy_post_latency_p99_us", "Strategy post latency p99 (us)"), &["strategy","symbol"]).unwrap();
+        let strat_cancel_p50 = GaugeVec::new(Opts::new("strategy_cancel_latency_p50_us", "Strategy cancel latency p50 (us)"), &["strategy","symbol"]).unwrap();
+        let strat_cancel_p99 = GaugeVec::new(Opts::new("strategy_cancel_latency_p99_us", "Strategy cancel latency p99 (us)"), &["strategy","symbol"]).unwrap();
+        // Request counters (increment-only)
+        let strat_post_requests_total = IntCounterVec::new(Opts::new("strategy_post_requests_total", "Total post order requests sent"), &["strategy","symbol"]).unwrap();
+        let strat_cancel_requests_total = IntCounterVec::new(Opts::new("strategy_cancel_requests_total", "Total cancel order requests sent"), &["strategy","symbol"]).unwrap();
         registry.register(Box::new(recv_total.clone())).unwrap();
         registry.register(Box::new(processed_total.clone())).unwrap();
         registry.register(Box::new(parse_errors_total.clone())).unwrap();
@@ -160,7 +184,21 @@ impl PrometheusExporter {
         registry.register(Box::new(strategy_pnl.clone())).unwrap();
         registry.register(Box::new(strategy_amount.clone())).unwrap();
         registry.register(Box::new(strategy_bps.clone())).unwrap();
-        Self { registry, recv_total, processed_total, parse_errors_total, throughput, code_p50_us, code_p99_us, overall_p50_us, overall_p99_us, parse_p50_us, parse_p99_us, transform_p50_us, transform_p99_us, overhead_p50_us, overhead_p99_us, strategy_pnl, strategy_amount, strategy_bps }
+        registry.register(Box::new(strat_tick_to_trade_p50.clone())).unwrap();
+        registry.register(Box::new(strat_tick_to_trade_p99.clone())).unwrap();
+        registry.register(Box::new(strat_tick_to_cancel_p50.clone())).unwrap();
+        registry.register(Box::new(strat_tick_to_cancel_p99.clone())).unwrap();
+        registry.register(Box::new(strat_code_p50.clone())).unwrap();
+        registry.register(Box::new(strat_code_p99.clone())).unwrap();
+        registry.register(Box::new(strat_network_p50.clone())).unwrap();
+        registry.register(Box::new(strat_network_p99.clone())).unwrap();
+        registry.register(Box::new(strat_post_p50.clone())).unwrap();
+        registry.register(Box::new(strat_post_p99.clone())).unwrap();
+        registry.register(Box::new(strat_cancel_p50.clone())).unwrap();
+        registry.register(Box::new(strat_cancel_p99.clone())).unwrap();
+        registry.register(Box::new(strat_post_requests_total.clone())).unwrap();
+        registry.register(Box::new(strat_cancel_requests_total.clone())).unwrap();
+        Self { registry, recv_total, processed_total, parse_errors_total, throughput, code_p50_us, code_p99_us, overall_p50_us, overall_p99_us, parse_p50_us, parse_p99_us, transform_p50_us, transform_p99_us, overhead_p50_us, overhead_p99_us, strategy_pnl, strategy_amount, strategy_bps, strat_tick_to_trade_p50, strat_tick_to_trade_p99, strat_tick_to_cancel_p50, strat_tick_to_cancel_p99, strat_code_p50, strat_code_p99, strat_network_p50, strat_network_p99, strat_post_p50, strat_post_p99, strat_cancel_p50, strat_cancel_p99, strat_post_requests_total, strat_cancel_requests_total }
     }
 
     pub fn gather(&self) -> String {
@@ -261,6 +299,41 @@ impl PrometheusExporter {
         self.strategy_pnl.with_label_values(labels).set(pnl);
         self.strategy_amount.with_label_values(labels).set(amount);
         self.strategy_bps.with_label_values(labels).set(bps);
+    }
+
+    pub fn set_strategy_latency_quantiles(&self, strategy: &str, symbol: &str,
+        tick_to_trade_p50: Option<u64>, tick_to_trade_p99: Option<u64>,
+        tick_to_cancel_p50: Option<u64>, tick_to_cancel_p99: Option<u64>,
+        code_p50: Option<u64>, code_p99: Option<u64>,
+        network_p50: Option<u64>, network_p99: Option<u64>) {
+        let labels = &[strategy, symbol];
+        if let Some(v) = tick_to_trade_p50 { self.strat_tick_to_trade_p50.with_label_values(labels).set(v as f64); }
+        if let Some(v) = tick_to_trade_p99 { self.strat_tick_to_trade_p99.with_label_values(labels).set(v as f64); }
+        if let Some(v) = tick_to_cancel_p50 { self.strat_tick_to_cancel_p50.with_label_values(labels).set(v as f64); }
+        if let Some(v) = tick_to_cancel_p99 { self.strat_tick_to_cancel_p99.with_label_values(labels).set(v as f64); }
+        if let Some(v) = code_p50 { self.strat_code_p50.with_label_values(labels).set(v as f64); }
+        if let Some(v) = code_p99 { self.strat_code_p99.with_label_values(labels).set(v as f64); }
+        if let Some(v) = network_p50 { self.strat_network_p50.with_label_values(labels).set(v as f64); }
+        if let Some(v) = network_p99 { self.strat_network_p99.with_label_values(labels).set(v as f64); }
+    }
+
+    /// Explicitly set post/cancel latency gauges (use last-sample or quantiles if computed elsewhere)
+    pub fn set_strategy_post_cancel_latencies(&self, strategy: &str, symbol: &str,
+        post_p50: Option<u64>, post_p99: Option<u64>,
+        cancel_p50: Option<u64>, cancel_p99: Option<u64>) {
+        let labels = &[strategy, symbol];
+        if let Some(v) = post_p50 { self.strat_post_p50.with_label_values(labels).set(v as f64); }
+        if let Some(v) = post_p99 { self.strat_post_p99.with_label_values(labels).set(v as f64); }
+        if let Some(v) = cancel_p50 { self.strat_cancel_p50.with_label_values(labels).set(v as f64); }
+        if let Some(v) = cancel_p99 { self.strat_cancel_p99.with_label_values(labels).set(v as f64); }
+    }
+
+    /// Increment post/cancel request counters
+    pub fn inc_strategy_post_request(&self, strategy: &str, symbol: &str) {
+        self.strat_post_requests_total.with_label_values(&[strategy, symbol]).inc();
+    }
+    pub fn inc_strategy_cancel_request(&self, strategy: &str, symbol: &str) {
+        self.strat_cancel_requests_total.with_label_values(&[strategy, symbol]).inc();
     }
 }
 

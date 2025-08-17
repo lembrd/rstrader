@@ -14,7 +14,7 @@ subscriptions:
 
 displace_th_bps: 1.0
 spread_bps: 2.0
-lot_size: 0.004
+lot_size: 0.005
 
 binance:
   api_key: "ABIIYlDOo5HLuqgvqXANYbfJNd1unmsDrV9A2JHgjjLfwwuLASMMwNV9quhooGfq"

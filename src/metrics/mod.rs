@@ -1,28 +1,13 @@
 //
 
-#[cfg(feature = "metrics-hdr")]
 pub mod hdr;
 
 pub mod snapshot;
 pub mod exporters;
 
-#[cfg(feature = "metrics-hdr")]
 pub use hdr::{HistogramBounds, LatencyHistograms, MetricsSnapshot};
 
-#[cfg(not(feature = "metrics-hdr"))]
-/// Empty types when histograms are disabled to avoid feature‑gating call sites.
-pub mod noop {
-    #[derive(Clone, Copy)]
-    pub struct HistogramBounds;
-    #[derive(Default, Debug, Clone, Copy)]
-    pub struct MetricsSnapshot;
-}
-
-// Feature-agnostic alias for exporter interfaces
-#[cfg(feature = "metrics-hdr")]
 pub type MaybeMetricsSnapshot = MetricsSnapshot;
-#[cfg(not(feature = "metrics-hdr"))]
-pub type MaybeMetricsSnapshot = noop::MetricsSnapshot;
 
 use once_cell::sync::{Lazy, OnceCell};
 use std::sync::{Arc, Mutex};
@@ -48,12 +33,11 @@ pub fn publish_stream_metrics(
     update_global(metrics);
 
     // Avoid unused-arg warnings when histograms feature is disabled
-    #[cfg(not(feature = "metrics-hdr"))]
-    let _ = (stream, exchange, symbol);
+    let _ = (stream, exchange, symbol); // used below and for label construction
 
     // Export quantiles when histograms are enabled
-    #[cfg(feature = "metrics-hdr")]
-    if let Some(h) = &metrics.latency_histograms {
+    {
+        let h = &metrics.latency_histograms;
         if let Some(prom) = PROM_EXPORTER.get() {
             // Compute all present values and single-call update
             let mut code_p50 = None; let mut code_p99 = None;

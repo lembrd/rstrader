@@ -99,16 +99,9 @@ impl StreamWriter {
             trade_buffer: Vec::with_capacity(BATCH_SIZE),
             last_activity: Instant::now(),
             metrics: {
-                #[cfg(feature = "metrics-hdr")]
-                {
-                    let mut m = crate::xcommons::types::Metrics::new();
-                    m.enable_histograms(crate::metrics::HistogramBounds::default());
-                    m
-                }
-                #[cfg(not(feature = "metrics-hdr"))]
-                {
-                    crate::xcommons::types::Metrics::new()
-                }
+                let mut m = crate::xcommons::types::Metrics::new();
+                m.enable_histograms(crate::metrics::HistogramBounds::default());
+                m
             },
             stream_type,
             exchange,

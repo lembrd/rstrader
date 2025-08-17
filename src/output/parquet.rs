@@ -32,14 +32,8 @@ impl ParquetSink {
             buffer: Vec::with_capacity(BATCH_SIZE),
             output_path,
             metrics: {
-                #[cfg(feature = "metrics-hdr")]
                 let mut m = Metrics::new();
-                #[cfg(not(feature = "metrics-hdr"))]
-                let m = Metrics::new();
-                #[cfg(feature = "metrics-hdr")]
-                {
-                    m.enable_histograms(crate::metrics::HistogramBounds::default());
-                }
+                m.enable_histograms(crate::metrics::HistogramBounds::default());
                 m
             },
         })

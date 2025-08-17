@@ -100,6 +100,10 @@ impl PostgresExecutionsDatastore {
 #[async_trait]
 impl ExecutionsDatastore for PostgresExecutionsDatastore {
     async fn upsert(&mut self, exec: &XExecution) -> Result<()> {
+        // Persist only trade executions; ignore others like cancel
+        if exec.exec_type != crate::xcommons::oms::ExecutionType::XTrade {
+            return Ok(());
+        }
         let conn = self.pool.get().await.map_err(|e| AppError::io(format!("pg pool: {}", e)))?;
         let stmt = r#"
             INSERT INTO executions (account_id, exchange, instrument, xmarket_id, exchange_execution_id, exchange_ts, side, execution_type, qty, price, fee, fee_currency, live_stream, exchange_sequence)
@@ -286,6 +290,8 @@ impl AccountState {
         // Step 2: find restart point
         let last_point = self.datastore.last_point(self.account_id, market_id).await?;
         if let Some((ts, seq)) = last_point { log::info!("[AccountState] last_point from PG: ts(us)={} seq={:?}", ts, seq); }
+        // If executions table was truncated (no last_point), backfill from full epoch_ts provided by config
+        // Otherwise continue strictly greater than last_point.
         let (gt_ts, gt_seq) = last_point.unwrap_or((start_epoch_ts, None));
 
         // Step 3: backfill via REST and persist idempotently

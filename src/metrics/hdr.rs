@@ -9,8 +9,8 @@ pub struct HistogramBounds {
 
 impl Default for HistogramBounds {
     fn default() -> Self {
-        // microseconds latency from 1us to 10s, 2 significant digits by default
-        Self { lowest: 1, highest: 10_000_000, sigfig: 2 }
+        // microseconds latency from 1us to 2s, 2 significant digits by default
+        Self { lowest: 1, highest: 2_000_000, sigfig: 2 }
     }
 }
 
@@ -21,6 +21,12 @@ pub struct LatencyHistograms {
     pub parse_us: Histogram<u64>,
     pub transform_us: Histogram<u64>,
     pub overhead_us: Histogram<u64>,
+    // Strategy-specific
+    pub tick_to_trade_us: Histogram<u64>,
+    pub tick_to_cancel_us: Histogram<u64>,
+    pub network_us: Histogram<u64>,
+    pub post_network_us: Histogram<u64>,
+    pub cancel_network_us: Histogram<u64>,
 }
 
 impl LatencyHistograms {
@@ -33,6 +39,11 @@ impl LatencyHistograms {
             parse_us: mk(),
             transform_us: mk(),
             overhead_us: mk(),
+            tick_to_trade_us: mk(),
+            tick_to_cancel_us: mk(),
+            network_us: mk(),
+            post_network_us: mk(),
+            cancel_network_us: mk(),
         }
     }
 
@@ -56,6 +67,16 @@ impl LatencyHistograms {
     pub fn record_overhead_time(&mut self, v: u64) {
         let _ = self.overhead_us.record(v);
     }
+    #[inline(always)]
+    pub fn record_tick_to_trade(&mut self, v: u64) { let _ = self.tick_to_trade_us.record(v); }
+    #[inline(always)]
+    pub fn record_tick_to_cancel(&mut self, v: u64) { let _ = self.tick_to_cancel_us.record(v); }
+    #[inline(always)]
+    pub fn record_network_latency(&mut self, v: u64) { let _ = self.network_us.record(v); let _ = self.post_network_us.record(v); }
+    #[inline(always)]
+    pub fn record_post_network_latency(&mut self, v: u64) { let _ = self.post_network_us.record(v); }
+    #[inline(always)]
+    pub fn record_cancel_network_latency(&mut self, v: u64) { let _ = self.cancel_network_us.record(v); }
 
     pub fn snapshot_and_reset(&mut self) -> MetricsSnapshot {
         let snap = MetricsSnapshot {
@@ -74,6 +95,15 @@ impl LatencyHistograms {
             overhead_p50: self.overhead_us.value_at_quantile(0.50),
             overhead_p90: self.overhead_us.value_at_quantile(0.90),
             overhead_p99: self.overhead_us.value_at_quantile(0.99),
+            tick_to_trade_p50: self.tick_to_trade_us.value_at_quantile(0.50),
+            tick_to_trade_p90: self.tick_to_trade_us.value_at_quantile(0.90),
+            tick_to_trade_p99: self.tick_to_trade_us.value_at_quantile(0.99),
+            tick_to_cancel_p50: self.tick_to_cancel_us.value_at_quantile(0.50),
+            tick_to_cancel_p90: self.tick_to_cancel_us.value_at_quantile(0.90),
+            tick_to_cancel_p99: self.tick_to_cancel_us.value_at_quantile(0.99),
+            network_p50: self.network_us.value_at_quantile(0.50),
+            network_p90: self.network_us.value_at_quantile(0.90),
+            network_p99: self.network_us.value_at_quantile(0.99),
         };
 
         self.code_us.reset();
@@ -81,6 +111,11 @@ impl LatencyHistograms {
         self.parse_us.reset();
         self.transform_us.reset();
         self.overhead_us.reset();
+        self.tick_to_trade_us.reset();
+        self.tick_to_cancel_us.reset();
+        self.network_us.reset();
+        self.post_network_us.reset();
+        self.cancel_network_us.reset();
         snap
     }
 }
@@ -102,6 +137,15 @@ pub struct MetricsSnapshot {
     pub overhead_p50: u64,
     pub overhead_p90: u64,
     pub overhead_p99: u64,
+    pub tick_to_trade_p50: u64,
+    pub tick_to_trade_p90: u64,
+    pub tick_to_trade_p99: u64,
+    pub tick_to_cancel_p50: u64,
+    pub tick_to_cancel_p90: u64,
+    pub tick_to_cancel_p99: u64,
+    pub network_p50: u64,
+    pub network_p90: u64,
+    pub network_p99: u64,
 }
 
 

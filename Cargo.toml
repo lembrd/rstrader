@@ -60,8 +60,8 @@ scopeguard = "1.2"
 prometheus = "0.13"
 cadence = "0.29"
 
-[features]
-metrics-hdr = []
+#[features]
+# HDR histograms are now always enabled; feature flag removed.
 
 [dev-dependencies]
 ureq = { version = "2.9", default-features = false }

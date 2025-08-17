@@ -137,14 +137,8 @@ impl BaseProcessor {
     /// Create new base processor with default values
     pub fn new() -> Self {
         let metrics = {
-            #[cfg(feature = "metrics-hdr")]
             let mut m = crate::xcommons::types::Metrics::new();
-            #[cfg(not(feature = "metrics-hdr"))]
-            let m = crate::xcommons::types::Metrics::new();
-            #[cfg(feature = "metrics-hdr")]
-            {
-                m.enable_histograms(crate::metrics::HistogramBounds::default());
-            }
+            m.enable_histograms(crate::metrics::HistogramBounds::default());
             m
         };
         Self {

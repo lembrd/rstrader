@@ -431,10 +431,8 @@ pub struct Metrics {
     overhead_time_count: u64,
     packet_count: u64,
 
-    // Optional low-overhead histograms (disabled by default to avoid allocations)
-    #[cfg(feature = "metrics-hdr")]
-    #[allow(clippy::type_complexity)]
-    pub(crate) latency_histograms: Option<crate::metrics::LatencyHistograms>,
+    // Latency histograms (always enabled)
+    pub(crate) latency_histograms: crate::metrics::LatencyHistograms,
 }
 
 impl Metrics {
@@ -474,18 +472,11 @@ impl Metrics {
             transform_time_count: 0,
             overhead_time_count: 0,
             packet_count: 0,
-            #[cfg(feature = "metrics-hdr")]
-            latency_histograms: None,
+            latency_histograms: crate::metrics::LatencyHistograms::new(crate::metrics::HistogramBounds::default()),
         }
     }
 
-    #[cfg(feature = "metrics-hdr")]
-    pub fn enable_histograms(&mut self, bounds: crate::metrics::HistogramBounds) {
-        use crate::metrics::LatencyHistograms;
-        if self.latency_histograms.is_none() {
-            self.latency_histograms = Some(LatencyHistograms::new(bounds));
-        }
-    }
+    pub fn enable_histograms(&mut self, _bounds: crate::metrics::HistogramBounds) { /* no-op */ }
 
     pub fn increment_received(&mut self) {
         self.messages_received += 1;
@@ -519,10 +510,7 @@ impl Metrics {
             None => self.avg_code_latency_us = Some(latency_us as f64),
         }
 
-        #[cfg(feature = "metrics-hdr")]
-        if let Some(h) = &mut self.latency_histograms {
-            h.record_code_latency(latency_us);
-        }
+        self.latency_histograms.record_code_latency(latency_us);
     }
 
     pub fn update_overall_latency(&mut self, latency_us: u64) {
@@ -535,10 +523,7 @@ impl Metrics {
             None => self.avg_overall_latency_us = Some(latency_us as f64),
         }
 
-        #[cfg(feature = "metrics-hdr")]
-        if let Some(h) = &mut self.latency_histograms {
-            h.record_overall_latency(latency_us);
-        }
+        self.latency_histograms.record_overall_latency(latency_us);
     }
 
     pub fn update_parse_time(&mut self, parse_time_us: u64) {
@@ -550,10 +535,7 @@ impl Metrics {
             None => self.avg_parse_time_us = Some(parse_time_us as f64),
         }
 
-        #[cfg(feature = "metrics-hdr")]
-        if let Some(h) = &mut self.latency_histograms {
-            h.record_parse_time(parse_time_us);
-        }
+        self.latency_histograms.record_parse_time(parse_time_us);
     }
 
     pub fn update_transform_time(&mut self, transform_time_us: u64) {
@@ -567,10 +549,7 @@ impl Metrics {
             None => self.avg_transform_time_us = Some(transform_time_us as f64),
         }
 
-        #[cfg(feature = "metrics-hdr")]
-        if let Some(h) = &mut self.latency_histograms {
-            h.record_transform_time(transform_time_us);
-        }
+        self.latency_histograms.record_transform_time(transform_time_us);
     }
 
     pub fn update_overhead_time(&mut self, overhead_time_us: u64) {
@@ -584,10 +563,7 @@ impl Metrics {
             None => self.avg_overhead_time_us = Some(overhead_time_us as f64),
         }
 
-        #[cfg(feature = "metrics-hdr")]
-        if let Some(h) = &mut self.latency_histograms {
-            h.record_overhead_time(overhead_time_us);
-        }
+        self.latency_histograms.record_overhead_time(overhead_time_us);
     }
 
     pub fn update_message_complexity(
@@ -722,19 +698,17 @@ impl std::fmt::Display for Metrics {
             write!(f, ", throughput: {:.1}msg/s", throughput)?;
         }
 
-        #[cfg(feature = "metrics-hdr")]
-        if let Some(h) = &self.latency_histograms {
-            // Non-mutating quantiles read
-            let code_p50 = h.code_us.value_at_quantile(0.50);
-            let code_p99 = h.code_us.value_at_quantile(0.99);
-            let overall_p50 = h.overall_us.value_at_quantile(0.50);
-            let overall_p99 = h.overall_us.value_at_quantile(0.99);
-            write!(
-                f,
-                ", p50/p99(us) code {} / {}, overall {} / {}",
-                code_p50, code_p99, overall_p50, overall_p99
-            )?;
-        }
+        // Non-mutating quantiles read
+        let h = &self.latency_histograms;
+        let code_p50 = h.code_us.value_at_quantile(0.50);
+        let code_p99 = h.code_us.value_at_quantile(0.99);
+        let overall_p50 = h.overall_us.value_at_quantile(0.50);
+        let overall_p99 = h.overall_us.value_at_quantile(0.99);
+        write!(
+            f,
+            ", p50/p99(us) code {} / {}, overall {} / {}",
+            code_p50, code_p99, overall_p50, overall_p99
+        )?;
 
         Ok(())
     }

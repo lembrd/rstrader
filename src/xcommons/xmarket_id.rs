@@ -37,6 +37,11 @@ impl XMarketId {
     pub fn exchange_from(id: i64) -> u8 {
         ((id as u64) >> 56) as u8
     }
+
+    /// Best-effort reverse mapping symbol is not available without a registry; return None.
+    /// Strategy should carry symbol context; helper kept for compatibility.
+    #[inline]
+    pub fn symbol(_id: i64) -> Option<String> { None }
 }
 
 

@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use futures_util::{StreamExt, SinkExt};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::{SigningKey, Signer};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
@@ -340,6 +340,7 @@ struct WsRoot {
 struct WsOrderUpdate {
     #[serde(rename = "s")] symbol: String,
     #[serde(rename = "i")] order_id: i64,
+    #[serde(rename = "c")] client_order_id: Option<String>,
     #[serde(rename = "S")] side: String,
     #[serde(rename = "o")] order_type: String,
     #[serde(rename = "f")] tif: String,
@@ -354,6 +355,19 @@ struct WsOrderUpdate {
     #[serde(rename = "N")] commission_asset: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+struct WsTradeLite {
+    #[serde(rename = "s")] symbol: String,
+    #[serde(rename = "S")] side: String,
+    #[serde(rename = "p")] order_price: Option<String>,
+    #[serde(rename = "L")] last_price: Option<String>,
+    #[serde(rename = "l")] last_qty: String,
+    #[serde(rename = "t")] trade_id: i64,
+    #[serde(rename = "i")] order_id: i64,
+    #[serde(rename = "T")] trade_time_ms: i64,
+    #[serde(rename = "m")] is_maker: bool,
+}
+
 #[async_trait]
 impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
     async fn fetch_historical(&self, account_id: i64, market_id: i64, gt_ts: i64, _gt_seq: Option<i64>) -> Result<Vec<XExecution>> {
@@ -363,82 +377,78 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
             account_id, market_id, symbol, gt_ts, (gt_ts/1000)+1
         );
         let mut out: Vec<XExecution> = Vec::new();
-        let mut start_time_ms: i64 = (gt_ts / 1000) + 1; // convert us → ms, strictly greater
-        let mut attempted_recent_fallback = false;
+        let mut window_start_ms: i64 = (gt_ts / 1000) + 1; // ms, strictly greater
+        let day_ms: i64 = 86_400_000;
         let limit = 1000i32;
-        loop {
-            let timestamp = chrono::Utc::now().timestamp_millis();
-            let query = format!("symbol={}&startTime={}&limit={}&timestamp={}", symbol, start_time_ms, limit, timestamp);
-            let sig = self.sign_query(&query);
-            let url = format!("{}/fapi/v1/userTrades?{}&signature={}", self.base_url, query, sig);
-            log::debug!("[BinanceFuturesAccountAdapter] userTrades url: {}", url.replace(&self.api_key, "***"));
-            let resp = self.rest.get(url)
-                .header("X-MBX-APIKEY", &self.api_key)
-                .send().await.map_err(|e| AppError::io(format!("binance userTrades: {}", e)))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.bytes().await.unwrap_or_default();
-                let txt = String::from_utf8_lossy(&body);
-                return Err(AppError::io(format!("userTrades http {}: {}", status, txt)));
-            }
-            let text = resp.text().await.map_err(|e| AppError::io(format!("userTrades text: {}", e)))?;
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!("[BinanceFuturesAccountAdapter] userTrades raw: {}", text);
-            }
-            let trades: Vec<UserTrade> = serde_json::from_str(&text).map_err(|e| AppError::parse(format!("userTrades json: {}", e)))?;
-            log::info!("[BinanceFuturesAccountAdapter] userTrades page count={} start_ms={}", trades.len(), start_time_ms);
-            if trades.is_empty() {
-                if !attempted_recent_fallback {
-                    attempted_recent_fallback = true;
-                    // Fallback: pull recent day to sanity-check if API returns anything
-                    let recent = timestamp - 86_400_000; // 1 day
-                    log::warn!("[BinanceFuturesAccountAdapter] userTrades empty for start_ms={}; retrying with recent 1d start_ms={}", start_time_ms, recent);
-                    start_time_ms = recent;
-                    continue;
+        let now_ms_all = chrono::Utc::now().timestamp_millis();
+        while window_start_ms <= now_ms_all {
+            let window_end_ms = (window_start_ms + (7 * day_ms) - 1).min(now_ms_all);
+            let mut page_start = window_start_ms;
+            loop {
+                let timestamp = chrono::Utc::now().timestamp_millis();
+                let query = format!("symbol={}&startTime={}&endTime={}&limit={}&timestamp={}", symbol, page_start, window_end_ms, limit, timestamp);
+                let sig = self.sign_query(&query);
+                let url = format!("{}/fapi/v1/userTrades?{}&signature={}", self.base_url, query, sig);
+                log::debug!("[BinanceFuturesAccountAdapter] userTrades url: {}", url.replace(&self.api_key, "***"));
+                let resp = self.rest.get(url)
+                    .header("X-MBX-APIKEY", &self.api_key)
+                    .send().await.map_err(|e| AppError::io(format!("binance userTrades: {}", e)))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.bytes().await.unwrap_or_default();
+                    let txt = String::from_utf8_lossy(&body);
+                    return Err(AppError::io(format!("userTrades http {}: {}", status, txt)));
+                }
+                let text = resp.text().await.map_err(|e| AppError::io(format!("userTrades text: {}", e)))?;
+                if log::log_enabled!(log::Level::Debug) {
+                    log::debug!("[BinanceFuturesAccountAdapter] userTrades raw: {}", text);
+                }
+                let trades: Vec<UserTrade> = serde_json::from_str(&text).map_err(|e| AppError::parse(format!("userTrades json: {}", e)))?;
+                log::info!("[BinanceFuturesAccountAdapter] userTrades page count={} window=[{}, {}] page_start={}", trades.len(), window_start_ms, window_end_ms, page_start);
+                if trades.is_empty() { break; }
+                for tr in trades.iter() {
+                    let price: f64 = tr.price.parse().unwrap_or(0.0);
+                    let qty: f64 = tr.qty.parse().unwrap_or(0.0);
+                    let ts_us = tr.time_ms * 1000;
+                    let side = match tr.side.as_str() { "BUY" => Side::Buy, "SELL" => Side::Sell, _ => Side::Unknown };
+                    let fee: f64 = tr.commission.as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let exec = XExecution {
+                        timestamp: ts_us,
+                        rcv_timestamp: ts_us,
+                        market_id,
+                        account_id,
+                        exec_type: ExecutionType::XTrade,
+                        side,
+                        native_ord_id: tr.order_id.to_string(),
+                        cl_ord_id: -1,
+                        orig_cl_ord_id: -1,
+                        ord_status: OrderStatus::OStatusFilled,
+                        last_qty: qty,
+                        last_px: price,
+                        leaves_qty: 0.0,
+                        ord_qty: qty,
+                        ord_price: price,
+                        ord_mode: OrderMode::MLimit,
+                        tif: TimeInForce::TifGoodTillCancel,
+                        fee,
+                        native_execution_id: tr.id.to_string(),
+                        metadata: {
+                            let mut m = std::collections::HashMap::new();
+                            m.insert("symbol".to_string(), symbol.clone());
+                            if let Some(asset) = tr.commission_asset.clone() { m.insert("fee_asset".to_string(), asset); }
+                            m
+                        },
+                        is_taker: !tr.maker,
+                    };
+                    out.push(exec);
+                }
+                if trades.len() == limit as usize {
+                    page_start = trades.last().map(|t| t.time_ms + 1).unwrap_or(page_start + 1);
+                    if page_start <= window_end_ms { continue; }
                 }
                 break;
             }
-            for tr in trades.iter() {
-                // Convert to XExecution
-                let price: f64 = tr.price.parse().unwrap_or(0.0);
-                let qty: f64 = tr.qty.parse().unwrap_or(0.0);
-                let ts_us = tr.time_ms * 1000;
-                let side = match tr.side.as_str() { "BUY" => Side::Buy, "SELL" => Side::Sell, _ => Side::Unknown };
-                // Fee: prefer commission (taker/maker fee or rebate). Binance returns negative commission for rebates.
-                let fee: f64 = tr.commission.as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                let exec = XExecution {
-                    timestamp: ts_us,
-                    rcv_timestamp: ts_us,
-                    market_id,
-                    account_id,
-                    exec_type: ExecutionType::XTrade,
-                    side,
-                    native_ord_id: tr.order_id.to_string(),
-                    cl_ord_id: -1,
-                    orig_cl_ord_id: -1,
-                    ord_status: OrderStatus::OStatusFilled,
-                    last_qty: qty,
-                    last_px: price,
-                    leaves_qty: 0.0,
-                    ord_qty: qty,
-                    ord_price: price,
-                    ord_mode: OrderMode::MLimit,
-                    tif: TimeInForce::TifGoodTillCancel,
-                    fee,
-                    native_execution_id: tr.id.to_string(),
-                    metadata: {
-                        let mut m = std::collections::HashMap::new();
-                        m.insert("symbol".to_string(), symbol.clone());
-                        if let Some(asset) = tr.commission_asset.clone() { m.insert("fee_asset".to_string(), asset); }
-                        m
-                    },
-                    is_taker: !tr.maker,
-                };
-                out.push(exec);
-            }
-            // next page: use time of last trade + 1 ms
-            start_time_ms = trades.last().map(|t| t.time_ms + 1).unwrap_or(start_time_ms + 1);
-            if trades.len() < limit as usize { break; }
+            window_start_ms = window_end_ms + 1;
         }
         Ok(out)
     }
@@ -496,6 +506,8 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
 
             let ws_url = format!("{}/ws/{}", ws_base, listen_key);
             let Ok((mut ws, _)) = connect_async(&ws_url).await else { return; };
+            let mut seen_ortu: HashSet<i64> = HashSet::with_capacity(8192);
+            let mut pending_tl: HashMap<i64, (XExecution, i64)> = HashMap::with_capacity(8192);
             while let Some(msg) = ws.next().await {
                 match msg {
                     Ok(Message::Text(txt)) => {
@@ -507,6 +519,11 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                                 if ev == "ORDER_TRADE_UPDATE" {
                                     if let Some(o) = root.order.clone() {
                                         if o.exec_type == "TRADE" && o.symbol == symbol {
+                                            // Prefer ORDER_TRADE_UPDATE (has commission fields). De-duplicate by trade_id
+                                            if !seen_ortu.insert(o.trade_id) { continue; }
+                                            if seen_ortu.len() > 8192 { seen_ortu.clear(); }
+                                            // Drop any pending TRADE_LITE placeholder for this trade_id
+                                            let _ = pending_tl.remove(&o.trade_id);
                                             let price: f64 = o.last_filled_price.parse().unwrap_or(0.0);
                                             let qty: f64 = o.last_filled_qty.parse().unwrap_or(0.0);
                                             let side = match o.side.as_str() {
@@ -515,16 +532,18 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                                                 _ => Side::Unknown,
                                             };
                                             let ts_us = o.trade_time_ms * 1000;
+                                            let rcv_ts = chrono::Utc::now().timestamp_micros();
                                             let fee: f64 = o.commission.as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                            let cl_id_i64 = o.client_order_id.as_deref().and_then(|c| crate::xcommons::oms::clordid::parse_xcl(c)).unwrap_or(-1);
                                             let exec = XExecution {
                                                 timestamp: ts_us,
-                                                rcv_timestamp: ts_us,
+                                                rcv_timestamp: rcv_ts,
                                                 market_id,
                                                 account_id,
                                                 exec_type: ExecutionType::XTrade,
                                                 side,
                                                 native_ord_id: o.order_id.to_string(),
-                                                cl_ord_id: -1,
+                                                cl_ord_id: cl_id_i64,
                                                 orig_cl_ord_id: -1,
                                                 ord_status: match o.order_status.as_str() {
                                                     "FILLED" => OrderStatus::OStatusFilled,
@@ -553,9 +572,100 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                                                  log::debug!("[BinanceFuturesAccountAdapter] mapped exec: {:?}", exec);
                                              }
                                              let _ = tx.send(exec).await;
+                                        } else if o.symbol == symbol && (o.exec_type == "CANCELED" || o.order_status == "CANCELED") {
+                                            let ts_us = o.trade_time_ms * 1000;
+                                            let rcv_ts = chrono::Utc::now().timestamp_micros();
+                                            let side = match o.side.as_str() { "BUY" => Side::Buy, "SELL" => Side::Sell, _ => Side::Unknown };
+                                            let cl_id_i64 = o.client_order_id.as_deref().and_then(|c| crate::xcommons::oms::clordid::parse_xcl(c)).unwrap_or(-1);
+                                            let exec = XExecution {
+                                                timestamp: ts_us,
+                                                rcv_timestamp: rcv_ts,
+                                                market_id,
+                                                account_id,
+                                                exec_type: ExecutionType::XOrderCanceled,
+                                                side,
+                                                native_ord_id: o.order_id.to_string(),
+                                                cl_ord_id: cl_id_i64,
+                                                orig_cl_ord_id: -1,
+                                                ord_status: OrderStatus::OStatusCanceled,
+                                                last_qty: 0.0,
+                                                last_px: 0.0,
+                                                leaves_qty: 0.0,
+                                                ord_qty: 0.0,
+                                                ord_price: 0.0,
+                                                ord_mode: OrderMode::MLimit,
+                                                tif: TimeInForce::TifGoodTillCancel,
+                                                fee: 0.0,
+                                                native_execution_id: format!("cancel:{}:{}", o.order_id, o.trade_time_ms),
+                                                metadata: {
+                                                    let mut m = std::collections::HashMap::new();
+                                                    m.insert("symbol".to_string(), symbol.clone());
+                                                    m.insert("live".to_string(), "true".to_string());
+                                                    m
+                                                },
+                                                is_taker: false,
+                                            };
+                                            let _ = tx.send(exec).await;
+                                        }
+                                    }
+                                } else if ev == "TRADE_LITE" {
+                                    if let Ok(tl) = serde_json::from_str::<WsTradeLite>(&txt) {
+                                        if tl.symbol == symbol {
+                                            // If ORTU already received for this trade, skip TL
+                                            if seen_ortu.contains(&tl.trade_id) { continue; }
+                                            let price: f64 = tl.last_price.as_deref().and_then(|s| s.parse().ok())
+                                                .or_else(|| tl.order_price.as_deref().and_then(|s| s.parse().ok()))
+                                                .unwrap_or(0.0);
+                                            let qty: f64 = tl.last_qty.parse().unwrap_or(0.0);
+                                            let side = match tl.side.as_str() { "BUY" => Side::Buy, "SELL" => Side::Sell, _ => Side::Unknown };
+                                            let ts_us = tl.trade_time_ms * 1000;
+                                            let rcv_ts = chrono::Utc::now().timestamp_micros();
+                                            let exec = XExecution {
+                                                timestamp: ts_us,
+                                                rcv_timestamp: rcv_ts,
+                                                market_id,
+                                                account_id,
+                                                exec_type: ExecutionType::XTrade,
+                                                side,
+                                                native_ord_id: tl.order_id.to_string(),
+                                                cl_ord_id: -1,
+                                                orig_cl_ord_id: -1,
+                                                ord_status: OrderStatus::OStatusFilled,
+                                                last_qty: qty,
+                                                last_px: price,
+                                                leaves_qty: 0.0,
+                                                ord_qty: qty,
+                                                ord_price: price,
+                                                ord_mode: OrderMode::MLimit,
+                                                tif: TimeInForce::TifGoodTillCancel,
+                                                fee: 0.0,
+                                                native_execution_id: tl.trade_id.to_string(),
+                                                metadata: {
+                                                    let mut m = std::collections::HashMap::new();
+                                                    m.insert("symbol".to_string(), symbol.clone());
+                                                    m.insert("live".to_string(), "true".to_string());
+                                                    m
+                                                },
+                                                is_taker: !tl.is_maker,
+                                            };
+                                            // Buffer TL briefly; if ORTU doesn't arrive, we'll emit it later
+                                            let now_ms = chrono::Utc::now().timestamp_millis();
+                                            pending_tl.entry(tl.trade_id).or_insert((exec, now_ms));
                                         }
                                     }
                                 }
+                            }
+                        }
+                        // Flush any buffered TL older than threshold (no ORTU arrived)
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let mut to_emit: Vec<i64> = Vec::new();
+                        for (tid, (_ex, ts)) in pending_tl.iter() {
+                            if now_ms.saturating_sub(*ts) >= 1500 { to_emit.push(*tid); }
+                        }
+                        for tid in to_emit {
+                            if let Some((ex, _)) = pending_tl.remove(&tid) {
+                                if log::log_enabled!(log::Level::Debug) { log::debug!("[BinanceFuturesAccountAdapter] emitting buffered TRADE_LITE trade_id={} (no ORTU)", tid); }
+                                let _ = tx.send(ex).await;
                             }
                         }
                     }
@@ -587,5 +697,6 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
         }
     }
 }
+
 
 

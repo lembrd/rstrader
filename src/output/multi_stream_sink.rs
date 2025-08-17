@@ -32,14 +32,8 @@ struct StreamWriter {
 impl StreamWriter {
     fn new(stream_type: String, exchange: ExchangeId, symbol: String) -> Self {
         let metrics = {
-            #[cfg(feature = "metrics-hdr")]
             let mut m = Metrics::new();
-            #[cfg(not(feature = "metrics-hdr"))]
-            let m = Metrics::new();
-            #[cfg(feature = "metrics-hdr")]
-            {
-                m.enable_histograms(crate::metrics::HistogramBounds::default());
-            }
+            m.enable_histograms(crate::metrics::HistogramBounds::default());
             m
         };
         Self {
