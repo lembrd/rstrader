@@ -11,19 +11,14 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 RUN useradd -m -u 10001 runner \
-  && apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata wget tar gzip \
+  && apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata wget tar gzip openjdk-17-jre-headless \
   && rm -rf /var/lib/apt/lists/*
 
 # Install Flyway Commandline (bundled JRE)
 ARG FLYWAY_VERSION=9.22.3
-ARG TARGETARCH
 RUN set -eu \
   && cd /tmp \
-  && case "${TARGETARCH}" in \
-       arm64|aarch64) FLYWAY_ARCH="linux-arm64" ;; \
-       amd64|x86_64|*) FLYWAY_ARCH="linux-x64" ;; \
-     esac \
-  && wget -qO flyway.tar.gz "https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/${FLYWAY_VERSION}/flyway-commandline-${FLYWAY_VERSION}-${FLYWAY_ARCH}.tar.gz" \
+  && wget -qO flyway.tar.gz "https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/${FLYWAY_VERSION}/flyway-commandline-${FLYWAY_VERSION}.tar.gz" \
   && tar -xzf flyway.tar.gz \
   && mv flyway-${FLYWAY_VERSION} /opt/flyway \
   && ln -s /opt/flyway/flyway /usr/local/bin/flyway \
