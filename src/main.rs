@@ -31,8 +31,33 @@ async fn main() -> Result<()> {
         .install_default()
         .map_err(|_| AppError::fatal("Failed to install TLS crypto provider"))?;
 
-    // Initialize logging
-    env_logger::init();
+    // Initialize logging: also write to file if LOG_FILE is set
+    if let Ok(path) = std::env::var("LOG_FILE") {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path);
+        match file {
+            Ok(file) => {
+                use std::io::Write;
+                let env = env_logger::Env::default();
+                let mut builder = env_logger::Builder::from_env(env);
+                builder.format(move |buf, record| {
+                    let ts = buf.timestamp_millis();
+                    let line = format!("{} {} [{}] {}\n", ts, record.level(), record.module_path().unwrap_or("unknown"), record.args());
+                    let _ = writeln!(buf, "{}", line.trim_end());
+                    let _ = writeln!(&file, "{}", line.trim_end());
+                    Ok(())
+                });
+                builder.init();
+            }
+            Err(_) => {
+                env_logger::init();
+            }
+        }
+    } else {
+        env_logger::init();
+    }
 
     // Parse command line arguments
     let args = Args::parse();

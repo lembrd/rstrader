@@ -16,3 +16,4 @@ logs/
 /data/
 /.idea/
 .pg_data/
+logs
