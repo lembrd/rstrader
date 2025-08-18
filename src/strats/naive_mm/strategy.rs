@@ -390,9 +390,10 @@ impl Strategy for NaiveMm {
 					}
 				}
 				None => {
-					// Relax repost guard: allow equal to max_position to keep two-sided quoting after fills
-					if pos_amt <= self.max_position && self.bid_order.is_none() {
-						let preq = PostRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), cl_ord_id: crate::xcommons::monoseq::next_id(), market_id, account_id: self.binance_account_id.unwrap_or_default(), side: Side::Buy, qty: lot, price: bid_target, ord_mode: OrderMode::MLimit, tif: TimeInForce::TifGoodTillCancel, post_only: true, reduce_only: false, metadata: Default::default() };
+					// Strict guard: do not post BUY at or above max long exposure
+					if pos_amt < self.max_position && self.bid_order.is_none() {
+						let reduce_only = pos_amt < 0.0; // reduce-only if currently short
+						let preq = PostRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), cl_ord_id: crate::xcommons::monoseq::next_id(), market_id, account_id: self.binance_account_id.unwrap_or_default(), side: Side::Buy, qty: lot, price: bid_target, ord_mode: OrderMode::MLimit, tif: TimeInForce::TifGoodTillCancel, post_only: true, reduce_only, metadata: Default::default() };
 						let cl = preq.cl_ord_id;
 						if tx.try_send(OrderRequest::Post(preq)).is_ok() {
 							self.bid_order = Some(LiveOrder { status: LiveOrderStatus::PendingNew, cl_ord_id: cl, price: bid_target });
@@ -420,8 +421,10 @@ impl Strategy for NaiveMm {
 					}
 				}
 				None => {
-					if -pos_amt <= self.max_position && self.ask_order.is_none() {
-						let preq = PostRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), cl_ord_id: crate::xcommons::monoseq::next_id(), market_id, account_id: self.binance_account_id.unwrap_or_default(), side: Side::Sell, qty: lot, price: ask_target, ord_mode: OrderMode::MLimit, tif: TimeInForce::TifGoodTillCancel, post_only: true, reduce_only: false, metadata: Default::default() };
+					// Strict guard: do not post SELL at or above max short exposure
+					if -pos_amt < self.max_position && self.ask_order.is_none() {
+						let reduce_only = pos_amt > 0.0; // reduce-only if currently long
+						let preq = PostRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), cl_ord_id: crate::xcommons::monoseq::next_id(), market_id, account_id: self.binance_account_id.unwrap_or_default(), side: Side::Sell, qty: lot, price: ask_target, ord_mode: OrderMode::MLimit, tif: TimeInForce::TifGoodTillCancel, post_only: true, reduce_only, metadata: Default::default() };
 						let cl = preq.cl_ord_id;
 
 						if tx.try_send(OrderRequest::Post(preq)).is_ok() {
