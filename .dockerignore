@@ -18,4 +18,8 @@ CLAUDE.md
 XTRADER_CODEBASE_ANALYSIS_REPORT.md
 PERFORMANCE_OPTIMIZATIONS_IMPLEMENTED.md
 
+# Re-include needed files for Docker build
+!scripts/docker_entrypoint.sh
+!sql/pg/
+!sql/pg/**
 
