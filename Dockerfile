@@ -14,22 +14,18 @@ RUN useradd -m -u 10001 runner \
   && apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata wget tar gzip openjdk-17-jre-headless \
   && rm -rf /var/lib/apt/lists/*
 
-# Install Flyway Commandline (bundled JRE)
-ARG FLYWAY_VERSION=11.11.1
-ARG TARGETARCH
-RUN set -eu \
-  && cd /tmp \
-  && case "${TARGETARCH}" in \
-       arm64|aarch64) FLYWAY_ARCH="linux-arm64" ;; \
-       amd64|x86_64|*) FLYWAY_ARCH="linux-x64" ;; \
-     esac \
-  && wget -qO flyway.tar.gz "https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/${FLYWAY_VERSION}/flyway-commandline-${FLYWAY_VERSION}-${FLYWAY_ARCH}.tar.gz" \
-  && tar -xzf flyway.tar.gz \
-  && mv flyway-${FLYWAY_VERSION} /opt/flyway \
-  && ln -s /opt/flyway/flyway /usr/local/bin/flyway \
+FROM flyway/flyway:11.11.1 AS flyway
+
+FROM debian:bookworm-slim
+RUN useradd -m -u 10001 runner \
+  && apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata wget tar gzip \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install Flyway (copy from official image; includes JRE)
+COPY --from=flyway /flyway /opt/flyway
+RUN ln -s /opt/flyway/flyway /usr/local/bin/flyway \
   && chmod -R a+rx /opt/flyway \
-  && chmod a+rx /usr/local/bin/flyway \
-  && rm -f flyway.tar.gz
+  && chmod a+rx /usr/local/bin/flyway
 
 WORKDIR /home/runner
 COPY --from=builder /app/target/release/xtrader /usr/local/bin/xtrader
