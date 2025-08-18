@@ -27,6 +27,7 @@ pub struct BinanceFuturesAccountAdapter {
     secret: String,
     ws_pubkey: Option<String>,
     ws_secret: Option<String>,
+    ws_signing_key: Option<SigningKey>,
     rest: Client,
     symbols: Vec<String>,
     market_to_symbol: HashMap<i64, String>,
@@ -41,17 +42,67 @@ impl BinanceFuturesAccountAdapter {
             .iter()
             .map(|s| (XMarketId::make(ExchangeId::BinanceFutures, s), s.clone()))
             .collect();
+        // Pre-parse Ed25519 signing key if provided to avoid per-request overhead
+        let ws_signing_key = ws_secret
+            .as_ref()
+            .and_then(|s| Self::parse_ws_signing_key(s).ok());
         Self {
             api_key,
             secret,
             ws_pubkey,
             ws_secret,
+            ws_signing_key,
             rest: Client::new(),
             symbols,
             market_to_symbol,
             base_url: "https://fapi.binance.com".to_string(),
             ws_base: "wss://fstream.binance.com".to_string(),
             ws_api: Mutex::new(None),
+        }
+    }
+
+    fn parse_ws_signing_key(key_src: &str) -> Result<SigningKey> {
+        // Accept PEM PKCS#8, hex, base64 raw 32 bytes, or DER PKCS#8
+        if key_src.trim_start().starts_with("-----BEGIN") {
+            // Extract base64 between header/footer; tolerate YAML folding/whitespace
+            let mut s = key_src.replace('\r', "");
+            s = s.replace("-----BEGIN PRIVATE KEY-----", "");
+            s = s.replace("-----END PRIVATE KEY-----", "");
+            let b64: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(&b64)
+                .map_err(|e| AppError::config(format!("ed25519 pem base64: {}", e)))?;
+            match SigningKey::from_pkcs8_der(&der) {
+                Ok(sk) => Ok(sk),
+                Err(_) => {
+                    // Fallback: try to locate seed inside PKCS#8: look for 0x04 0x20 followed by 32-byte seed
+                    if let Some(pos) = der.windows(2).position(|w| w == [0x04, 0x20]) {
+                        let start = pos + 2;
+                        if der.len() >= start + 32 {
+                            let seed: [u8; 32] = der[start..start+32].try_into().unwrap();
+                            Ok(SigningKey::from_bytes(&seed))
+                        } else {
+                            Err(AppError::config("ed25519 pkcs8: missing 32-byte seed".to_string()))
+                        }
+                    } else {
+                        Err(AppError::config("ed25519 pkcs8: parse failure".to_string()))
+                    }
+                }
+            }
+        } else if key_src.trim().len() >= 64 && key_src.chars().all(|c| c.is_ascii_hexdigit()) {
+            let sk_bytes = hex::decode(key_src.trim()).map_err(|e| AppError::config(format!("ed25519 secret hex decode: {}", e)))?;
+            let arr: [u8; 32] = sk_bytes.as_slice().try_into().map_err(|_| AppError::config("ed25519 key length".to_string()))?;
+            Ok(SigningKey::from_bytes(&arr))
+        } else {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(key_src.trim())
+                .map_err(|e| AppError::config(format!("ed25519 base64 decode: {}", e)))?;
+            if raw.len() == 32 {
+                let arr: [u8; 32] = raw.as_slice().try_into().map_err(|_| AppError::config("ed25519 key length".to_string()))?;
+                Ok(SigningKey::from_bytes(&arr))
+            } else {
+                SigningKey::from_pkcs8_der(&raw).map_err(|e| AppError::config(format!("ed25519 pkcs8: {}", e)))
+            }
         }
     }
 
@@ -72,51 +123,13 @@ impl BinanceFuturesAccountAdapter {
         let mut items: Vec<(String, String)> = params.iter().map(|(k,v)| (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string())).collect();
         items.sort_by(|a,b| a.0.cmp(&b.0));
         let payload = items.iter().map(|(k,v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
-        // Build ed25519 signer from raw key bytes in hex/base64 if provided; here assume raw hex in secret
-        let key_src = self.ws_secret.as_ref().ok_or_else(|| AppError::config("ed25519_secret missing in config".to_string()))?;
-        // Accept either hex, base64, or PEM PKCS#8 private key
-        let signing_key = if key_src.trim_start().starts_with("-----BEGIN") {
-            // Extract base64 between header/footer; tolerate YAML folding/whitespace
-            let mut s = key_src.replace('\r', "");
-            s = s.replace("-----BEGIN PRIVATE KEY-----", "");
-            s = s.replace("-----END PRIVATE KEY-----", "");
-            let b64: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-            let der = base64::engine::general_purpose::STANDARD
-                .decode(&b64)
-                .map_err(|e| AppError::config(format!("ed25519 pem base64: {}", e)))?;
-            match SigningKey::from_pkcs8_der(&der) {
-                Ok(sk) => sk,
-                Err(_e) => {
-                    // Fallback: try to locate seed inside PKCS#8: look for 0x04 0x20 followed by 32-byte seed
-                    if let Some(pos) = der.windows(2).position(|w| w == [0x04, 0x20]) {
-                        let start = pos + 2;
-                        if der.len() >= start + 32 {
-                            let seed: [u8; 32] = der[start..start+32].try_into().unwrap();
-                            SigningKey::from_bytes(&seed)
-                        } else {
-                            return Err(AppError::config("ed25519 pkcs8: missing 32-byte seed"));
-                        }
-                    } else {
-                        return Err(AppError::config("ed25519 pkcs8: parse failure"));
-                    }
-                }
-            }
-        } else if key_src.len() >= 64 && key_src.chars().all(|c| c.is_ascii_hexdigit()) {
-            let sk_bytes = hex::decode(key_src.trim()).map_err(|e| AppError::config(format!("ed25519 secret hex decode: {}", e)))?;
-            SigningKey::from_bytes(sk_bytes.as_slice().try_into().map_err(|_| AppError::config("ed25519 key length".to_string()))?)
-        } else {
-            let raw = base64::engine::general_purpose::STANDARD.decode(key_src.trim()).map_err(|e| AppError::config(format!("ed25519 base64 decode: {}", e)))?;
-            if raw.len() == 32 {
-                SigningKey::from_bytes(raw.as_slice().try_into().map_err(|_| AppError::config("ed25519 key length".to_string()))?)
-            } else {
-                SigningKey::from_pkcs8_der(&raw).map_err(|e| AppError::config(format!("ed25519 pkcs8: {}", e)))?
-            }
-        };
+        // Use pre-parsed signing key if available
+        let signing_key = self.ws_signing_key.as_ref().ok_or_else(|| AppError::config("ed25519_secret missing in config".to_string()))?;
         let sig = signing_key.sign(payload.as_bytes());
         let sig_b64 = general_purpose::STANDARD.encode(sig.to_bytes());
         params.insert("signature".to_string(), serde_json::Value::from(sig_b64.clone()));
 
-        let req_id = format!("xtrader-{}", timestamp);
+        let req_id = format!("xtrader-{}", crate::xcommons::monoseq::next_id());
         let req = serde_json::json!({
             "id": req_id,
             "method": method,
@@ -138,6 +151,7 @@ impl BinanceFuturesAccountAdapter {
             let mut map = handle.pending.lock().await;
             map.insert(req_id.clone(), tx_once);
         }
+        let send_start_us = chrono::Utc::now().timestamp_micros();
         if let Err(e) = handle.send_tx.send(req.to_string()).await {
             log::warn!("[Binance WS-API] send failed: {} (resetting)", e);
             self.reset_ws_api().await;
@@ -152,12 +166,33 @@ impl BinanceFuturesAccountAdapter {
                 .await
                 .map_err(|_| AppError::connection("ws api timeout".to_string()))?
                 .map_err(|_| AppError::connection("ws api closed".to_string()))?;
+            let rcv_us = chrono::Utc::now().timestamp_micros();
+            if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+                prom.set_ws_api_last_rtt_us("BINANCE_FUTURES", method, (rcv_us - send_start_us) as u64);
+                prom.inc_ws_api_request_outcome("BINANCE_FUTURES", method, "ok");
+            }
             return Self::extract_result(v);
         }
-        let v = tokio::time::timeout(Duration::from_secs(7), rx_once)
-            .await
-            .map_err(|_| AppError::connection("ws api timeout".to_string()))?
-            .map_err(|_| AppError::connection("ws api closed".to_string()))?;
+        let v = match tokio::time::timeout(Duration::from_secs(7), rx_once).await {
+            Ok(Ok(val)) => val,
+            Ok(Err(_)) => {
+                if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+                    prom.inc_ws_api_request_outcome("BINANCE_FUTURES", method, "closed");
+                }
+                return Err(AppError::connection("ws api closed".to_string()));
+            }
+            Err(_) => {
+                if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+                    prom.inc_ws_api_request_outcome("BINANCE_FUTURES", method, "timeout");
+                }
+                return Err(AppError::connection("ws api timeout".to_string()));
+            }
+        };
+        let rcv_us = chrono::Utc::now().timestamp_micros();
+        if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+            prom.set_ws_api_last_rtt_us("BINANCE_FUTURES", method, (rcv_us - send_start_us) as u64);
+            prom.inc_ws_api_request_outcome("BINANCE_FUTURES", method, "ok");
+        }
         Self::extract_result(v)
     }
 
@@ -246,6 +281,9 @@ impl BinanceFuturesAccountAdapter {
         match self.ws_api_request("order.place", params).await {
             Ok(_v) => {},
             Err(e) => {
+                if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+                    prom.inc_ws_api_error_code("BINANCE_FUTURES", "order.place", "error");
+                }
                 let s = format!("{}", e);
                 if s.contains("\"code\":-5022") {
                     let rcv_timestamp = chrono::Utc::now().timestamp_micros();
@@ -265,7 +303,15 @@ impl BinanceFuturesAccountAdapter {
         params.insert("symbol".into(), symbol.into());
         if let Some(cl) = c.cl_ord_id { params.insert("origClientOrderId".into(), crate::xcommons::oms::clordid::format_xcl(cl).into()); }
         if let Some(native) = c.native_ord_id.clone() { params.insert("orderId".into(), native.into()); }
-        let _result = self.ws_api_request("order.cancel", params).await?;
+        match self.ws_api_request("order.cancel", params).await {
+            Ok(_v) => {},
+            Err(e) => {
+                if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+                    prom.inc_ws_api_error_code("BINANCE_FUTURES", "order.cancel", "error");
+                }
+                return Err(e);
+            }
+        }
         let rcv_timestamp = chrono::Utc::now().timestamp_micros();
         Ok(OrderResponse { req_id: c.req_id, timestamp: rcv_timestamp, rcv_timestamp, cl_ord_id: c.cl_ord_id, native_ord_id: None, status: OrderResponseStatus::Ok, exec: None })
     }

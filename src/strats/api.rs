@@ -41,7 +41,7 @@ pub enum StrategyMessage {
 
 pub struct StrategyIo<'a> {
     pub env: &'a dyn AppEnvironment,
-    pub order_txs: std::collections::HashMap<String, tokio::sync::mpsc::Sender<OrderRequest>>, // symbol -> tx
+    pub order_txs: std::collections::HashMap<i64, tokio::sync::mpsc::Sender<OrderRequest>>, // market_id -> tx
 }
 
 #[async_trait]
@@ -163,7 +163,7 @@ impl StrategyRunner {
         });
 
         // Start account runners and forward executions/positions into strategy mailbox
-        let mut order_txs: HashMap<String, tokio::sync::mpsc::Sender<OrderRequest>> = HashMap::new();
+        let mut order_txs: HashMap<i64, tokio::sync::mpsc::Sender<OrderRequest>> = HashMap::new();
         if !accounts.is_empty() {
             use crate::trading::account_state::{AccountState, PostgresExecutionsDatastore};
             use crate::exchanges::binance_account::BinanceFuturesAccountAdapter;
@@ -200,7 +200,7 @@ impl StrategyRunner {
                     let contract_size = params.contract_size;
                     let market_id = XMarketId::make(ExchangeId::BinanceFutures, &symbol);
                     let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<OrderRequest>(1024);
-                    order_txs.insert(symbol.clone(), req_tx);
+                    order_txs.insert(market_id, req_tx);
                     let adapter_req = adapter.clone();
                     tokio::spawn(async move {
                         let mut account = AccountState::new(
@@ -230,14 +230,18 @@ impl StrategyRunner {
                                 }
                             }
                         });
-                        // Bridge order requests to exchange adapter API directly
+                        // Bridge order requests to exchange adapter API; spawn per-request to allow concurrency
                         let ftx2 = forward_tx.clone();
                         tokio::spawn(async move {
                             while let Some(req) = req_rx.recv().await {
-                                match adapter_req.send_request(req).await {
-                                    Ok(resp) => { let _ = ftx2.try_send(StrategyMessage::OrderResponse(resp)); }
-                                    Err(e) => { log::error!("[StrategyRunner] send_request error for {}: {}", market_id, e); }
-                                }
+                                let adapter_req = adapter_req.clone();
+                                let ftx2 = ftx2.clone();
+                                tokio::spawn(async move {
+                                    match adapter_req.send_request(req).await {
+                                        Ok(resp) => { let _ = ftx2.try_send(StrategyMessage::OrderResponse(resp)); }
+                                        Err(e) => { log::error!("[StrategyRunner] send_request error for {}: {}", market_id, e); }
+                                    }
+                                });
                             }
                         });
                         if let Err(e) = account.run_market(market_id, start_epoch_ts, fee_bps, contract_size).await {

@@ -17,8 +17,8 @@ pub struct NaiveMm {
 	fair_px: f64,
 	obs_last_print_us: HashMap<SubscriptionId, i64>,
 	// per symbol state
-	live_orders: HashMap<String, (Option<(i64, f64)>, Option<(i64, f64)>)>, // symbol -> (bid: (cl_id, px), ask: (cl_id, px))
-	did_init: std::collections::HashSet<String>,
+	live_orders: HashMap<i64, (Option<(i64, f64)>, Option<(i64, f64)>)>, // market_id -> (bid: (cl_id, px), ask: (cl_id, px))
+	did_init: std::collections::HashSet<i64>,
 	positions: HashMap<i64, Position>,
 	ready_markets: std::collections::HashSet<i64>,
 	// trading params
@@ -31,8 +31,9 @@ pub struct NaiveMm {
 	last_obs_ts_us: HashMap<i64, i64>, // market_id -> last OBS ts (exchange)
 	last_req_ts_us: HashMap<i64, i64>,    // cl_ord_id -> post req time (local)
 	last_cancel_req_ts_us: HashMap<i64, i64>, // cl_ord_id -> cancel req time (local)
-	cl_to_symbol: HashMap<i64, String>, // cl_ord_id -> symbol
+	cl_to_market_id: HashMap<i64, i64>, // cl_ord_id -> market_id
 	market_id_to_symbol: HashMap<i64, String>,
+	pending_cancels: std::collections::HashSet<i64>,
 }
 
 impl Default for NaiveMm {
@@ -52,8 +53,9 @@ impl Default for NaiveMm {
 			last_obs_ts_us: HashMap::new(),
 			last_req_ts_us: HashMap::new(),
 			last_cancel_req_ts_us: HashMap::new(),
-			cl_to_symbol: HashMap::new(),
+			cl_to_market_id: HashMap::new(),
 			market_id_to_symbol: HashMap::new(),
+			pending_cancels: std::collections::HashSet::new(),
 		}
 	}
 }
@@ -115,40 +117,40 @@ impl Strategy for NaiveMm {
 		self.market_id_to_symbol.insert(market_id, snapshot.symbol.clone());
 		let is_ready = self.ready_markets.contains(&market_id);
 
-		// One-time cancel all at startup per symbol (only after ready)
-		if is_ready && !self.did_init.contains(&snapshot.symbol) {
-			if let Some(tx) = io.order_txs.get(&snapshot.symbol) {
+		// One-time cancel all at startup per market (only after ready)
+		if is_ready && !self.did_init.contains(&market_id) {
+			if let Some(tx) = io.order_txs.get(&market_id) {
 				if let Some(account_id) = self.binance_account_id {
 					let req = CancelAllRequest {
 						req_id: crate::xcommons::monoseq::next_id(),
 						timestamp: crate::xcommons::types::time::now_micros(),
-						market_id: XMarketId::make(snapshot.exchange_id, &snapshot.symbol),
+						market_id,
 						account_id,
 					};
 					let _ = tx.try_send(OrderRequest::CancelAll(req));
-					self.did_init.insert(snapshot.symbol.clone());
+					self.did_init.insert(market_id);
 				}
 			}
 		}
 		// Throttled pretty print of top10
-		if should_print {
-			let mut bids = snapshot.bids.clone();
-			let mut asks = snapshot.asks.clone();
-			bids.sort_by(|a,b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
-			asks.sort_by(|a,b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
-			let rows = 10usize;
-			log::info!("[OBS] {} top10:", snapshot.symbol);
-			log::info!("{:<12} {:<14} | {:<14} {:<12}", "bid_amt", "bid_px", "ask_px", "ask_amt");
-			for i in 0..rows {
-				let (bid_px, bid_qty) = if i < bids.len() { (bids[i].price, bids[i].qty) } else { (0.0, 0.0) };
-				let (ask_px, ask_qty) = if i < asks.len() { (asks[i].price, asks[i].qty) } else { (0.0, 0.0) };
-				if bid_qty == 0.0 && ask_qty == 0.0 { continue; }
-				log::info!(
-					"{:<12.4} {:<14.4} | {:<14.4} {:<12.4}",
-					bid_qty, bid_px, ask_px, ask_qty
-				);
-			}
-		}
+		// if should_print {
+		// 	let mut bids = snapshot.bids.clone();
+		// 	let mut asks = snapshot.asks.clone();
+		// 	bids.sort_by(|a,b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+		// 	asks.sort_by(|a,b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+		// 	let rows = 10usize;
+		// 	log::info!("[OBS] {} top10:", snapshot.symbol);
+		// 	log::info!("{:<12} {:<14} | {:<14} {:<12}", "bid_amt", "bid_px", "ask_px", "ask_amt");
+		// 	for i in 0..rows {
+		// 		let (bid_px, bid_qty) = if i < bids.len() { (bids[i].price, bids[i].qty) } else { (0.0, 0.0) };
+		// 		let (ask_px, ask_qty) = if i < asks.len() { (asks[i].price, asks[i].qty) } else { (0.0, 0.0) };
+		// 		if bid_qty == 0.0 && ask_qty == 0.0 { continue; }
+		// 		log::info!(
+		// 			"{:<12.4} {:<14.4} | {:<14.4} {:<12.4}",
+		// 			bid_qty, bid_px, ask_px, ask_qty
+		// 		);
+		// 	}
+		// }
 
 		// Trading logic
 		let code_start_us = crate::xcommons::types::time::now_micros();
@@ -182,12 +184,16 @@ impl Strategy for NaiveMm {
 		let bid_target = round_to_tick(mid_price * (1.0 - spread_bps / 10_000.0));
 		let ask_target = round_to_tick(mid_price * (1.0 + spread_bps / 10_000.0));
 		let disp_th = displace_bps / 10_000.0 * mid_price;
-		let entry = self.live_orders.entry(snapshot.symbol.clone()).or_insert((None, None));
-		if let Some(tx) = io.order_txs.get(&snapshot.symbol) {
+		let entry = self.live_orders.entry(market_id).or_insert((None, None));
+		if let Some(tx) = io.order_txs.get(&market_id) {
 			// BID side
 			match entry.0 {
 				Some((cl, px)) => {
-					if (px - bid_target).abs() > disp_th || pos_amt >= self.max_position { // displace or limit
+					// avoid canceling a just-posted order unless position limit breached
+					const MIN_LIVE_US: i64 = 300_000; // 300ms
+					let now_us2 = crate::xcommons::types::time::now_micros();
+					let is_fresh = self.last_req_ts_us.get(&cl).map(|t| now_us2 - *t).unwrap_or(i64::MAX) < MIN_LIVE_US;
+					if ((px - bid_target).abs() > disp_th && !is_fresh) || pos_amt >= self.max_position { // displace or limit
 						let creq = CancelRequest {
 							req_id: crate::xcommons::monoseq::next_id(),
 							timestamp: crate::xcommons::types::time::now_micros(),
@@ -197,15 +203,17 @@ impl Strategy for NaiveMm {
 							native_ord_id: None,
 						};
 						let sent = crate::xcommons::types::time::now_micros();
-						if tx.try_send(OrderRequest::Cancel(creq)).is_ok() {
+						if !self.pending_cancels.contains(&cl) && tx.try_send(OrderRequest::Cancel(creq)).is_ok() {
 							self.last_cancel_req_ts_us.insert(cl, sent);
+							self.cl_to_market_id.insert(cl, market_id);
+							self.pending_cancels.insert(cl);
 							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { prom.inc_strategy_cancel_request(strategy_name, &symbol_clone); }
 						}
-						entry.0 = None;
+						// keep entry until cancel is confirmed via execution
 					}
 				}
 				None => {
-					if pos_amt < self.max_position {
+					if pos_amt < self.max_position && entry.0.is_none() {
 						let preq = PostRequest {
 							req_id: crate::xcommons::monoseq::next_id(),
 							timestamp: crate::xcommons::types::time::now_micros(),
@@ -226,8 +234,10 @@ impl Strategy for NaiveMm {
 							entry.0 = Some((cl, bid_target));
 							let sent = crate::xcommons::types::time::now_micros();
 							self.last_req_ts_us.insert(cl, sent);
-							self.cl_to_symbol.insert(cl, snapshot.symbol.clone());
+							self.cl_to_market_id.insert(cl, market_id);
 							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { prom.inc_strategy_post_request(strategy_name, &symbol_clone); }
+						} else {
+							log::debug!("[naive_mm] skip post BUY: send failed or channel missing market_id={}", market_id);
 						}
 					}
 				}
@@ -235,7 +245,11 @@ impl Strategy for NaiveMm {
 			// ASK side
 			match entry.1 {
 				Some((cl, px)) => {
-					if (px - ask_target).abs() > disp_th || -pos_amt >= self.max_position { // displace or limit
+					// avoid canceling a just-posted order unless position limit breached
+					const MIN_LIVE_US: i64 = 300_000; // 300ms
+					let now_us2 = crate::xcommons::types::time::now_micros();
+					let is_fresh = self.last_req_ts_us.get(&cl).map(|t| now_us2 - *t).unwrap_or(i64::MAX) < MIN_LIVE_US;
+					if ((px - ask_target).abs() > disp_th && !is_fresh) || -pos_amt >= self.max_position { // displace or limit
 						let creq = CancelRequest {
 							req_id: crate::xcommons::monoseq::next_id(),
 							timestamp: crate::xcommons::types::time::now_micros(),
@@ -245,16 +259,17 @@ impl Strategy for NaiveMm {
 							native_ord_id: None,
 						};
 						let sent = crate::xcommons::types::time::now_micros();
-						if tx.try_send(OrderRequest::Cancel(creq)).is_ok() {
+						if !self.pending_cancels.contains(&cl) && tx.try_send(OrderRequest::Cancel(creq)).is_ok() {
 							self.last_cancel_req_ts_us.insert(cl, sent);
-							self.cl_to_symbol.insert(cl, snapshot.symbol.clone());
+							self.cl_to_market_id.insert(cl, market_id);
+							self.pending_cancels.insert(cl);
 							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { prom.inc_strategy_cancel_request(strategy_name, &symbol_clone); }
 						}
-						entry.1 = None;
+						// keep entry until cancel is confirmed via execution
 					}
 				}
 				None => {
-					if -pos_amt < self.max_position {
+					if -pos_amt < self.max_position && entry.1.is_none() {
 						let preq = PostRequest {
 							req_id: crate::xcommons::monoseq::next_id(),
 							timestamp: crate::xcommons::types::time::now_micros(),
@@ -275,8 +290,10 @@ impl Strategy for NaiveMm {
 							entry.1 = Some((cl, ask_target));
 							let sent = crate::xcommons::types::time::now_micros();
 							self.last_req_ts_us.insert(cl, sent);
-							self.cl_to_symbol.insert(cl, snapshot.symbol.clone());
+							self.cl_to_market_id.insert(cl, market_id);
 							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { prom.inc_strategy_post_request(strategy_name, &symbol_clone); }
+						} else {
+							log::debug!("[naive_mm] skip post SELL: send failed or channel missing market_id={}", market_id);
 						}
 					}
 				}
@@ -331,40 +348,57 @@ impl Strategy for NaiveMm {
 			// full network latencies for post/cancel (request -> ack)
 			let post_net = if exec.cl_ord_id != -1 { self.last_req_ts_us.remove(&exec.cl_ord_id).map(|sent| (exec.rcv_timestamp - sent).max(0) as u64) } else { None };
 			let cancel_net = if exec.cl_ord_id != -1 { self.last_cancel_req_ts_us.remove(&exec.cl_ord_id).map(|sent| (exec.rcv_timestamp - sent).max(0) as u64) } else { None };
-			if let Ok(mut g) = crate::metrics::GLOBAL_METRICS.lock() {
-				let h = &mut g.latency_histograms;
-				if let Some(nu) = post_net { h.record_post_network_latency(nu); }
-				if let Some(nu) = cancel_net { h.record_cancel_network_latency(nu); }
-				// we can later split network into separate hist if needed
+			// cancel ACK clears pending flag
+			if exec.exec_type == crate::xcommons::oms::ExecutionType::XOrderCanceled && exec.cl_ord_id != -1 {
+				self.pending_cancels.remove(&exec.cl_ord_id);
 			}
-			// Export quantiles
+			// Do not record post/cancel network hist here to avoid double-counting; on_order_response records ACK timings
+			// Export quantiles (skip explicit post/cancel here; use on_order_response ACK-based only)
 			if let Ok(g) = crate::metrics::GLOBAL_METRICS.lock() {
 				let h = &g.latency_histograms;
 				let symbol = exec.metadata.get("symbol").cloned()
-					.or_else(|| if exec.cl_ord_id != -1 { self.cl_to_symbol.get(&exec.cl_ord_id).cloned() } else { None })
 					.or_else(|| self.market_id_to_symbol.get(&exec.market_id).cloned())
+					.or_else(|| {
+						if exec.cl_ord_id != -1 {
+							self.cl_to_market_id
+								.get(&exec.cl_ord_id)
+								.and_then(|mid| self.market_id_to_symbol.get(mid).cloned())
+						} else { None }
+					})
 					.unwrap_or_else(|| "UNKNOWN".to_string());
 				prom.set_strategy_latency_quantiles(
 					strategy,
 					&symbol,
 					Some(h.tick_to_trade_us.value_at_quantile(0.50)),
 					Some(h.tick_to_trade_us.value_at_quantile(0.99)),
-					cancel_net.map(|_| h.tick_to_cancel_us.value_at_quantile(0.50)),
-					cancel_net.map(|_| h.tick_to_cancel_us.value_at_quantile(0.99)),
+					Some(h.tick_to_cancel_us.value_at_quantile(0.50)),
+					Some(h.tick_to_cancel_us.value_at_quantile(0.99)),
 					Some(h.code_us.value_at_quantile(0.50)),
 					Some(h.code_us.value_at_quantile(0.99)),
-					post_net.map(|_| h.post_network_us.value_at_quantile(0.50)),
-					post_net.map(|_| h.post_network_us.value_at_quantile(0.99)),
+					None,
+					None,
 				);
-				// Also set explicit post/cancel gauges using quantiles
-				prom.set_strategy_post_cancel_latencies(
-					strategy,
-					&symbol,
-					post_net.map(|_| h.post_network_us.value_at_quantile(0.50)),
-					post_net.map(|_| h.post_network_us.value_at_quantile(0.99)),
-					cancel_net.map(|_| h.cancel_network_us.value_at_quantile(0.50)),
-					cancel_net.map(|_| h.cancel_network_us.value_at_quantile(0.99)),
-				);
+			}
+			// Update live order slots based on execution state: clear on cancel or full fill
+			let market_id = exec.market_id;
+			if let Some(entry) = self.live_orders.get_mut(&market_id) {
+					let clear_due_to_cancel = exec.exec_type == crate::xcommons::oms::ExecutionType::XOrderCanceled
+						|| exec.ord_status == crate::xcommons::oms::OrderStatus::OStatusCanceled;
+					let clear_due_to_fill = exec.ord_status == crate::xcommons::oms::OrderStatus::OStatusFilled
+						|| (exec.leaves_qty == 0.0 && exec.exec_type == crate::xcommons::oms::ExecutionType::XTrade);
+					if clear_due_to_cancel || clear_due_to_fill {
+						if exec.cl_ord_id != -1 {
+							if let Some((cl, _px)) = entry.0 { if cl == exec.cl_ord_id { entry.0 = None; } }
+							if let Some((cl, _px)) = entry.1 { if cl == exec.cl_ord_id { entry.1 = None; } }
+						} else if clear_due_to_fill {
+							// Fallback for TRADE_LITE without client order id: clear by side
+							match exec.side {
+								crate::xcommons::oms::Side::Buy => { entry.0 = None; }
+								crate::xcommons::oms::Side::Sell => { entry.1 = None; }
+								_ => {}
+							}
+						}
+					}
 			}
 		}
 	}
@@ -376,26 +410,60 @@ impl Strategy for NaiveMm {
 			// Derive symbol using cl_ord_id lookup from live_orders
 			let mut symbol = "UNKNOWN".to_string();
 			if let Some(cl) = resp.cl_ord_id {
-				if let Some(s) = self.cl_to_symbol.get(&cl) { symbol = s.clone(); }
+				if let Some(s) = self.cl_to_market_id.get(&cl) { symbol = self.market_id_to_symbol.get(s).cloned().unwrap_or_default(); }
 			}
 			let post_net = resp.cl_ord_id.and_then(|cl| self.last_req_ts_us.remove(&cl).map(|sent| (resp.rcv_timestamp - sent).max(0) as u64));
-			let cancel_net = resp.cl_ord_id.and_then(|cl| self.last_cancel_req_ts_us.remove(&cl).map(|sent| (resp.rcv_timestamp - sent).max(0) as u64));
+			let cancel_net = resp.cl_ord_id.and_then(|cl| {
+				// Keep pending_cancels until we see an actual cancel execution to avoid duplicate cancels between ACK and ORTU
+				self.last_cancel_req_ts_us.remove(&cl).map(|sent| (resp.rcv_timestamp - sent).max(0) as u64)
+			});
 			{
 				if let Ok(mut g) = crate::metrics::GLOBAL_METRICS.lock() {
 					let h = &mut g.latency_histograms;
 					if let Some(nu) = post_net { h.record_post_network_latency(nu); }
 					if let Some(nu) = cancel_net { h.record_cancel_network_latency(nu); }
 				}
-				if let Ok(g) = crate::metrics::GLOBAL_METRICS.lock() {
-					let h = &g.latency_histograms;
+				// Set gauges from histogram quantiles (p50/p99)
+				if let Ok(g2) = crate::metrics::GLOBAL_METRICS.lock() {
+					let h2 = &g2.latency_histograms;
 					prom.set_strategy_post_cancel_latencies(
 						strategy,
 						&symbol,
-						post_net.map(|_| h.post_network_us.value_at_quantile(0.50)),
-						post_net.map(|_| h.post_network_us.value_at_quantile(0.99)),
-						cancel_net.map(|_| h.cancel_network_us.value_at_quantile(0.50)),
-						cancel_net.map(|_| h.cancel_network_us.value_at_quantile(0.99)),
+						Some(h2.post_network_us.value_at_quantile(0.50)),
+						Some(h2.post_network_us.value_at_quantile(0.99)),
+						Some(h2.cancel_network_us.value_at_quantile(0.50)),
+						Some(h2.cancel_network_us.value_at_quantile(0.99)),
 					);
+				}
+			}
+
+			// If this is a cancel ACK (cl still pending), clear slot immediately to avoid stall while waiting for ORTU
+			if resp.status == crate::xcommons::oms::OrderResponseStatus::Ok {
+				if let Some(cl) = resp.cl_ord_id {
+					if self.pending_cancels.contains(&cl) {
+						self.pending_cancels.remove(&cl);
+						if let Some(mid) = self.cl_to_market_id.get(&cl).cloned() {
+							if let Some(entry) = self.live_orders.get_mut(&mid) {
+								if let Some((ecl, _)) = entry.0 { if ecl == cl { entry.0 = None; } }
+								if let Some((ecl, _)) = entry.1 { if ecl == cl { entry.1 = None; } }
+							}
+						}
+					}
+				}
+			}
+
+			// If a post was rejected as post-only (or other failure), clear the slot so we can repost
+			if resp.status == crate::xcommons::oms::OrderResponseStatus::FailedPostOnly {
+				if let Some(cl) = resp.cl_ord_id {
+					// Remove any pending trace
+					self.last_req_ts_us.remove(&cl);
+					self.pending_cancels.remove(&cl);
+					if let Some(mid) = self.cl_to_market_id.get(&cl).cloned() {
+						if let Some(entry) = self.live_orders.get_mut(&mid) {
+							if let Some((ecl, _)) = entry.0 { if ecl == cl { entry.0 = None; } }
+							if let Some((ecl, _)) = entry.1 { if ecl == cl { entry.1 = None; } }
+						}
+					}
 				}
 			}
 		}

@@ -38,7 +38,7 @@ impl SubscriptionManager {
                         exchange_id: u.exchange,
                         symbol: u.ticker.clone(),
                         last_update_id: u.update_id,
-                        timestamp: u.rcv_timestamp,
+                        timestamp: u.timestamp,
                         sequence: u.seq_id,
                         bids,
                         asks,
@@ -84,7 +84,7 @@ impl SubscriptionManager {
                 && effective_sub.max_connections.unwrap_or(1) > 1
             {
                 // OBS with arbitration: run L2 arb into local channel, adapt to snapshots, forward OBS
-                let (l2_tx, mut l2_rx) = mpsc::channel::<StreamData>(10_000);
+                let (l2_tx, l2_rx) = mpsc::channel::<StreamData>(10_000);
                 let sub_clone = effective_sub.clone();
                 let okx_swap = okx_swap_registry.clone();
                 let okx_spot = okx_spot_registry.clone();
@@ -133,7 +133,7 @@ impl SubscriptionManager {
                 && !(effective_sub.max_connections.unwrap_or(1) > 1)
             {
                 // OBS without arbitration: run unified L2 handler into local channel, adapt to snapshot
-                let (l2_tx, mut l2_rx) = mpsc::channel::<StreamData>(10_000);
+                let (l2_tx, l2_rx) = mpsc::channel::<StreamData>(10_000);
                 let handler = UnifiedHandlerFactory::create_handler(
                     effective_sub.clone(),
                     index,

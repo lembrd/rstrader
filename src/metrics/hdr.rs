@@ -9,8 +9,8 @@ pub struct HistogramBounds {
 
 impl Default for HistogramBounds {
     fn default() -> Self {
-        // microseconds latency from 1us to 2s, 2 significant digits by default
-        Self { lowest: 1, highest: 2_000_000, sigfig: 2 }
+        // microseconds latency from 1us to 8s, 2 significant digits by default
+        Self { lowest: 1, highest: 8_000_000, sigfig: 2 }
     }
 }
 

@@ -101,6 +101,10 @@ pub struct PrometheusExporter {
     // Request counters
     strat_post_requests_total: IntCounterVec,
     strat_cancel_requests_total: IntCounterVec,
+    // WS-API metrics
+    ws_api_last_rtt_us: GaugeVec,
+    ws_api_requests_total: IntCounterVec, // labels: exchange, method, outcome {ok,error,timeout}
+    ws_api_errors_total: IntCounterVec,   // labels: exchange, method, code
 }
 
 impl PrometheusExporter {
@@ -167,6 +171,10 @@ impl PrometheusExporter {
         // Request counters (increment-only)
         let strat_post_requests_total = IntCounterVec::new(Opts::new("strategy_post_requests_total", "Total post order requests sent"), &["strategy","symbol"]).unwrap();
         let strat_cancel_requests_total = IntCounterVec::new(Opts::new("strategy_cancel_requests_total", "Total cancel order requests sent"), &["strategy","symbol"]).unwrap();
+        // WS-API metrics
+        let ws_api_last_rtt_us = GaugeVec::new(Opts::new("ws_api_last_rtt_us", "Last WS-API round-trip latency (us)"), &["exchange","method"]).unwrap();
+        let ws_api_requests_total = IntCounterVec::new(Opts::new("ws_api_requests_total", "WS-API requests by outcome"), &["exchange","method","outcome"]).unwrap();
+        let ws_api_errors_total = IntCounterVec::new(Opts::new("ws_api_errors_total", "WS-API error codes"), &["exchange","method","code"]).unwrap();
         registry.register(Box::new(recv_total.clone())).unwrap();
         registry.register(Box::new(processed_total.clone())).unwrap();
         registry.register(Box::new(parse_errors_total.clone())).unwrap();
@@ -198,7 +206,10 @@ impl PrometheusExporter {
         registry.register(Box::new(strat_cancel_p99.clone())).unwrap();
         registry.register(Box::new(strat_post_requests_total.clone())).unwrap();
         registry.register(Box::new(strat_cancel_requests_total.clone())).unwrap();
-        Self { registry, recv_total, processed_total, parse_errors_total, throughput, code_p50_us, code_p99_us, overall_p50_us, overall_p99_us, parse_p50_us, parse_p99_us, transform_p50_us, transform_p99_us, overhead_p50_us, overhead_p99_us, strategy_pnl, strategy_amount, strategy_bps, strat_tick_to_trade_p50, strat_tick_to_trade_p99, strat_tick_to_cancel_p50, strat_tick_to_cancel_p99, strat_code_p50, strat_code_p99, strat_network_p50, strat_network_p99, strat_post_p50, strat_post_p99, strat_cancel_p50, strat_cancel_p99, strat_post_requests_total, strat_cancel_requests_total }
+        registry.register(Box::new(ws_api_last_rtt_us.clone())).unwrap();
+        registry.register(Box::new(ws_api_requests_total.clone())).unwrap();
+        registry.register(Box::new(ws_api_errors_total.clone())).unwrap();
+        Self { registry, recv_total, processed_total, parse_errors_total, throughput, code_p50_us, code_p99_us, overall_p50_us, overall_p99_us, parse_p50_us, parse_p99_us, transform_p50_us, transform_p99_us, overhead_p50_us, overhead_p99_us, strategy_pnl, strategy_amount, strategy_bps, strat_tick_to_trade_p50, strat_tick_to_trade_p99, strat_tick_to_cancel_p50, strat_tick_to_cancel_p99, strat_code_p50, strat_code_p99, strat_network_p50, strat_network_p99, strat_post_p50, strat_post_p99, strat_cancel_p50, strat_cancel_p99, strat_post_requests_total, strat_cancel_requests_total, ws_api_last_rtt_us, ws_api_requests_total, ws_api_errors_total }
     }
 
     pub fn gather(&self) -> String {
@@ -334,6 +345,17 @@ impl PrometheusExporter {
     }
     pub fn inc_strategy_cancel_request(&self, strategy: &str, symbol: &str) {
         self.strat_cancel_requests_total.with_label_values(&[strategy, symbol]).inc();
+    }
+
+    // WS-API helpers
+    pub fn set_ws_api_last_rtt_us(&self, exchange: &str, method: &str, rtt_us: u64) {
+        self.ws_api_last_rtt_us.with_label_values(&[exchange, method]).set(rtt_us as f64);
+    }
+    pub fn inc_ws_api_request_outcome(&self, exchange: &str, method: &str, outcome: &str) {
+        self.ws_api_requests_total.with_label_values(&[exchange, method, outcome]).inc();
+    }
+    pub fn inc_ws_api_error_code(&self, exchange: &str, method: &str, code: &str) {
+        self.ws_api_errors_total.with_label_values(&[exchange, method, code]).inc();
     }
 }
 
