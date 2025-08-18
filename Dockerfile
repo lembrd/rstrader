@@ -22,6 +22,8 @@ RUN set -eu \
   && tar -xzf flyway.tar.gz \
   && mv flyway-${FLYWAY_VERSION} /opt/flyway \
   && ln -s /opt/flyway/flyway /usr/local/bin/flyway \
+  && chmod -R a+rx /opt/flyway \
+  && chmod a+rx /usr/local/bin/flyway \
   && rm -f flyway.tar.gz
 
 WORKDIR /home/runner
@@ -31,7 +33,7 @@ COPY --from=builder /app/sql/pg /usr/local/share/xtrader/migrations/pg
 # Wrapper entrypoint to run migrations then start app
 COPY scripts/docker_entrypoint.sh /usr/local/bin/docker_entrypoint.sh
 RUN chmod +x /usr/local/bin/docker_entrypoint.sh \
-  && chown -R 10001:10001 /usr/local/share/xtrader
+  && chown -R 10001:10001 /usr/local/share/xtrader /opt/flyway
 USER runner
 ENTRYPOINT ["/usr/local/bin/docker_entrypoint.sh"]
 
