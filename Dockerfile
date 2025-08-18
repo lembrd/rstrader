@@ -11,18 +11,18 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 RUN useradd -m -u 10001 runner \
-  && apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata wget \
+  && apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata wget tar gzip \
   && rm -rf /var/lib/apt/lists/*
 
 # Install Flyway Commandline (bundled JRE)
 ARG FLYWAY_VERSION=9.22.3
 RUN set -euo pipefail \
   && cd /tmp \
-  && wget -q https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/${FLYWAY_VERSION}/flyway-commandline-${FLYWAY_VERSION}-linux-x64.tar.gz \
-  && tar -xzf flyway-commandline-${FLYWAY_VERSION}-linux-x64.tar.gz \
+  && wget -qO flyway.tar.gz "https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/${FLYWAY_VERSION}/flyway-commandline-${FLYWAY_VERSION}-linux-x64.tar.gz" \
+  && tar -xzf flyway.tar.gz \
   && mv flyway-${FLYWAY_VERSION} /opt/flyway \
   && ln -s /opt/flyway/flyway /usr/local/bin/flyway \
-  && rm -f flyway-commandline-${FLYWAY_VERSION}-linux-x64.tar.gz
+  && rm -f flyway.tar.gz
 
 WORKDIR /home/runner
 COPY --from=builder /app/target/release/xtrader /usr/local/bin/xtrader
