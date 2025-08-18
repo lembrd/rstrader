@@ -42,6 +42,13 @@ pub enum StrategyMessage {
 pub struct StrategyIo<'a> {
     pub env: &'a dyn AppEnvironment,
     pub order_txs: std::collections::HashMap<i64, tokio::sync::mpsc::Sender<OrderRequest>>, // market_id -> tx
+    // Set by strategies to request a deferred update() after the current mailbox drain
+    update_scheduled: bool,
+}
+
+impl<'a> StrategyIo<'a> {
+    #[inline]
+    pub fn schedule_update(&mut self) { self.update_scheduled = true; }
 }
 
 #[async_trait]
@@ -61,6 +68,10 @@ pub trait Strategy: Send + Sync {
     fn on_obs(&mut self, _sub: SubscriptionId, _snapshot: OrderBookSnapshot, _io: &mut StrategyIo) {}
     fn on_order_response(&mut self, _resp: OrderResponse, _io: &mut StrategyIo) {}
     fn on_control(&mut self, _c: StrategyControl, _io: &mut StrategyIo) {}
+
+    /// Called by the framework after draining all currently available mailbox messages,
+    /// if the strategy requested an update via `StrategyIo::schedule_update()`.
+    fn update(&mut self, _io: &mut StrategyIo) {}
 }
 
 pub struct StrategyRegistrar<'a> {
@@ -143,19 +154,25 @@ impl StrategyRunner {
                     StreamData::L2(msg) => {
                         let key = (CoreStreamType::L2, msg.exchange, msg.ticker.clone());
                         if let Some(&sid) = key_to_subid.get(&key) {
-                            let _ = forward_tx.try_send(StrategyMessage::MarketDataL2 { sub: sid, msg });
+                            if let Err(e) = forward_tx.try_send(StrategyMessage::MarketDataL2 { sub: sid, msg }) {
+                                log::warn!("[StrategyRunner] mailbox overflow dropping L2 for {:?}. Error={}", key, e);
+                            }
                         }
                     }
                     StreamData::Trade(msg) => {
                         let key = (CoreStreamType::Trade, msg.exchange, msg.ticker.clone());
                         if let Some(&sid) = key_to_subid.get(&key) {
-                            let _ = forward_tx.try_send(StrategyMessage::MarketDataTrade { sub: sid, msg });
+                            if let Err(e) = forward_tx.try_send(StrategyMessage::MarketDataTrade { sub: sid, msg }) {
+                                log::warn!("[StrategyRunner] mailbox overflow dropping Trade for {:?}. Error={}", key, e);
+                            }
                         }
                     }
                     StreamData::Obs(snapshot) => {
                         let key = (CoreStreamType::Obs, snapshot.exchange_id, snapshot.symbol.clone());
                         if let Some(&sid) = key_to_subid.get(&key) {
-                            let _ = forward_tx.try_send(StrategyMessage::Obs { sub: sid, snapshot });
+                            if let Err(e) = forward_tx.try_send(StrategyMessage::Obs { sub: sid, snapshot }) {
+                                log::warn!("[StrategyRunner] mailbox overflow dropping OBS for {:?}. Error={}", key, e);
+                            }
                         }
                     }
                 }
@@ -215,19 +232,65 @@ impl StrategyRunner {
                         let mut resp_rx = account.subscribe_order_responses();
                         let ftx = forward_tx.clone();
                         tokio::spawn(async move {
+                            let mut exec_open = true;
+                            let mut pos_open = true;
+                            let mut resp_open = true;
                             loop {
                                 tokio::select! {
-                                    Ok(exec) = exec_rx.recv() => {
-                                        let _ = ftx.try_send(StrategyMessage::Execution { account_id, exec });
+                                    res = exec_rx.recv(), if exec_open => {
+                                        match res {
+                                            Ok(exec) => {
+                                                if ftx.send(StrategyMessage::Execution { account_id, exec: exec.clone() }).await.is_err() {
+                                                    log::warn!("[StrategyRunner] dropping execution: mailbox closed");
+                                                } else {
+                                                    log::debug!("[StrategyRunner] forwarded execution: market_id={} side={} qty={} px={}", exec.market_id, exec.side as i8, exec.last_qty, exec.last_px);
+                                                }
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                                log::warn!("[StrategyRunner] exec_rx lagged, skipped {} messages", skipped);
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                                exec_open = false;
+                                            }
+                                        }
                                     }
-                                    Ok((mid, pos)) = pos_rx.recv() => {
-                                        let _ = ftx.try_send(StrategyMessage::Position { account_id, market_id: mid, pos });
+                                    res = pos_rx.recv(), if pos_open => {
+                                        match res {
+                                            Ok((mid, pos)) => {
+                                                if ftx.send(StrategyMessage::Position { account_id, market_id: mid, pos: pos.clone() }).await.is_err() {
+                                                    log::warn!("[StrategyRunner] dropping position: mailbox closed (market_id={})", mid);
+                                                } else {
+                                                    log::info!("[StrategyRunner] forwarded position: market_id={} amount={} avp={}", mid, pos.amount, pos.avp);
+                                                }
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                                log::warn!("[StrategyRunner] pos_rx lagged, skipped {} messages", skipped);
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                                pos_open = false;
+                                            }
+                                        }
                                     }
-                                    Ok(resp) = resp_rx.recv() => {
-                                        let _ = ftx.try_send(StrategyMessage::OrderResponse(resp));
+                                    res = resp_rx.recv(), if resp_open => {
+                                        match res {
+                                            Ok(resp) => {
+                                                if ftx.send(StrategyMessage::OrderResponse(resp)).await.is_err() {
+                                                    log::warn!("[StrategyRunner] dropping order response: mailbox closed");
+                                                } else {
+                                                    log::debug!("[StrategyRunner] forwarded order response");
+                                                }
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                                log::warn!("[StrategyRunner] resp_rx lagged, skipped {} messages", skipped);
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                                resp_open = false;
+                                            }
+                                        }
                                     }
                                     else => break,
                                 }
+                                if !exec_open && !pos_open && !resp_open { break; }
                             }
                         });
                         // Bridge order requests to exchange adapter API; spawn per-request to allow concurrency
@@ -238,7 +301,11 @@ impl StrategyRunner {
                                 let ftx2 = ftx2.clone();
                                 tokio::spawn(async move {
                                     match adapter_req.send_request(req).await {
-                                        Ok(resp) => { let _ = ftx2.try_send(StrategyMessage::OrderResponse(resp)); }
+                                        Ok(resp) => {
+                                            if let Err(e) = ftx2.try_send(StrategyMessage::OrderResponse(resp)) {
+                                                log::warn!("[StrategyRunner] mailbox overflow dropping OrderResponse. Error={}", e);
+                                            }
+                                        }
                                         Err(e) => { log::error!("[StrategyRunner] send_request error for {}: {}", market_id, e); }
                                     }
                                 });
@@ -252,17 +319,39 @@ impl StrategyRunner {
             }
         }
 
-        // Single-threaded dispatch loop
-        let mut io = StrategyIo { env: ctx.env.as_ref(), order_txs };
-        while let Some(m) = rx.recv().await {
-            match m {
-                StrategyMessage::MarketDataL2 { sub, msg } => strategy.on_l2(sub, msg, &mut io),
-                StrategyMessage::MarketDataTrade { sub, msg } => strategy.on_trade(sub, msg, &mut io),
-                StrategyMessage::Execution { account_id, exec } => strategy.on_execution(account_id, exec, &mut io),
-                StrategyMessage::Position { account_id, market_id, pos } => strategy.on_position(account_id, market_id, pos, &mut io),
-                StrategyMessage::Obs { sub, snapshot } => strategy.on_obs(sub, snapshot, &mut io),
-                StrategyMessage::OrderResponse(r) => strategy.on_order_response(r, &mut io),
-                StrategyMessage::Control(c) => strategy.on_control(c, &mut io),
+        // Single-threaded dispatch loop with mailbox draining and deferred updates
+        let mut io = StrategyIo { env: ctx.env.as_ref(), order_txs, update_scheduled: false };
+        loop {
+            let first = match rx.recv().await {
+                Some(m) => m,
+                None => break,
+            };
+
+            let mut handle_msg = |msg: StrategyMessage| {
+                match msg {
+                    StrategyMessage::MarketDataL2 { sub, msg } => strategy.on_l2(sub, msg, &mut io),
+                    StrategyMessage::MarketDataTrade { sub, msg } => strategy.on_trade(sub, msg, &mut io),
+                    StrategyMessage::Execution { account_id, exec } => strategy.on_execution(account_id, exec, &mut io),
+                    StrategyMessage::Position { account_id, market_id, pos } => strategy.on_position(account_id, market_id, pos, &mut io),
+                    StrategyMessage::Obs { sub, snapshot } => strategy.on_obs(sub, snapshot, &mut io),
+                    StrategyMessage::OrderResponse(r) => strategy.on_order_response(r, &mut io),
+                    StrategyMessage::Control(c) => strategy.on_control(c, &mut io),
+                }
+            };
+
+            handle_msg(first);
+            // Drain mailbox without awaiting to form a batch
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => handle_msg(m),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+                }
+            }
+
+            if io.update_scheduled {
+                strategy.update(&mut io);
+                io.update_scheduled = false;
             }
         }
 
