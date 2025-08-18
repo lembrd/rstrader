@@ -18,7 +18,7 @@ FROM flyway/flyway:11.11.1 AS flyway
 
 FROM debian:bookworm-slim
 RUN useradd -m -u 10001 runner \
-  && apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata wget tar gzip \
+  && apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata wget tar gzip openjdk-17-jre-headless \
   && rm -rf /var/lib/apt/lists/*
 
 # Install Flyway (copy from official image; includes JRE)
