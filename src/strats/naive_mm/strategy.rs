@@ -187,7 +187,10 @@ impl Strategy for NaiveMm {
 			let pos = self.position.clone();
 			let pnl = pos.current_pnl(mid_price);
 			let bps = pos.bps();
-			if let Some(symbol) = self.symbol.as_ref() { prom.set_strategy_metrics(self.name(), symbol, pnl, pos.amount, bps); }
+			if let Some(symbol) = self.symbol.as_ref() {
+				prom.set_strategy_metrics(self.name(), symbol, pnl, pos.amount, bps);
+				prom.set_strategy_mid_price(self.name(), symbol, mid_price);
+			}
 		}
 
 		if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {

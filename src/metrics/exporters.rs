@@ -84,6 +84,7 @@ pub struct PrometheusExporter {
     strategy_pnl: GaugeVec,
     strategy_amount: GaugeVec,
     strategy_bps: GaugeVec,
+    strategy_mid_price: GaugeVec,
     // Strategy latency (us) gauges
     strat_tick_to_trade_p50: GaugeVec,
     strat_tick_to_trade_p99: GaugeVec,
@@ -154,6 +155,9 @@ impl PrometheusExporter {
         let strategy_bps = GaugeVec::new(Opts::new("strategy_bps", "Realized PnL in bps"), &[
             "strategy", "symbol"
         ]).unwrap();
+        let strategy_mid_price = GaugeVec::new(Opts::new("strategy_mid_price", "Mid price observed by strategy"), &[
+            "strategy", "symbol"
+        ]).unwrap();
         // Strategy latency
         let strat_tick_to_trade_p50 = GaugeVec::new(Opts::new("strategy_tick_to_trade_p50_us", "Tick-to-trade p50 (us)"), &["strategy","symbol"]).unwrap();
         let strat_tick_to_trade_p99 = GaugeVec::new(Opts::new("strategy_tick_to_trade_p99_us", "Tick-to-trade p99 (us)"), &["strategy","symbol"]).unwrap();
@@ -192,6 +196,7 @@ impl PrometheusExporter {
         registry.register(Box::new(strategy_pnl.clone())).unwrap();
         registry.register(Box::new(strategy_amount.clone())).unwrap();
         registry.register(Box::new(strategy_bps.clone())).unwrap();
+        registry.register(Box::new(strategy_mid_price.clone())).unwrap();
         registry.register(Box::new(strat_tick_to_trade_p50.clone())).unwrap();
         registry.register(Box::new(strat_tick_to_trade_p99.clone())).unwrap();
         registry.register(Box::new(strat_tick_to_cancel_p50.clone())).unwrap();
@@ -209,7 +214,7 @@ impl PrometheusExporter {
         registry.register(Box::new(ws_api_last_rtt_us.clone())).unwrap();
         registry.register(Box::new(ws_api_requests_total.clone())).unwrap();
         registry.register(Box::new(ws_api_errors_total.clone())).unwrap();
-        Self { registry, recv_total, processed_total, parse_errors_total, throughput, code_p50_us, code_p99_us, overall_p50_us, overall_p99_us, parse_p50_us, parse_p99_us, transform_p50_us, transform_p99_us, overhead_p50_us, overhead_p99_us, strategy_pnl, strategy_amount, strategy_bps, strat_tick_to_trade_p50, strat_tick_to_trade_p99, strat_tick_to_cancel_p50, strat_tick_to_cancel_p99, strat_code_p50, strat_code_p99, strat_network_p50, strat_network_p99, strat_post_p50, strat_post_p99, strat_cancel_p50, strat_cancel_p99, strat_post_requests_total, strat_cancel_requests_total, ws_api_last_rtt_us, ws_api_requests_total, ws_api_errors_total }
+        Self { registry, recv_total, processed_total, parse_errors_total, throughput, code_p50_us, code_p99_us, overall_p50_us, overall_p99_us, parse_p50_us, parse_p99_us, transform_p50_us, transform_p99_us, overhead_p50_us, overhead_p99_us, strategy_pnl, strategy_amount, strategy_bps, strategy_mid_price, strat_tick_to_trade_p50, strat_tick_to_trade_p99, strat_tick_to_cancel_p50, strat_tick_to_cancel_p99, strat_code_p50, strat_code_p99, strat_network_p50, strat_network_p99, strat_post_p50, strat_post_p99, strat_cancel_p50, strat_cancel_p99, strat_post_requests_total, strat_cancel_requests_total, ws_api_last_rtt_us, ws_api_requests_total, ws_api_errors_total }
     }
 
     pub fn gather(&self) -> String {
@@ -310,6 +315,11 @@ impl PrometheusExporter {
         self.strategy_pnl.with_label_values(labels).set(pnl);
         self.strategy_amount.with_label_values(labels).set(amount);
         self.strategy_bps.with_label_values(labels).set(bps);
+    }
+
+    pub fn set_strategy_mid_price(&self, strategy: &str, symbol: &str, mid_price: f64) {
+        let labels = &[strategy, symbol];
+        self.strategy_mid_price.with_label_values(labels).set(mid_price);
     }
 
     pub fn set_strategy_latency_quantiles(&self, strategy: &str, symbol: &str,
