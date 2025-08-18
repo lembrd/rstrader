@@ -2,18 +2,15 @@
 set -euo pipefail
 
 # Requires env: DATABASE_URL or explicit PG vars
-if [[ -n "${DATABASE_URL:-}" ]]; then
-  DB_URL="$DATABASE_URL"
-else
-  PG_HOST=${POSTGRES_HOST:-127.0.0.1}
-  PG_PORT=${POSTGRES_PORT:-5432}
-  PG_DB=${POSTGRES_DB:-xtrader}
-  PG_USER=${POSTGRES_USER:-xtrader}
-  PG_PASSWORD=${POSTGRES_PASSWORD:-xtrader}
-  DB_URL="jdbc:postgresql://${PG_HOST}:${PG_PORT}/${PG_DB}"
-  export FLYWAY_USER="$PG_USER"
-  export FLYWAY_PASSWORD="$PG_PASSWORD"
-fi
+PG_HOST=${POSTGRES_HOST:-127.0.0.1}
+PG_PORT=${POSTGRES_PORT:-5432}
+PG_DB=${POSTGRES_DB:-xtrader}
+PG_USER=${POSTGRES_USER:-xtrader}
+PG_PASSWORD=${POSTGRES_PASSWORD:-xtrader}
+DB_URL="jdbc:postgresql://${PG_HOST}:${PG_PORT}/${PG_DB}"
+export FLYWAY_USER="$PG_USER"
+export FLYWAY_PASSWORD="$PG_PASSWORD"
+export DATABASE_URL="postgres://$PG_USER:$PG_PASSWORD@$PG_HOST:$PG_PORT/$PG_DB"
 
 MIGRATIONS_DIR=/usr/local/share/xtrader/migrations/pg
 
@@ -24,6 +21,6 @@ else
   echo "[entrypoint] No migrations directory found, skipping Flyway."
 fi
 
-echo "[entrypoint] Starting xtrader: $*"
+echo "[entrypoint] Starting DB:$DATABASE_URL xtrader: $*"
 exec /usr/local/bin/xtrader "$@"
 
