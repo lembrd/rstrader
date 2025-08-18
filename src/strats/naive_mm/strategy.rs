@@ -13,11 +13,17 @@ use crate::xcommons::xmarket_id::XMarketId;
 
 use super::config::NaiveMmConfig;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiveOrderStatus { PendingNew, Live, PendingCancel }
+
+#[derive(Clone, Copy)]
+struct LiveOrder { status: LiveOrderStatus, cl_ord_id: i64, price: f64 }
+
 pub struct NaiveMm {
 	fair_px: f64,
 	obs_last_print_us: HashMap<SubscriptionId, i64>,
 	// per symbol state
-	live_orders: HashMap<i64, (Option<(i64, f64)>, Option<(i64, f64)>)>, // market_id -> (bid: (cl_id, px), ask: (cl_id, px))
+	live_orders: HashMap<i64, (Option<LiveOrder>, Option<LiveOrder>)>, // market_id -> (bid, ask)
 	did_init: std::collections::HashSet<i64>,
 	positions: HashMap<i64, Position>,
 	ready_markets: std::collections::HashSet<i64>,
@@ -34,6 +40,7 @@ pub struct NaiveMm {
 	cl_to_market_id: HashMap<i64, i64>, // cl_ord_id -> market_id
 	market_id_to_symbol: HashMap<i64, String>,
 	pending_cancels: std::collections::HashSet<i64>,
+	cl_to_side: HashMap<i64, Side>,
 }
 
 impl Default for NaiveMm {
@@ -56,6 +63,7 @@ impl Default for NaiveMm {
 			cl_to_market_id: HashMap::new(),
 			market_id_to_symbol: HashMap::new(),
 			pending_cancels: std::collections::HashSet::new(),
+			cl_to_side: HashMap::new(),
 		}
 	}
 }
@@ -188,12 +196,9 @@ impl Strategy for NaiveMm {
 		if let Some(tx) = io.order_txs.get(&market_id) {
 			// BID side
 			match entry.0 {
-				Some((cl, px)) => {
-					// avoid canceling a just-posted order unless position limit breached
-					const MIN_LIVE_US: i64 = 300_000; // 300ms
-					let now_us2 = crate::xcommons::types::time::now_micros();
-					let is_fresh = self.last_req_ts_us.get(&cl).map(|t| now_us2 - *t).unwrap_or(i64::MAX) < MIN_LIVE_US;
-					if ((px - bid_target).abs() > disp_th && !is_fresh) || pos_amt >= self.max_position { // displace or limit
+				Some(lo) => {
+					let cl = lo.cl_ord_id; let px = lo.price;
+					if lo.status == LiveOrderStatus::Live && ((px - bid_target).abs() > disp_th || pos_amt >= self.max_position) { // displace or limit only when live
 						let creq = CancelRequest {
 							req_id: crate::xcommons::monoseq::next_id(),
 							timestamp: crate::xcommons::types::time::now_micros(),
@@ -207,6 +212,8 @@ impl Strategy for NaiveMm {
 							self.last_cancel_req_ts_us.insert(cl, sent);
 							self.cl_to_market_id.insert(cl, market_id);
 							self.pending_cancels.insert(cl);
+							// mark as pending cancel
+							if let Some(ref mut cur) = entry.0 { cur.status = LiveOrderStatus::PendingCancel; }
 							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { prom.inc_strategy_cancel_request(strategy_name, &symbol_clone); }
 						}
 						// keep entry until cancel is confirmed via execution
@@ -231,10 +238,11 @@ impl Strategy for NaiveMm {
 						};
 						let cl = preq.cl_ord_id;
 						if tx.try_send(OrderRequest::Post(preq)).is_ok() {
-							entry.0 = Some((cl, bid_target));
+							entry.0 = Some(LiveOrder { status: LiveOrderStatus::PendingNew, cl_ord_id: cl, price: bid_target });
 							let sent = crate::xcommons::types::time::now_micros();
 							self.last_req_ts_us.insert(cl, sent);
 							self.cl_to_market_id.insert(cl, market_id);
+							self.cl_to_side.insert(cl, Side::Buy);
 							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { prom.inc_strategy_post_request(strategy_name, &symbol_clone); }
 						} else {
 							log::debug!("[naive_mm] skip post BUY: send failed or channel missing market_id={}", market_id);
@@ -244,12 +252,9 @@ impl Strategy for NaiveMm {
 			}
 			// ASK side
 			match entry.1 {
-				Some((cl, px)) => {
-					// avoid canceling a just-posted order unless position limit breached
-					const MIN_LIVE_US: i64 = 300_000; // 300ms
-					let now_us2 = crate::xcommons::types::time::now_micros();
-					let is_fresh = self.last_req_ts_us.get(&cl).map(|t| now_us2 - *t).unwrap_or(i64::MAX) < MIN_LIVE_US;
-					if ((px - ask_target).abs() > disp_th && !is_fresh) || -pos_amt >= self.max_position { // displace or limit
+				Some(lo) => {
+					let cl = lo.cl_ord_id; let px = lo.price;
+					if lo.status == LiveOrderStatus::Live && ((px - ask_target).abs() > disp_th || -pos_amt >= self.max_position) { // displace or limit only when live
 						let creq = CancelRequest {
 							req_id: crate::xcommons::monoseq::next_id(),
 							timestamp: crate::xcommons::types::time::now_micros(),
@@ -263,6 +268,7 @@ impl Strategy for NaiveMm {
 							self.last_cancel_req_ts_us.insert(cl, sent);
 							self.cl_to_market_id.insert(cl, market_id);
 							self.pending_cancels.insert(cl);
+							if let Some(ref mut cur) = entry.1 { cur.status = LiveOrderStatus::PendingCancel; }
 							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { prom.inc_strategy_cancel_request(strategy_name, &symbol_clone); }
 						}
 						// keep entry until cancel is confirmed via execution
@@ -287,10 +293,11 @@ impl Strategy for NaiveMm {
 						};
 						let cl = preq.cl_ord_id;
 						if tx.try_send(OrderRequest::Post(preq)).is_ok() {
-							entry.1 = Some((cl, ask_target));
+							entry.1 = Some(LiveOrder { status: LiveOrderStatus::PendingNew, cl_ord_id: cl, price: ask_target });
 							let sent = crate::xcommons::types::time::now_micros();
 							self.last_req_ts_us.insert(cl, sent);
 							self.cl_to_market_id.insert(cl, market_id);
+							self.cl_to_side.insert(cl, Side::Sell);
 							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { prom.inc_strategy_post_request(strategy_name, &symbol_clone); }
 						} else {
 							log::debug!("[naive_mm] skip post SELL: send failed or channel missing market_id={}", market_id);
@@ -352,6 +359,10 @@ impl Strategy for NaiveMm {
 			if exec.exec_type == crate::xcommons::oms::ExecutionType::XOrderCanceled && exec.cl_ord_id != -1 {
 				self.pending_cancels.remove(&exec.cl_ord_id);
 			}
+            // also clear any pending cancel if the order actually FILLED before cancel ACK
+            if exec.ord_status == crate::xcommons::oms::OrderStatus::OStatusFilled && exec.cl_ord_id != -1 {
+                self.pending_cancels.remove(&exec.cl_ord_id);
+            }
 			// Do not record post/cancel network hist here to avoid double-counting; on_order_response records ACK timings
 			// Export quantiles (skip explicit post/cancel here; use on_order_response ACK-based only)
 			if let Ok(g) = crate::metrics::GLOBAL_METRICS.lock() {
@@ -379,24 +390,18 @@ impl Strategy for NaiveMm {
 					None,
 				);
 			}
-			// Update live order slots based on execution state: clear on cancel or full fill
+			// Update local state strictly by cl_ord_id: only mutate when IDs match; otherwise ignore here (displacement path may cancel unknowns)
 			let market_id = exec.market_id;
 			if let Some(entry) = self.live_orders.get_mut(&market_id) {
-					let clear_due_to_cancel = exec.exec_type == crate::xcommons::oms::ExecutionType::XOrderCanceled
-						|| exec.ord_status == crate::xcommons::oms::OrderStatus::OStatusCanceled;
-					let clear_due_to_fill = exec.ord_status == crate::xcommons::oms::OrderStatus::OStatusFilled
-						|| (exec.leaves_qty == 0.0 && exec.exec_type == crate::xcommons::oms::ExecutionType::XTrade);
-					if clear_due_to_cancel || clear_due_to_fill {
-						if exec.cl_ord_id != -1 {
-							if let Some((cl, _px)) = entry.0 { if cl == exec.cl_ord_id { entry.0 = None; } }
-							if let Some((cl, _px)) = entry.1 { if cl == exec.cl_ord_id { entry.1 = None; } }
-						} else if clear_due_to_fill {
-							// Fallback for TRADE_LITE without client order id: clear by side
-							match exec.side {
-								crate::xcommons::oms::Side::Buy => { entry.0 = None; }
-								crate::xcommons::oms::Side::Sell => { entry.1 = None; }
-								_ => {}
-							}
+					if exec.cl_ord_id != -1 {
+						let bid_match = entry.0.map(|lo| lo.cl_ord_id == exec.cl_ord_id).unwrap_or(false);
+						let ask_match = entry.1.map(|lo| lo.cl_ord_id == exec.cl_ord_id).unwrap_or(false);
+						if exec.ord_status.is_alive() {
+							if bid_match { if let Some(ref mut lo) = entry.0 { lo.status = LiveOrderStatus::Live; } }
+							if ask_match { if let Some(ref mut lo) = entry.1 { lo.status = LiveOrderStatus::Live; } }
+						} else {
+							if bid_match { entry.0 = None; }
+							if ask_match { entry.1 = None; }
 						}
 					}
 			}
@@ -444,8 +449,8 @@ impl Strategy for NaiveMm {
 						self.pending_cancels.remove(&cl);
 						if let Some(mid) = self.cl_to_market_id.get(&cl).cloned() {
 							if let Some(entry) = self.live_orders.get_mut(&mid) {
-								if let Some((ecl, _)) = entry.0 { if ecl == cl { entry.0 = None; } }
-								if let Some((ecl, _)) = entry.1 { if ecl == cl { entry.1 = None; } }
+								if let Some(lo) = entry.0 { if lo.cl_ord_id == cl { entry.0 = None; } }
+								if let Some(lo) = entry.1 { if lo.cl_ord_id == cl { entry.1 = None; } }
 							}
 						}
 					}
@@ -460,8 +465,8 @@ impl Strategy for NaiveMm {
 					self.pending_cancels.remove(&cl);
 					if let Some(mid) = self.cl_to_market_id.get(&cl).cloned() {
 						if let Some(entry) = self.live_orders.get_mut(&mid) {
-							if let Some((ecl, _)) = entry.0 { if ecl == cl { entry.0 = None; } }
-							if let Some((ecl, _)) = entry.1 { if ecl == cl { entry.1 = None; } }
+							if let Some(lo) = entry.0 { if lo.cl_ord_id == cl { entry.0 = None; } }
+							if let Some(lo) = entry.1 { if lo.cl_ord_id == cl { entry.1 = None; } }
 						}
 					}
 				}
