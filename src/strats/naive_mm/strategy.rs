@@ -134,8 +134,8 @@ impl Strategy for NaiveMm {
 		let should_print = now_us - self.obs_last_print_us >= PRINT_INTERVAL_US;
 		if should_print { self.obs_last_print_us = now_us; }
 
-		let market_id = snapshot.market_id;
-		self.market_id = Some(market_id);
+		let market_id = self.market_id.unwrap_or_default();
+		// self.market_id = Some(market_id);
 		self.last_obs_ts_us = snapshot.timestamp;
 		let is_ready = self.ready;
 
