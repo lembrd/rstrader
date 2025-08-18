@@ -168,11 +168,24 @@ impl StrategyRunner {
                         }
                     }
                     StreamData::Obs(snapshot) => {
-                        let key = (CoreStreamType::Obs, snapshot.exchange_id, snapshot.symbol.clone());
-                        if let Some(&sid) = key_to_subid.get(&key) {
-                            if let Err(e) = forward_tx.try_send(StrategyMessage::Obs { sub: sid, snapshot }) {
-                                log::warn!("[StrategyRunner] mailbox overflow dropping OBS for {:?}. Error={}", key, e);
+                        // For OBS routing, use market_id as key by mapping back to instrument spec key
+                        // Since SubscriptionSpec is keyed by (stream_type, exchange, instrument), and OBS now carries only market_id,
+                        // we route OBS broadly by iterating keys and matching market_id via XMarketId.
+                        // Fast path: try to find a unique sub with same market_id computed from its spec.
+                        let mut routed = false;
+                        for ((stype, ex, instr), sid) in key_to_subid.iter() {
+                            if *stype != CoreStreamType::Obs { continue; }
+                            let mid = crate::xcommons::xmarket_id::XMarketId::make(*ex, instr);
+                            if mid == snapshot.market_id {
+                                if let Err(e) = forward_tx.try_send(StrategyMessage::Obs { sub: *sid, snapshot: snapshot.clone() }) {
+                                    log::warn!("[StrategyRunner] mailbox overflow dropping OBS for market_id={}. Error={}", snapshot.market_id, e);
+                                }
+                                routed = true;
+                                break;
                             }
+                        }
+                        if !routed {
+                            log::debug!("[StrategyRunner] no OBS subscription found for market_id={}", snapshot.market_id);
                         }
                     }
                 }

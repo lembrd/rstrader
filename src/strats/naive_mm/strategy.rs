@@ -97,6 +97,13 @@ impl Strategy for NaiveMm {
 			}
 		}
 
+		// Initialize symbol and market_id from config (first symbol)
+		if let Some(sym) = cfg.binance.symbols.get(0).cloned() {
+			let mid = XMarketId::make(crate::xcommons::types::ExchangeId::BinanceFutures, &sym);
+			self.symbol = Some(sym);
+			self.market_id = Some(mid);
+		}
+
 		reg.subscribe_binance_futures_accounts(BinanceAccountParams {
 			api_key: cfg.binance.api_key.clone(),
 			secret: cfg.binance.secret.clone(),
@@ -127,9 +134,8 @@ impl Strategy for NaiveMm {
 		let should_print = now_us - self.obs_last_print_us >= PRINT_INTERVAL_US;
 		if should_print { self.obs_last_print_us = now_us; }
 
-		let market_id = XMarketId::make(snapshot.exchange_id, &snapshot.symbol);
+		let market_id = snapshot.market_id;
 		self.market_id = Some(market_id);
-		self.symbol = Some(snapshot.symbol.clone());
 		self.last_obs_ts_us = snapshot.timestamp;
 		let is_ready = self.ready;
 
@@ -167,10 +173,9 @@ impl Strategy for NaiveMm {
 				None => "None".to_string(),
 			};
 			log::info!(
-				"[naive_mm] on_obs: symbol={} mid={} market_id={} ready={} bid={} ask={}",
-				snapshot.symbol,
+				"[naive_mm] on_obs: mid={} market_id={} ready={} bid={} ask={}",
 				mid_price,
-				XMarketId::make(snapshot.exchange_id, &snapshot.symbol),
+				market_id,
 				self.ready,
 				bid_state,
 				ask_state,
@@ -182,11 +187,11 @@ impl Strategy for NaiveMm {
 			let pos = self.position.clone();
 			let pnl = pos.current_pnl(mid_price);
 			let bps = pos.bps();
-			prom.set_strategy_metrics(self.name(), &snapshot.symbol, pnl, pos.amount, bps);
+			if let Some(symbol) = self.symbol.as_ref() { prom.set_strategy_metrics(self.name(), symbol, pnl, pos.amount, bps); }
 		}
 
 		if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
-			let symbol = snapshot.symbol.as_str();
+			let symbol = self.symbol.as_deref().unwrap_or("UNKNOWN");
 			if let Ok(g) = crate::metrics::GLOBAL_METRICS.lock() {
 				let h = &g.latency_histograms;
 				prom.set_strategy_latency_quantiles(self.name(), symbol, None, None, None, None, Some(h.code_us.value_at_quantile(0.50)), Some(h.code_us.value_at_quantile(0.99)), None, None);
@@ -208,9 +213,12 @@ impl Strategy for NaiveMm {
 				if exec.exec_type == crate::xcommons::oms::ExecutionType::XOrderCanceled { h.record_tick_to_cancel(ttt); } else { h.record_tick_to_trade(ttt); }
 			}
 			if let Ok(g) = crate::metrics::GLOBAL_METRICS.lock() {
-				let h = &g.latency_histograms;
-				let symbol = self.symbol.clone().unwrap_or_else(|| "UNKNOWN".to_string());
-				prom.set_strategy_latency_quantiles(strategy, &symbol, Some(h.tick_to_trade_us.value_at_quantile(0.50)), Some(h.tick_to_trade_us.value_at_quantile(0.99)), Some(h.tick_to_cancel_us.value_at_quantile(0.50)), Some(h.tick_to_cancel_us.value_at_quantile(0.99)), Some(h.code_us.value_at_quantile(0.50)), Some(h.code_us.value_at_quantile(0.99)), None, None);
+				if let Some(symbol) = self.symbol.as_ref() {
+					let h = &g.latency_histograms;
+					prom.set_strategy_latency_quantiles(strategy, symbol, Some(h.tick_to_trade_us.value_at_quantile(0.50)), Some(h.tick_to_trade_us.value_at_quantile(0.99)), Some(h.tick_to_cancel_us.value_at_quantile(0.50)), Some(h.tick_to_cancel_us.value_at_quantile(0.99)), Some(h.code_us.value_at_quantile(0.50)), Some(h.code_us.value_at_quantile(0.99)), None, None);
+				} else {
+					log::debug!("[naive_mm] skip latency metrics on_execution: symbol unknown yet");
+				}
 			}
 		}
 		if exec.cl_ord_id != -1 {
@@ -310,10 +318,13 @@ impl Strategy for NaiveMm {
 		log::info!("[naive_mm] on_position: ready set, market_id={} symbol={:?}", market_id, self.symbol);
 		// Update strategy metrics on position event as well to avoid waiting for next OBS tick
 		if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
-			let symbol = self.symbol.clone().unwrap_or_else(|| "UNKNOWN".to_string());
-			let mid = self.last_mid.unwrap_or(self.fair_px);
-			let pnl = self.position.current_pnl(if mid.is_finite() && mid > 0.0 { mid } else { self.position.avp.max(0.0) });
-			prom.set_strategy_metrics(self.name(), &symbol, pnl, self.position.amount, self.position.bps());
+			if let Some(symbol) = self.symbol.as_ref() {
+				let mid = self.last_mid.unwrap_or(self.fair_px);
+				let pnl = self.position.current_pnl(if mid.is_finite() && mid > 0.0 { mid } else { self.position.avp.max(0.0) });
+				prom.set_strategy_metrics(self.name(), symbol, pnl, self.position.amount, self.position.bps());
+			} else {
+				log::debug!("[naive_mm] skip strategy metrics on_position: symbol unknown yet");
+			}
 		}
 		io.schedule_update();
 	}
@@ -350,7 +361,7 @@ impl Strategy for NaiveMm {
 		let spread_bps = self.spread_bps;
 		let displace_bps = self.displace_bps;
 		let lot = self.lot_size;
-		let symbol_clone = self.symbol.clone().unwrap_or_else(|| "UNKNOWN".to_string());
+		let symbol_clone_opt = self.symbol.clone();
 		let pos_amt = self.position.amount;
 		let bid_target = round_to_tick(mid_price * (1.0 - spread_bps / 10_000.0));
 		let ask_target = round_to_tick(mid_price * (1.0 + spread_bps / 10_000.0));
@@ -383,7 +394,7 @@ impl Strategy for NaiveMm {
 							self.last_cancel_req_ts_us_bid = Some(sent);
 							self.pending_cancel_bid = true;
 							if let Some(ref mut cur) = self.bid_order { cur.status = LiveOrderStatus::PendingCancel; }
-							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { prom.inc_strategy_cancel_request(strategy_name, &symbol_clone); }
+							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { if let Some(ref sym) = symbol_clone_opt { prom.inc_strategy_cancel_request(strategy_name, sym); } }
 						} else if !self.pending_cancel_bid {
 							log::warn!("[naive_mm] mailbox overflow dropping Cancel BUY request for market_id={} symbol={:?}", market_id, self.symbol);
 						}
@@ -399,7 +410,7 @@ impl Strategy for NaiveMm {
 							self.bid_order = Some(LiveOrder { status: LiveOrderStatus::PendingNew, cl_ord_id: cl, price: bid_target });
 							let sent = crate::xcommons::types::time::now_micros();
 							self.last_post_req_ts_us_bid = Some(sent);
-							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { prom.inc_strategy_post_request(strategy_name, &symbol_clone); }
+							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { if let Some(ref sym) = symbol_clone_opt { prom.inc_strategy_post_request(strategy_name, sym); } }
 						} else { log::warn!("[naive_mm] mailbox overflow dropping Post BUY for market_id={} symbol={:?}", market_id, self.symbol); }
 					}
 				}
@@ -414,7 +425,7 @@ impl Strategy for NaiveMm {
 							self.last_cancel_req_ts_us_ask = Some(sent);
 							self.pending_cancel_ask = true;
 							if let Some(ref mut cur) = self.ask_order { cur.status = LiveOrderStatus::PendingCancel; }
-							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { prom.inc_strategy_cancel_request(strategy_name, &symbol_clone); }
+							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { if let Some(ref sym) = symbol_clone_opt { prom.inc_strategy_cancel_request(strategy_name, sym); } }
 						} else if !self.pending_cancel_ask {
 							log::warn!("[naive_mm] mailbox overflow dropping Cancel SELL request for market_id={} symbol={:?}", market_id, self.symbol);
 						}
@@ -426,12 +437,11 @@ impl Strategy for NaiveMm {
 						let reduce_only = pos_amt > 0.0; // reduce-only if currently long
 						let preq = PostRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), cl_ord_id: crate::xcommons::monoseq::next_id(), market_id, account_id: self.binance_account_id.unwrap_or_default(), side: Side::Sell, qty: lot, price: ask_target, ord_mode: OrderMode::MLimit, tif: TimeInForce::TifGoodTillCancel, post_only: true, reduce_only, metadata: Default::default() };
 						let cl = preq.cl_ord_id;
-
 						if tx.try_send(OrderRequest::Post(preq)).is_ok() {
 							self.ask_order = Some(LiveOrder { status: LiveOrderStatus::PendingNew, cl_ord_id: cl, price: ask_target });
 							let sent = crate::xcommons::types::time::now_micros();
 							self.last_post_req_ts_us_ask = Some(sent);
-							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { prom.inc_strategy_post_request(strategy_name, &symbol_clone); }
+							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { if let Some(ref sym) = symbol_clone_opt { prom.inc_strategy_post_request(strategy_name, sym); } }
 						} else { log::warn!("[naive_mm] mailbox overflow dropping Post SELL for market_id={} symbol={:?}", market_id, self.symbol); }
 					}
 				}

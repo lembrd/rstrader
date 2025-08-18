@@ -561,8 +561,7 @@ impl OkxConnector {
             .map_err(|e| AppError::parse(format!("Invalid timestamp: {}", e)))?;
 
         Ok(OrderBookSnapshot {
-            exchange_id: self.exchange_id,
-            symbol: symbol.to_string(),
+            market_id: crate::xcommons::xmarket_id::XMarketId::make(self.exchange_id, symbol),
             last_update_id: depth_data.seq_id.unwrap_or(0),
             timestamp,
             sequence: depth_data.seq_id.unwrap_or(0),

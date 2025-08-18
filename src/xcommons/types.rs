@@ -10,6 +10,8 @@ pub struct OrderBookL2Update {
     // Common fields (as per project specification)
     pub timestamp: i64,       // Exchange timestamp (microseconds UTC)
     pub rcv_timestamp: i64,   // Local receive timestamp (microseconds UTC)
+    /// Unified market id for quick matching; prefer this in new code
+    pub market_id: i64,
     pub exchange: ExchangeId, // Exchange identifier
     pub ticker: String,       // Instrument symbol (e.g., "BTCUSDT")
     pub seq_id: i64,          // Local monotonic sequence ID
@@ -62,9 +64,11 @@ impl OrderBookL2UpdateBuilder {
 
     /// Build a bid update
     pub fn build_bid(self, price: f64, qty: f64) -> OrderBookL2Update {
+        let market_id = crate::xcommons::xmarket_id::XMarketId::make(self.exchange, &self.ticker);
         OrderBookL2Update {
             timestamp: self.timestamp,
             rcv_timestamp: self.rcv_timestamp,
+            market_id,
             exchange: self.exchange,
             ticker: self.ticker,
             seq_id: self.seq_id,
@@ -84,9 +88,11 @@ impl OrderBookL2UpdateBuilder {
 
     /// Build an ask update
     pub fn build_ask(self, price: f64, qty: f64) -> OrderBookL2Update {
+        let market_id = crate::xcommons::xmarket_id::XMarketId::make(self.exchange, &self.ticker);
         OrderBookL2Update {
             timestamp: self.timestamp,
             rcv_timestamp: self.rcv_timestamp,
+            market_id,
             exchange: self.exchange,
             ticker: self.ticker,
             seq_id: self.seq_id,
@@ -229,8 +235,9 @@ impl StreamData {
             StreamData::Obs(snapshot) => (
                 snapshot.timestamp,
                 snapshot.timestamp,
-                snapshot.exchange_id,
-                &snapshot.symbol,
+                // Derive exchange id from market id high 8 bits
+                unsafe { std::mem::transmute::<u8, ExchangeId>(((snapshot.market_id as u64) >> 56) as u8) },
+                "",
                 snapshot.sequence,
                 0,
             ),
@@ -364,11 +371,11 @@ pub struct RawMessage {
     pub timestamp: SystemTime,
 }
 
-/// Order book snapshot from REST API
+/// Order book snapshot from REST API (compact; uses integer market id)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBookSnapshot {
-    pub exchange_id: ExchangeId,
-    pub symbol: String,
+    /// Unified market id ([exchange:8][symbol_hash:56])
+    pub market_id: i64,
     pub last_update_id: i64,
     pub timestamp: i64,
     pub sequence: i64,

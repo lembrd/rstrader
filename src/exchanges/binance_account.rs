@@ -418,9 +418,10 @@ struct WsTradeLite {
 impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
     async fn fetch_historical(&self, account_id: i64, market_id: i64, gt_ts: i64, _gt_seq: Option<i64>) -> Result<Vec<XExecution>> {
         let symbol = self.market_to_symbol.get(&market_id).ok_or_else(|| AppError::config(format!("unknown market_id {}", market_id)))?.clone();
+        let gt_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(gt_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
         log::info!(
-            "[BinanceFuturesAccountAdapter] fetch_historical account_id={} market_id={} symbol={} gt_ts(us)={} (start_ms={})",
-            account_id, market_id, symbol, gt_ts, (gt_ts/1000)+1
+            "[BinanceFuturesAccountAdapter] fetch_historical account_id={} market_id={} symbol={} gt_ts(us)={} ({}) (start_ms={})",
+            account_id, market_id, symbol, gt_ts, gt_rfc, (gt_ts/1000)+1
         );
         let mut out: Vec<XExecution> = Vec::new();
         let mut window_start_ms: i64 = (gt_ts / 1000) + 1; // ms, strictly greater
@@ -450,7 +451,12 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                     log::debug!("[BinanceFuturesAccountAdapter] userTrades raw: {}", text);
                 }
                 let trades: Vec<UserTrade> = serde_json::from_str(&text).map_err(|e| AppError::parse(format!("userTrades json: {}", e)))?;
-                log::info!("[BinanceFuturesAccountAdapter] userTrades page count={} window=[{}, {}] page_start={}", trades.len(), window_start_ms, window_end_ms, page_start);
+                let win_start_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(window_start_ms).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+                let win_end_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(window_end_ms).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+                log::info!(
+                    "[BinanceFuturesAccountAdapter] userTrades page count={} window=[{} ({}) .. {} ({})] page_start={}",
+                    trades.len(), window_start_ms, win_start_rfc, window_end_ms, win_end_rfc, page_start
+                );
                 if trades.is_empty() { break; }
                 for tr in trades.iter() {
                     let price: f64 = tr.price.parse().unwrap_or(0.0);

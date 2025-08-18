@@ -108,7 +108,7 @@ impl ExecutionsDatastore for PostgresExecutionsDatastore {
         let stmt = r#"
             INSERT INTO executions (account_id, exchange, instrument, xmarket_id, exchange_execution_id, exchange_ts, side, execution_type, qty, price, fee, fee_currency, live_stream, exchange_sequence)
             VALUES (
-                $1, $2, $3, $4, $5, to_timestamp($6), $7, $8,
+                $1, $2, $3, $4, $5, $6, $7, $8,
                 $9::float8, $10::float8, $11::float8, $12, $13, $14
             )
             ON CONFLICT (account_id, xmarket_id, exchange_execution_id, exchange_ts) DO UPDATE SET
@@ -123,9 +123,31 @@ impl ExecutionsDatastore for PostgresExecutionsDatastore {
         let live_stream = exec.metadata.get("live").map(|v| v == "true").unwrap_or(false);
         let exchange = format!("{}", ExchangeId::BinanceFutures);
         let seq: Option<i64> = exec.native_execution_id.parse::<i64>().ok();
-        let ts_seconds: f64 = (exec.timestamp as f64) / 1_000_000.0;
+        // Bind TIMESTAMPTZ directly to avoid float rounding issues that can defeat unique constraints
+        let ts_utc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(exec.timestamp)
+            .ok_or_else(|| AppError::parse(format!("invalid exec.timestamp micros: {}", exec.timestamp)))?;
         let fee_currency: Option<String> = exec.metadata.get("fee_asset").cloned();
-        conn.execute(stmt, &[&exec.account_id, &exchange, &instrument, &exec.market_id, &exec.native_execution_id, &ts_seconds, &side, &exec_type, &exec.last_qty, &exec.last_px, &exec.fee, &fee_currency, &live_stream, &seq]).await.map_err(|e| AppError::io(format!("pg exec: {}", e)))?;
+        conn.execute(
+            stmt,
+            &[
+                &exec.account_id,
+                &exchange,
+                &instrument,
+                &exec.market_id,
+                &exec.native_execution_id,
+                &ts_utc,
+                &side,
+                &exec_type,
+                &exec.last_qty,
+                &exec.last_px,
+                &exec.fee,
+                &fee_currency,
+                &live_stream,
+                &seq,
+            ],
+        )
+        .await
+        .map_err(|e| AppError::io(format!("pg exec: {}", e)))?;
         Ok(())
     }
 
@@ -134,11 +156,12 @@ impl ExecutionsDatastore for PostgresExecutionsDatastore {
         let stmt = r#"
             SELECT exchange_ts, xmarket_id, account_id, side, qty::float8, price::float8, fee::float8, exchange_execution_id
             FROM executions
-            WHERE account_id=$1 AND xmarket_id=$2 AND exchange_ts > to_timestamp($3)
+            WHERE account_id=$1 AND xmarket_id=$2 AND exchange_ts > $3
             ORDER BY exchange_ts ASC
         "#;
-        let ts_seconds: f64 = (gt_ts as f64) / 1_000_000.0;
-        let rows = conn.query(stmt, &[&account_id, &market_id, &ts_seconds]).await.map_err(|e| AppError::io(format!("pg query: {}", e)))?;
+        let gt_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(gt_ts)
+            .ok_or_else(|| AppError::parse(format!("invalid gt_ts micros: {}", gt_ts)))?;
+        let rows = conn.query(stmt, &[&account_id, &market_id, &gt_dt]).await.map_err(|e| AppError::io(format!("pg query: {}", e)))?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let timestamp: chrono::DateTime<chrono::Utc> = r.get(0);
@@ -170,12 +193,12 @@ impl ExecutionsDatastore for PostgresExecutionsDatastore {
     async fn last_point(&self, account_id: i64, market_id: i64) -> Result<Option<(i64, Option<i64>)>> {
         let conn = self.pool.get().await.map_err(|e| AppError::io(format!("pg pool: {}", e)))?;
         let stmt = r#"
-            SELECT EXTRACT(EPOCH FROM max(exchange_ts)) as last_ts_seconds
+            SELECT max(exchange_ts) as last_ts
             FROM executions WHERE account_id=$1 AND xmarket_id=$2
         "#;
         let row = conn.query_one(stmt, &[&account_id, &market_id]).await.map_err(|e| AppError::io(format!("pg query: {}", e)))?;
-        let last_ts_seconds_opt: Option<f64> = row.try_get(0).ok();
-        Ok(last_ts_seconds_opt.map(|s| ((s * 1_000_000.0) as i64, None)))
+        let last_ts_opt: Option<chrono::DateTime<chrono::Utc>> = row.try_get(0).ok();
+        Ok(last_ts_opt.map(|dt| (dt.timestamp_micros(), None)))
     }
 }
 
@@ -240,14 +263,25 @@ impl AccountState {
     pub async fn build_from_epoch(&mut self, market_id: i64, start_epoch_ts: i64, fee_bps: f64, contract_size: f64) -> Result<()> {
         log::info!("[AccountState] build_from_epoch account={} market_id={} start_epoch_ts(us)={}",
             self.account_id, market_id, start_epoch_ts);
-        // Backfill via REST strictly greater than last persisted point
-        if let Some((gt_ts, gt_seq)) = self.datastore.last_point(self.account_id, market_id).await? {
-            log::info!("[AccountState] last_point from PG: ts(us)={} seq={:?}", gt_ts, gt_seq);
-            let hist = self.adapter.fetch_historical(self.account_id, market_id, gt_ts, gt_seq).await?;
+        // Backfill via REST strictly greater than max(last_point, start_epoch_ts)
+        if let Some((lp_ts, lp_seq)) = self.datastore.last_point(self.account_id, market_id).await? {
+            let gt_ts = lp_ts.max(start_epoch_ts);
+            let lp_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(lp_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+            let gt_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(gt_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+            log::info!(
+                "[AccountState] last_point from PG: ts(us)={} ({}) seq={:?}; using gt_ts(us)={} ({}) (clamped by epoch)",
+                lp_ts, lp_rfc, lp_seq, gt_ts, gt_rfc
+            );
+            let hist = self.adapter.fetch_historical(self.account_id, market_id, gt_ts, lp_seq).await?;
             if !hist.is_empty() {
                 let first_ts = hist.first().map(|e| e.timestamp).unwrap_or(0);
                 let last_ts = hist.last().map(|e| e.timestamp).unwrap_or(0);
-                log::info!("[AccountState] fetched historical execs: count={} first_ts(us)={} last_ts(us)={}", hist.len(), first_ts, last_ts);
+                let first_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(first_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+                let last_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(last_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+                log::info!(
+                    "[AccountState] fetched historical execs: count={} first_ts(us)={} ({}) last_ts(us)={} ({})",
+                    hist.len(), first_ts, first_rfc, last_ts, last_rfc
+                );
             } else {
                 log::info!("[AccountState] fetched historical execs: count=0");
             }
@@ -256,13 +290,19 @@ impl AccountState {
 
         // Replay from epoch to build current positions
         let base_ts = start_epoch_ts.saturating_sub(1);
+        let base_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(base_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
         let mut execs = self.datastore.load_range(self.account_id, market_id, base_ts, None).await?;
         if !execs.is_empty() {
             let first_ts = execs.first().map(|e| e.timestamp).unwrap_or(0);
             let last_ts = execs.last().map(|e| e.timestamp).unwrap_or(0);
-            log::info!("[AccountState] replay from PG: count={} first_ts(us)={} last_ts(us)={} base_ts(us)={}", execs.len(), first_ts, last_ts, base_ts);
+            let first_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(first_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+            let last_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(last_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+            log::info!(
+                "[AccountState] replay from PG: count={} first_ts(us)={} ({}) last_ts(us)={} ({}) base_ts(us)={} ({})",
+                execs.len(), first_ts, first_rfc, last_ts, last_rfc, base_ts, base_rfc
+            );
         } else {
-            log::info!("[AccountState] replay from PG: count=0 base_ts(us)={}", base_ts);
+            log::info!("[AccountState] replay from PG: count=0 base_ts(us)={} ({})", base_ts, base_rfc);
         }
         Self::stable_sort_executions(&mut execs);
         self.apply_executions(market_id, &execs, fee_bps, contract_size)?;
@@ -287,35 +327,56 @@ impl AccountState {
             while let Some(e) = rx.recv().await { let _ = tx_buf.send(e).await; }
         });
 
-        // Step 2: find restart point
+        // Step 2: find restart point and clamp to epoch
         let last_point = self.datastore.last_point(self.account_id, market_id).await?;
-        if let Some((ts, seq)) = last_point { log::info!("[AccountState] last_point from PG: ts(us)={} seq={:?}", ts, seq); }
-        // If executions table was truncated (no last_point), backfill from full epoch_ts provided by config
-        // Otherwise continue strictly greater than last_point.
-        let (gt_ts, gt_seq) = last_point.unwrap_or((start_epoch_ts, None));
+        let (gt_ts, gt_seq) = match last_point {
+            Some((ts, seq)) => {
+                let clamped = ts.max(start_epoch_ts);
+                let ts_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+                let clamped_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(clamped).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+                log::info!(
+                    "[AccountState] last_point from PG: ts(us)={} ({}) seq={:?}; using gt_ts(us)={} ({}) (clamped by epoch)",
+                    ts, ts_rfc, seq, clamped, clamped_rfc
+                );
+                (clamped, seq)
+            }
+            None => (start_epoch_ts, None),
+        };
 
         // Step 3: backfill via REST and persist idempotently
         let hist = self.adapter.fetch_historical(self.account_id, market_id, gt_ts, gt_seq).await?;
         if !hist.is_empty() {
             let first_ts = hist.first().map(|e| e.timestamp).unwrap_or(0);
             let last_ts = hist.last().map(|e| e.timestamp).unwrap_or(0);
-            log::info!("[AccountState] fetched historical execs: count={} first_ts(us)={} last_ts(us)={} from_gt_ts(us)={}",
-                hist.len(), first_ts, last_ts, gt_ts);
+            let first_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(first_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+            let last_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(last_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+            let gt_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(gt_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+            log::info!(
+                "[AccountState] fetched historical execs: count={} first_ts(us)={} ({}) last_ts(us)={} ({}) from_gt_ts(us)={} ({})",
+                hist.len(), first_ts, first_rfc, last_ts, last_rfc, gt_ts, gt_rfc
+            );
         } else {
-            log::info!("[AccountState] fetched historical execs: count=0 from_gt_ts(us)={}", gt_ts);
+            let gt_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(gt_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+            log::info!("[AccountState] fetched historical execs: count=0 from_gt_ts(us)={} ({})", gt_ts, gt_rfc);
         }
         for e in hist.iter() { let _ = self.datastore.upsert(e).await?; }
 
         // Step 4: replay from datastore to build in-memory state
         // IMPORTANT: Build current positions from epoch. Replay from epoch regardless of last_point
         let base_ts = start_epoch_ts.saturating_sub(1);
+        let base_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(base_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
         let mut execs = self.datastore.load_range(self.account_id, market_id, base_ts, None).await?;
         if !execs.is_empty() {
             let first_ts = execs.first().map(|e| e.timestamp).unwrap_or(0);
             let last_ts = execs.last().map(|e| e.timestamp).unwrap_or(0);
-            log::info!("[AccountState] replay from PG: count={} first_ts(us)={} last_ts(us)={} base_ts(us)={}", execs.len(), first_ts, last_ts, base_ts);
+            let first_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(first_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+            let last_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(last_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+            log::info!(
+                "[AccountState] replay from PG: count={} first_ts(us)={} ({}) last_ts(us)={} ({}) base_ts(us)={} ({})",
+                execs.len(), first_ts, first_rfc, last_ts, last_rfc, base_ts, base_rfc
+            );
         } else {
-            log::info!("[AccountState] replay from PG: count=0 base_ts(us)={}", base_ts);
+            log::info!("[AccountState] replay from PG: count=0 base_ts(us)={} ({})", base_ts, base_rfc);
         }
         Self::stable_sort_executions(&mut execs);
         self.apply_executions(market_id, &execs, fee_bps, contract_size)?;
@@ -336,7 +397,8 @@ impl AccountState {
         self.live_buffer.entry(market_id).or_default();
         while let Ok(e) = rx_buf.try_recv() { self.live_buffer.get_mut(&market_id).unwrap().push_back(e); }
         let last_applied_ts = execs.last().map(|e| e.timestamp).unwrap_or(start_epoch_ts);
-        log::info!("[AccountState] last_applied_ts(us) after initial replay: {}", last_applied_ts);
+        let last_applied_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(last_applied_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+        log::info!("[AccountState] last_applied_ts(us) after initial replay: {} ({})", last_applied_ts, last_applied_rfc);
         while let Some(front) = self.live_buffer.get(&market_id).and_then(|q| q.front()).cloned() {
             if front.timestamp <= last_applied_ts { self.live_buffer.get_mut(&market_id).unwrap().pop_front(); } else { break; }
         }

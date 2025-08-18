@@ -426,9 +426,8 @@ impl ExchangeConnector for BinanceFuturesConnector {
         }
 
         Ok(OrderBookSnapshot {
-            symbol: symbol.to_string(),
+            market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::BinanceFutures, symbol),
             last_update_id: depth_response.last_update_id,
-            exchange_id: ExchangeId::BinanceFutures,
             timestamp: crate::xcommons::types::time::now_millis(),
             sequence: depth_response.last_update_id,
             bids,

@@ -584,8 +584,7 @@ impl ExchangeConnector for DeribitConnector {
     async fn get_snapshot(&self, symbol: &str) -> Result<OrderBookSnapshot, Self::Error> {
         // For now, return empty snapshot - implement REST API call if needed
         Ok(OrderBookSnapshot {
-            exchange_id: ExchangeId::Deribit,
-            symbol: symbol.to_string(),
+            market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::Deribit, symbol),
             bids: vec![],
             asks: vec![],
             timestamp: chrono::Utc::now().timestamp_micros(),
@@ -743,6 +742,7 @@ impl DeribitProcessor {
             updates.push(OrderBookL2Update {
                 timestamp,
                 rcv_timestamp,
+                market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::Deribit, &data.instrument_name),
                 exchange: ExchangeId::Deribit,
                 ticker: data.instrument_name.clone(),
                 seq_id,
@@ -773,6 +773,7 @@ impl DeribitProcessor {
             updates.push(OrderBookL2Update {
                 timestamp,
                 rcv_timestamp,
+                market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::Deribit, &data.instrument_name),
                 exchange: ExchangeId::Deribit,
                 ticker: data.instrument_name.clone(),
                 seq_id,

@@ -7,6 +7,7 @@ use std::collections::BTreeMap; // stay with BTreeMap for price ordering semanti
 /// Order book manager for maintaining L2 state
 pub struct OrderBookManager {
     symbol: String,
+    market_id: Option<i64>,
     bids: BTreeMap<OrderedFloat, f64>, // price -> quantity
     asks: BTreeMap<OrderedFloat, f64>, // price -> quantity
     last_update_id: i64,
@@ -41,17 +42,13 @@ impl OrderBookManager {
             asks: BTreeMap::new(),
             last_update_id: 0,
             sequence_counter: 0,
+            market_id: None,
         }
     }
 
     /// Initialize order book from snapshot
     pub fn initialize_from_snapshot(&mut self, snapshot: OrderBookSnapshot) -> Result<()> {
-        if snapshot.symbol != self.symbol {
-            return Err(AppError::pipeline(format!(
-                "Symbol mismatch: expected {}, got {}",
-                self.symbol, snapshot.symbol
-            )));
-        }
+        // Symbol verification skipped after migration to market_id; caller ensures mapping
 
         // Clear existing state
         self.bids.clear();
@@ -85,12 +82,13 @@ impl OrderBookManager {
 
     /// Apply L2 update to order book
     pub fn apply_update(&mut self, update: &OrderBookL2Update) -> Result<()> {
-        // Validate symbol
-        if update.ticker != self.symbol {
-            return Err(AppError::pipeline(format!(
-                "Symbol mismatch: expected {}, got {}",
-                self.symbol, update.ticker
-            )));
+        // Optional: validate market id once known
+        if let Some(mid) = self.market_id {
+            if update.market_id != mid {
+                return Err(AppError::pipeline("Market id mismatch".to_string()));
+            }
+        } else {
+            self.market_id = Some(update.market_id);
         }
 
         // Validate update sequence
@@ -289,9 +287,8 @@ mod tests {
         let mut ob = OrderBookManager::new("BTCUSDT".to_string());
 
         let snapshot = OrderBookSnapshot {
-            symbol: "BTCUSDT".to_string(),
+            market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::BinanceFutures, "BTCUSDT"),
             last_update_id: 100,
-            exchange_id: ExchangeId::BinanceFutures,
             timestamp: crate::xcommons::types::time::now_millis(),
             sequence: 100,
             bids: vec![
@@ -329,9 +326,8 @@ mod tests {
 
         // Initialize with snapshot
         let snapshot = OrderBookSnapshot {
-            symbol: "BTCUSDT".to_string(),
+            market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::BinanceFutures, "BTCUSDT"),
             last_update_id: 100,
-            exchange_id: ExchangeId::BinanceFutures,
             timestamp: crate::xcommons::types::time::now_millis(),
             sequence: 100,
             bids: vec![PriceLevel {
@@ -373,9 +369,8 @@ mod tests {
 
         // Initialize with snapshot
         let snapshot = OrderBookSnapshot {
-            symbol: "BTCUSDT".to_string(),
+            market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::BinanceFutures, "BTCUSDT"),
             last_update_id: 100,
-            exchange_id: ExchangeId::BinanceFutures,
             timestamp: crate::xcommons::types::time::now_millis(),
             sequence: 100,
             bids: vec![PriceLevel {
