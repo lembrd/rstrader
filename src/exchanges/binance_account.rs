@@ -21,6 +21,7 @@ use crate::xcommons::xmarket_id::XMarketId;
 use tokio::time::{sleep, Duration};
 use tokio::sync::{mpsc as tmpsc, oneshot, Mutex};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 pub struct BinanceFuturesAccountAdapter {
     api_key: String,
@@ -536,7 +537,9 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
             };
             log::info!("[BinanceFuturesAccountAdapter] obtained listenKey");
 
-            // Spawn keepalive task; if it fails silently, WS may close later
+            // Spawn keepalive task; cancel on stream termination
+            let cancel_token = CancellationToken::new();
+            let cancel_guard = cancel_token.clone();
             {
                 let rest = rest.clone();
                 let base_url = base_url.clone();
@@ -545,24 +548,45 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                 tokio::spawn(async move {
                     let interval = Duration::from_secs(20 * 60);
                     loop {
-                        sleep(interval).await;
-                        let _ = rest
-                            .put(format!("{}/fapi/v1/listenKey", base_url))
-                            .header("X-MBX-APIKEY", &api_key)
-                            .query(&[("listenKey", listen_key_clone.as_str())])
-                            .send()
-                            .await;
+                        tokio::select! {
+                            _ = cancel_guard.cancelled() => { break; }
+                            _ = sleep(interval) => {
+                                let res = rest
+                                    .put(format!("{}/fapi/v1/listenKey", base_url))
+                                    .header("X-MBX-APIKEY", &api_key)
+                                    .query(&[("listenKey", listen_key_clone.as_str())])
+                                    .send()
+                                    .await;
+                                if let Err(e) = res { log::warn!("[BinanceFuturesAccountAdapter] listenKey keepalive error: {}", e); }
+                            }
+                        }
                     }
                 });
             }
 
             let ws_url = format!("{}/ws/{}", ws_base, listen_key);
             let Ok((mut ws, _)) = connect_async(&ws_url).await else { return; };
+            let mut last_frame_at = chrono::Utc::now().timestamp_millis();
+            let idle_timeout_ms: i64 = 60_000; // 60s watchdog
+            let mut watchdog = tokio::time::interval(Duration::from_millis(5_000));
+            watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut seen_ortu: HashSet<i64> = HashSet::with_capacity(8192);
             let mut pending_tl: HashMap<i64, (XExecution, i64)> = HashMap::with_capacity(8192);
-            while let Some(msg) = ws.next().await {
-                match msg {
+            loop {
+                tokio::select! {
+                    _ = watchdog.tick() => {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        if now_ms - last_frame_at > idle_timeout_ms {
+                            log::warn!("[BinanceFuturesAccountAdapter] WS idle {}ms > {}; closing to force restart", now_ms - last_frame_at, idle_timeout_ms);
+                            let _ = ws.close(None).await;
+                            break;
+                        }
+                    }
+                    msg_opt = ws.next() => {
+                        let Some(msg) = msg_opt else { log::warn!("[BinanceFuturesAccountAdapter] WS stream ended"); break; };
+                        match msg {
                     Ok(Message::Text(txt)) => {
+                        last_frame_at = chrono::Utc::now().timestamp_millis();
                         if log::log_enabled!(log::Level::Debug) {
                             log::debug!("[BinanceFuturesAccountAdapter] raw WS: {}", txt);
                         }
@@ -721,9 +745,9 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                             }
                         }
                     }
-                    Ok(Message::Binary(_)) => {}
-                    Ok(Message::Ping(_)) => {}
-                    Ok(Message::Pong(_)) => {}
+                    Ok(Message::Binary(_)) => { last_frame_at = chrono::Utc::now().timestamp_millis(); }
+                    Ok(Message::Ping(_)) => { last_frame_at = chrono::Utc::now().timestamp_millis(); }
+                    Ok(Message::Pong(_)) => { last_frame_at = chrono::Utc::now().timestamp_millis(); }
                     Ok(Message::Frame(_)) => {}
                     Ok(Message::Close(reason)) => {
                         log::warn!("[BinanceFuturesAccountAdapter] WS close: {:?}", reason);
@@ -734,8 +758,11 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                         break
                     },
                 }
+                    }
+                }
             }
-            // Exit: channel closes and AccountState can perform full restore + resubscribe
+            // Exit: cancel keepalive and close channel so AccountState can perform restore logic
+            cancel_token.cancel();
         });
 
         Ok(rx)

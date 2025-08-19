@@ -114,6 +114,7 @@ impl Strategy for NaiveMm {
 			fee_bps: cfg.binance.fee_bps,
 			contract_size: cfg.binance.contract_size,
 			symbols: cfg.binance.symbols.clone(),
+			recovery_mode: cfg.binance.recovery_mode.clone(),
 		});
 		self.lot_size = cfg.lot_size;
 		self.max_position = cfg.max_position;

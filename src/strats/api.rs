@@ -220,6 +220,10 @@ impl StrategyRunner {
                     params.ed25519_key.clone(),
                     params.ed25519_secret.clone(),
                 ));
+                let rec_mode = match params.recovery_mode.as_deref() {
+                    Some("exit") | Some("Exit") => crate::trading::account_state::RecoveryMode::Exit,
+                    _ => crate::trading::account_state::RecoveryMode::Restore,
+                };
                 for symbol in params.symbols.iter().cloned() {
                     let adapter = adapter.clone();
                     let pool = pool.clone();
@@ -232,12 +236,14 @@ impl StrategyRunner {
                     let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<OrderRequest>(1024);
                     order_txs.insert(market_id, req_tx);
                     let adapter_req = adapter.clone();
+                    let rec_mode_clone = rec_mode.clone();
                     tokio::spawn(async move {
                         let mut account = AccountState::new(
                             account_id,
                             ExchangeId::BinanceFutures,
                             Box::new(PostgresExecutionsDatastore::new(pool)),
                             adapter,
+                            rec_mode_clone,
                         );
                         // Forward exec/pos into strategy mailbox
                         let mut exec_rx = account.subscribe_executions();

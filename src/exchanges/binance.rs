@@ -9,6 +9,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{WebSocketStream, connect_async, MaybeTlsStream};
 use tokio::net::lookup_host;
 use tokio::net::TcpStream;
+use tokio::time::Duration;
 
 use crate::xcommons::error::{AppError, Result};
 use crate::exchanges::ExchangeConnector;
@@ -656,19 +657,34 @@ impl ExchangeConnector for BinanceFuturesConnector {
 
         log::info!("Binance trade stream connected for {}", symbol);
 
-        // Message forwarding loop
+        // Message forwarding loop with idle watchdog
+        let mut last_frame_at = crate::xcommons::types::time::now_micros();
+        let idle_timeout_us: i64 = 60_000_000; // 60s
+        let mut watchdog = tokio::time::interval(Duration::from_millis(5_000));
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let msg = {
                 let ws_stream = self
                     .ws_stream
                     .as_mut()
                     .ok_or_else(|| AppError::connection("WebSocket not connected"))?;
-                ws_stream.next().await
+                tokio::select! {
+                    _ = watchdog.tick() => {
+                        let now = crate::xcommons::types::time::now_micros();
+                        if now - last_frame_at > idle_timeout_us {
+                            log::warn!("[trade-stream] idle {}us > {}; closing and returning to allow reconnect", now - last_frame_at, idle_timeout_us);
+                            let _ = ws_stream.close(None).await;
+                        }
+                        ws_stream.next().await
+                    }
+                    m = ws_stream.next() => m
+                }
             };
 
             match msg {
                 Some(Ok(Message::Text(text))) => {
                     let timestamp = SystemTime::now();
+                    last_frame_at = crate::xcommons::types::time::now_micros();
                     
                     let raw_message = RawMessage {
                         exchange_id: ExchangeId::BinanceFutures,
@@ -687,6 +703,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
                     break;
                 }
                 Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
+                    last_frame_at = crate::xcommons::types::time::now_micros();
                     // Handle ping/pong, continue reading
                     continue;
                 }
