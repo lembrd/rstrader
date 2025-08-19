@@ -549,12 +549,6 @@ impl AccountState {
                 pos.clone()
             };
             // broadcast execution and updated position snapshot (best-effort)
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "[AccountState] apply exec ts={} mid={} side={:?} qty={} px={} native_id={}",
-                    e.timestamp, e.market_id, e.side, e.last_qty, e.last_px, e.native_execution_id
-                );
-            }
             let _ = self.exec_tx.send(e.clone());
             let _ = self.pos_tx.send((market_id, snapshot));
         }

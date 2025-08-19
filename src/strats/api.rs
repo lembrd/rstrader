@@ -261,9 +261,7 @@ impl StrategyRunner {
                                             Ok(exec) => {
                                                 if ftx.send(StrategyMessage::Execution { account_id, exec: exec.clone() }).await.is_err() {
                                                     log::warn!("[StrategyRunner] dropping execution: mailbox closed");
-                                                } else {
-                                                    log::debug!("[StrategyRunner] forwarded execution: market_id={} side={} qty={} px={}", exec.market_id, exec.side as i8, exec.last_qty, exec.last_px);
-                                                }
+                                                } 
                                             }
                                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                                 log::warn!("[StrategyRunner] exec_rx lagged, skipped {} messages", skipped);
@@ -278,9 +276,7 @@ impl StrategyRunner {
                                             Ok((mid, pos)) => {
                                                 if ftx.send(StrategyMessage::Position { account_id, market_id: mid, pos: pos.clone() }).await.is_err() {
                                                     log::warn!("[StrategyRunner] dropping position: mailbox closed (market_id={})", mid);
-                                                } else {
-                                                    log::info!("[StrategyRunner] forwarded position: market_id={} amount={} avp={}", mid, pos.amount, pos.avp);
-                                                }
+                                                } 
                                             }
                                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                                 log::warn!("[StrategyRunner] pos_rx lagged, skipped {} messages", skipped);

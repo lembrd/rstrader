@@ -319,7 +319,7 @@ impl Strategy for NaiveMm {
 		self.position = pos;
 		self.market_id = Some(market_id);
 		self.ready = true;
-		log::info!("[naive_mm] on_position: ready set, market_id={} symbol={:?}", market_id, self.symbol);
+		// log::info!("[naive_mm] on_position: ready set, market_id={} symbol={:?}", market_id, self.symbol);
 		// Update strategy metrics on position event as well to avoid waiting for next OBS tick
 		if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
 			if let Some(symbol) = self.symbol.as_ref() {
