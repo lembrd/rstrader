@@ -659,7 +659,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
 
         // Message forwarding loop with idle watchdog
         let mut last_frame_at = crate::xcommons::types::time::now_micros();
-        let idle_timeout_us: i64 = 60_000_000; // 60s
+        let idle_timeout_us: i64 = 180_000_000; // 180s
         let mut watchdog = tokio::time::interval(Duration::from_millis(5_000));
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

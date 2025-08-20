@@ -567,7 +567,7 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
             let ws_url = format!("{}/ws/{}", ws_base, listen_key);
             let Ok((mut ws, _)) = connect_async(&ws_url).await else { return; };
             let mut last_frame_at = chrono::Utc::now().timestamp_millis();
-            let idle_timeout_ms: i64 = 60_000; // 60s watchdog
+            let idle_timeout_ms: i64 = 180_000; // 180s watchdog
             let mut watchdog = tokio::time::interval(Duration::from_millis(5_000));
             watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut seen_ortu: HashSet<i64> = HashSet::with_capacity(8192);
