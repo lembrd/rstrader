@@ -206,7 +206,7 @@ impl Strategy for NaiveMm {
 	fn on_trade(&mut self, _sub: SubscriptionId, _msg: TradeUpdate, _io: &mut StrategyIo) {}
 
 	fn on_execution(&mut self, account_id: i64, exec: XExecution, io: &mut StrategyIo) {
-		log::info!("[naive_mm] exec account_id={} market_id={} side={} qty={} px={} id={}", account_id, exec.market_id, exec.side as i8, exec.last_qty, exec.last_px, exec.native_execution_id);
+		// log::info!("[naive_mm] exec account_id={} market_id={} side={} qty={} px={} id={}", account_id, exec.market_id, exec.side as i8, exec.last_qty, exec.last_px, exec.native_execution_id);
 		if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
 			let strategy = self.name();
 			let tick_ts = self.last_obs_ts_us;
@@ -315,7 +315,7 @@ impl Strategy for NaiveMm {
 	}
 
 	fn on_position(&mut self, account_id: i64, market_id: i64, pos: Position, io: &mut StrategyIo) {
-		log::info!("[naive_mm] position account_id={} market_id={} amount={} avp={} realized={} fees={} trades_count={} vol={} bps={}", account_id, market_id, pos.amount, pos.avp, pos.realized, pos.fees, pos.trades_count, pos.quote_volume, pos.bps());
+		// log::info!("[naive_mm] position account_id={} market_id={} amount={} avp={} realized={} fees={} trades_count={} vol={} bps={}", account_id, market_id, pos.amount, pos.avp, pos.realized, pos.fees, pos.trades_count, pos.quote_volume, pos.bps());
 		self.position = pos;
 		self.market_id = Some(market_id);
 		self.ready = true;
