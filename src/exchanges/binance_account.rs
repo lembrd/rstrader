@@ -13,6 +13,8 @@ use ed25519_dalek::{SigningKey, Signer};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 
 use crate::trading::account_state::ExchangeAccountAdapter;
+use crate::trading::tradelog::{TradeLogHandle, LogEventType};
+use crate::trading::tradelog::build as tlog;
 use crate::xcommons::error::{AppError, Result};
 use crate::xcommons::oms::{ExecutionType, OrderStatus, Side, TimeInForce, OrderMode, XExecution};
 use crate::xcommons::oms::{OrderRequest, OrderResponse, OrderResponseStatus, PostRequest, CancelRequest, CancelAllRequest};
@@ -35,10 +37,11 @@ pub struct BinanceFuturesAccountAdapter {
     base_url: String,
     ws_base: String,
     ws_api: Mutex<Option<WsApiState>>, // persistent WS-API connection
+    tradelog: Option<TradeLogHandle>,
 }
 
 impl BinanceFuturesAccountAdapter {
-    pub fn new(api_key: String, secret: String, symbols: Vec<String>, ws_pubkey: Option<String>, ws_secret: Option<String>) -> Self {
+    pub fn new(api_key: String, secret: String, symbols: Vec<String>, ws_pubkey: Option<String>, ws_secret: Option<String>, tradelog: Option<TradeLogHandle>) -> Self {
         let market_to_symbol = symbols
             .iter()
             .map(|s| (XMarketId::make(ExchangeId::BinanceFutures, s), s.clone()))
@@ -59,6 +62,7 @@ impl BinanceFuturesAccountAdapter {
             base_url: "https://fapi.binance.com".to_string(),
             ws_base: "wss://fstream.binance.com".to_string(),
             ws_api: Mutex::new(None),
+            tradelog,
         }
     }
 
@@ -114,7 +118,19 @@ impl BinanceFuturesAccountAdapter {
         hex_encode(sig)
     }
 
-    async fn ws_api_request(&self, method: &str, mut params: serde_json::Map<String, serde_json::Value>) -> Result<serde_json::Value> {
+}
+
+#[derive(Clone, Debug)]
+struct TradeReqMeta {
+    event_type: LogEventType,
+    req_id: Option<i64>,
+    cl_ord_id: Option<i64>,
+    market_id: Option<i64>,
+    account_id: Option<i64>,
+}
+
+impl BinanceFuturesAccountAdapter {
+    async fn ws_api_request(&self, method: &str, mut params: serde_json::Map<String, serde_json::Value>, meta: Option<TradeReqMeta>) -> Result<serde_json::Value> {
         // Sign: sort params and sign with Ed25519 base64; we assume `secret` is PEM-encoded Ed25519 key material
         let timestamp = chrono::Utc::now().timestamp_millis();
         params.insert("timestamp".to_string(), serde_json::Value::from(timestamp));
@@ -153,6 +169,19 @@ impl BinanceFuturesAccountAdapter {
             map.insert(req_id.clone(), tx_once);
         }
         let send_start_us = chrono::Utc::now().timestamp_micros();
+        // Log request (exact JSON)
+        if let Some(tlh) = self.tradelog.as_ref() {
+            if let Some(meta) = meta.as_ref() {
+                let mut ev = tlog::event_base(meta.event_type, "binance_wsapi", req.clone());
+                // strategy_id is injected by TradeLogService at insert time; keep 0 here
+                ev.req_id = meta.req_id;
+                ev.cl_ord_id = meta.cl_ord_id;
+                ev.market_id = meta.market_id;
+                ev.account_id = meta.account_id;
+                tlh.log(ev).await;
+            }
+        }
+
         if let Err(e) = handle.send_tx.send(req.to_string()).await {
             log::warn!("[Binance WS-API] send failed: {} (resetting)", e);
             self.reset_ws_api().await;
@@ -171,6 +200,17 @@ impl BinanceFuturesAccountAdapter {
             if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
                 prom.set_ws_api_last_rtt_us("BINANCE_FUTURES", method, (rcv_us - send_start_us) as u64);
                 prom.inc_ws_api_request_outcome("BINANCE_FUTURES", method, "ok");
+            }
+            // Log response (exact JSON)
+            if let Some(tlh) = self.tradelog.as_ref() {
+                if let Some(meta) = meta.as_ref() {
+                    let mut ev = tlog::event_base(LogEventType::ApiResponse, "binance_wsapi", v.clone());
+                    ev.req_id = meta.req_id;
+                    ev.cl_ord_id = meta.cl_ord_id;
+                    ev.market_id = meta.market_id;
+                    ev.account_id = meta.account_id;
+                    tlh.log(ev).await;
+                }
             }
             return Self::extract_result(v);
         }
@@ -193,6 +233,17 @@ impl BinanceFuturesAccountAdapter {
         if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
             prom.set_ws_api_last_rtt_us("BINANCE_FUTURES", method, (rcv_us - send_start_us) as u64);
             prom.inc_ws_api_request_outcome("BINANCE_FUTURES", method, "ok");
+        }
+        // Log response (exact JSON)
+        if let Some(tlh) = self.tradelog.as_ref() {
+            if let Some(meta) = meta.as_ref() {
+                let mut ev = tlog::event_base(LogEventType::ApiResponse, "binance_wsapi", v.clone());
+                ev.req_id = meta.req_id;
+                ev.cl_ord_id = meta.cl_ord_id;
+                ev.market_id = meta.market_id;
+                ev.account_id = meta.account_id;
+                tlh.log(ev).await;
+            }
         }
         Self::extract_result(v)
     }
@@ -279,7 +330,8 @@ impl BinanceFuturesAccountAdapter {
         params.insert("reduceOnly".into(), serde_json::Value::Bool(p.reduce_only));
         params.insert("quantity".into(), format!("{:.6}", p.qty).into());
         params.insert("newClientOrderId".into(), crate::xcommons::oms::clordid::format_xcl(p.cl_ord_id).into());
-        match self.ws_api_request("order.place", params).await {
+        let meta = TradeReqMeta { event_type: LogEventType::RequestOrderNew, req_id: Some(p.req_id), cl_ord_id: Some(p.cl_ord_id), market_id: Some(p.market_id), account_id: Some(p.account_id) };
+        match self.ws_api_request("order.place", params, Some(meta)).await {
             Ok(_v) => {},
             Err(e) => {
                 if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
@@ -304,7 +356,8 @@ impl BinanceFuturesAccountAdapter {
         params.insert("symbol".into(), symbol.into());
         if let Some(cl) = c.cl_ord_id { params.insert("origClientOrderId".into(), crate::xcommons::oms::clordid::format_xcl(cl).into()); }
         if let Some(native) = c.native_ord_id.clone() { params.insert("orderId".into(), native.into()); }
-        match self.ws_api_request("order.cancel", params).await {
+        let meta = TradeReqMeta { event_type: LogEventType::RequestOrderCancel, req_id: Some(c.req_id), cl_ord_id: c.cl_ord_id, market_id: Some(c.market_id), account_id: Some(c.account_id) };
+        match self.ws_api_request("order.cancel", params, Some(meta)).await {
             Ok(_v) => {},
             Err(e) => {
                 if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
@@ -324,17 +377,40 @@ impl BinanceFuturesAccountAdapter {
         let query = format!("symbol={}&timestamp={}", symbol, timestamp);
         let sig = self.sign_query(&query);
         let url = format!("{}/fapi/v1/allOpenOrders?{}&signature={}", self.base_url, query, sig);
+        // Build HTTP request log body (without credentials/signature)
+        let http_body_req = serde_json::json!({
+            "transport": "http",
+            "method": "DELETE",
+            "path": "/fapi/v1/allOpenOrders",
+            "query": { "symbol": symbol, "timestamp": timestamp },
+        });
+        if let Some(tlh) = self.tradelog.as_ref() {
+            let mut ev = tlog::event_base(LogEventType::RequestCancelAll, "binance_http", http_body_req);
+            ev.req_id = Some(a.req_id);
+            ev.market_id = Some(a.market_id);
+            ev.account_id = Some(a.account_id);
+            tlh.log(ev).await;
+        }
+
         let resp = self.rest
             .delete(url)
             .header("X-MBX-APIKEY", &self.api_key)
             .send()
             .await
             .map_err(|e| AppError::io(format!("cancelAll send: {}", e)))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.bytes().await.unwrap_or_default();
-            let txt = String::from_utf8_lossy(&body);
-            return Err(AppError::io(format!("cancelAll http {}: {}", status, txt)));
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        // Try parse JSON; if empty, use empty object
+        let resp_json: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({"raw": text}));
+        if let Some(tlh) = self.tradelog.as_ref() {
+            let mut ev = tlog::event_base(LogEventType::ApiResponse, "binance_http", resp_json.clone());
+            ev.req_id = Some(a.req_id);
+            ev.market_id = Some(a.market_id);
+            ev.account_id = Some(a.account_id);
+            tlh.log(ev).await;
+        }
+        if !status.is_success() {
+            return Err(AppError::io(format!("cancelAll http {}: {}", status, text)));
         }
         let rcv_timestamp = chrono::Utc::now().timestamp_micros();
         Ok(OrderResponse { req_id: a.req_id, timestamp: rcv_timestamp, rcv_timestamp, cl_ord_id: None, native_ord_id: None, status: OrderResponseStatus::Ok, exec: None })
@@ -521,6 +597,7 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
         let ws_base = self.ws_base.clone();
         let rest = self.rest.clone();
 
+        let tradelog = self.tradelog.clone();
         tokio::spawn(async move {
             // Create listenKey
             let resp = rest
@@ -591,6 +668,35 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                             log::debug!("[BinanceFuturesAccountAdapter] raw WS: {}", txt);
                         }
                         if let Ok(root) = serde_json::from_str::<WsRoot>(&txt) {
+                            // Log raw WS event
+                            if let Some(tlh) = tradelog.as_ref() {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                    let (event_type, exec_type_opt, ord_status_opt, side_opt, is_taker_opt, last_px_opt, last_qty_opt, cl_id_opt, native_id_opt) =
+                                        if let Some(ev) = root.event_type.as_deref() {
+                                            if ev == "ORDER_TRADE_UPDATE" {
+                                                if let Some(o) = root.order.as_ref() {
+                                                    let et = if o.exec_type == "TRADE" { LogEventType::ApiEventExecution } else { LogEventType::ApiEventOrderUpdate };
+                                                    let side_opt = match o.side.as_str() { "BUY" => Some(Side::Buy), "SELL" => Some(Side::Sell), _ => Some(Side::Unknown) };
+                                                    (et, None, None, side_opt, Some(!o.is_maker), o.last_filled_price.parse().ok(), o.last_filled_qty.parse().ok(), o.client_order_id.as_deref().and_then(|c| crate::xcommons::oms::clordid::parse_xcl(c)), Some(o.order_id.to_string()))
+                                                } else { (LogEventType::ApiEventOrderUpdate, None, None, None, None, None, None, None, None) }
+                                            } else if ev == "TRADE_LITE" { (LogEventType::ApiEventTradeLite, None, None, None, None, None, None, None, None) }
+                                            else { (LogEventType::ApiEventOrderUpdate, None, None, None, None, None, None, None, None) }
+                                        } else { (LogEventType::ApiEventOrderUpdate, None, None, None, None, None, None, None, None) };
+                                    let mut ev = tlog::event_base(event_type, "binance_user_ws", v);
+                                    ev.market_id = Some(market_id);
+                                    ev.account_id = Some(account_id);
+                                    ev.exchange_ts_us = root.event_time.map(|ms| ms * 1000);
+                                    ev.exec_type = exec_type_opt;
+                                    ev.ord_status = ord_status_opt;
+                                    ev.side = side_opt;
+                                    ev.is_taker = is_taker_opt;
+                                    ev.last_px = last_px_opt;
+                                    ev.last_qty = last_qty_opt;
+                                    ev.cl_ord_id = cl_id_opt;
+                                    ev.native_ord_id = native_id_opt;
+                                    tlh.log(ev).await;
+                                }
+                            }
                             if let Some(ev) = root.event_type.as_deref() {
                                 if ev == "ORDER_TRADE_UPDATE" {
                                     if let Some(o) = root.order.clone() {

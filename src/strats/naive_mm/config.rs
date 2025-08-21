@@ -4,6 +4,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct NaiveMmConfig {
+    pub strategy_id: i64,
     pub runtime: RuntimeSection,
     pub subscriptions: Vec<SubscriptionItem>,
     pub binance: BinanceSection,

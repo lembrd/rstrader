@@ -2309,6 +2309,8 @@ dependencies = [
  "chrono",
  "fallible-iterator",
  "postgres-protocol",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3890,6 +3892,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "parquet",
+ "postgres-types",
  "prometheus",
  "reqwest",
  "rustc-hash 1.1.0",

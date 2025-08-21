@@ -213,12 +213,14 @@ impl StrategyRunner {
             let pool = deadpool_postgres::Pool::builder(mgr).max_size(16).build().unwrap();
 
             for params in accounts.into_iter() {
+                // For standalone strategy runner, no tradelog handle yet
                 let adapter = std::sync::Arc::new(BinanceFuturesAccountAdapter::new(
                     params.api_key.clone(),
                     params.secret.clone(),
                     params.symbols.clone(),
                     params.ed25519_key.clone(),
                     params.ed25519_secret.clone(),
+                    None,
                 ));
                 let rec_mode = match params.recovery_mode.as_deref() {
                     Some("exit") | Some("Exit") => crate::trading::account_state::RecoveryMode::Exit,

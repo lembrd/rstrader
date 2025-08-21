@@ -98,6 +98,7 @@ impl AppEnvironment for DefaultEnvironment {
 
     fn start_binance_futures_accounts(&self, params: BinanceAccountParams) -> Result<Vec<tokio::task::JoinHandle<()>>> {
         use crate::trading::account_state::{AccountState, PostgresExecutionsDatastore};
+        use crate::trading::tradelog::TradeLogService;
         use crate::exchanges::binance_account::BinanceFuturesAccountAdapter;
         use crate::xcommons::xmarket_id::XMarketId;
 
@@ -114,6 +115,13 @@ impl AppEnvironment for DefaultEnvironment {
         );
         let pool = deadpool_postgres::Pool::builder(mgr).max_size(16).build().unwrap();
 
+        // Start tradelog worker (strategy_id is a top-level strategy config; require via env var for now)
+        let strategy_id: i64 = std::env::var("STRATEGY_ID")
+            .map_err(|e| crate::xcommons::error::AppError::config(format!("STRATEGY_ID missing: {}", e)))?
+            .parse()
+            .map_err(|e| crate::xcommons::error::AppError::config(format!("STRATEGY_ID parse: {}", e)))?;
+        let tradelog = TradeLogService::start(pool.clone(), strategy_id);
+
         // Shared adapter
         let adapter = std::sync::Arc::new(BinanceFuturesAccountAdapter::new(
             params.api_key.clone(),
@@ -121,6 +129,7 @@ impl AppEnvironment for DefaultEnvironment {
             params.symbols.clone(),
             params.ed25519_key.clone(),
             params.ed25519_secret.clone(),
+            Some(tradelog.clone()),
         ));
 
         let mut runners = Vec::new();
@@ -203,6 +212,7 @@ pub struct BinanceAccountParams {
     pub symbols: Vec<String>,
     /// Recovery policy: "restore" (default) or "exit" on user-stream loss
     pub recovery_mode: Option<String>,
+    // strategy_id removed: it's top-level per-strategy
 }
 
 
