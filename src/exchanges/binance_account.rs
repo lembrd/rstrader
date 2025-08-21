@@ -371,6 +371,10 @@ impl BinanceFuturesAccountAdapter {
                 if s.contains("\"code\":-5022") {
                     let rcv_timestamp = chrono::Utc::now().timestamp_micros();
                     return Ok(OrderResponse { req_id: p.req_id, timestamp: rcv_timestamp, rcv_timestamp, cl_ord_id: Some(p.cl_ord_id), native_ord_id: None, status: OrderResponseStatus::FailedPostOnly, exec: None });
+                } else if s.contains("\"code\":-2022") || s.contains("ReduceOnly Order is rejected") {
+                    // Reduce-only reject: benign race when position closed between decision and post
+                    let rcv_timestamp = chrono::Utc::now().timestamp_micros();
+                    return Ok(OrderResponse { req_id: p.req_id, timestamp: rcv_timestamp, rcv_timestamp, cl_ord_id: Some(p.cl_ord_id), native_ord_id: None, status: OrderResponseStatus::FailedPostOnly, exec: None });
                 } else {
                     return Err(e);
                 }

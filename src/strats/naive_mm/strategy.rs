@@ -312,6 +312,30 @@ impl Strategy for NaiveMm {
 					if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) { self.pending_cancel_ask = false; self.ask_order = None; }
 				}
 			}
+			// Generic failure handling: clear pending-new posts; release pending-cancel flags to avoid stalls
+			if resp.status == crate::xcommons::oms::OrderResponseStatus::Failed400
+				|| resp.status == crate::xcommons::oms::OrderResponseStatus::Failed500
+				|| resp.status == crate::xcommons::oms::OrderResponseStatus::FailedRateLimit
+			{
+				if let Some(cl) = resp.cl_ord_id {
+					// BUY side
+					if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+						match self.bid_order.as_ref().map(|o| o.status) {
+							Some(LiveOrderStatus::PendingNew) => { self.bid_order = None; self.last_post_req_ts_us_bid = None; },
+							Some(LiveOrderStatus::PendingCancel) => { self.pending_cancel_bid = false; if let Some(ref mut lo) = self.bid_order { lo.status = LiveOrderStatus::Live; } },
+							_ => {}
+						}
+					}
+					// SELL side
+					if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+						match self.ask_order.as_ref().map(|o| o.status) {
+							Some(LiveOrderStatus::PendingNew) => { self.ask_order = None; self.last_post_req_ts_us_ask = None; },
+							Some(LiveOrderStatus::PendingCancel) => { self.pending_cancel_ask = false; if let Some(ref mut lo) = self.ask_order { lo.status = LiveOrderStatus::Live; } },
+							_ => {}
+						}
+					}
+				}
+			}
 		}
 		// After processing an order response, trigger a decision pass
 		io.schedule_update();
@@ -370,8 +394,19 @@ impl Strategy for NaiveMm {
 		let lot = self.lot_size;
 		let symbol_clone_opt = self.symbol.clone();
 		let pos_amt = self.position.amount;
-		let bid_target = round_to_tick(mid_price * (1.0 - spread_bps / 10_000.0));
-		let ask_target = round_to_tick(mid_price * (1.0 + spread_bps / 10_000.0));
+
+
+		let mut bid_target = round_to_tick(mid_price * (1.0 - spread_bps / 10_000.0));
+		let mut ask_target = round_to_tick(mid_price * (1.0 + spread_bps / 10_000.0));
+
+		if pos_amt.abs() > 0.0 {
+			if pos_amt > 0.0 { 
+				bid_target = round_to_tick(bid_target * (1.0 -((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * 0.2)));
+			} else {
+				ask_target = round_to_tick(ask_target * (1.0 +((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * 0.2)));
+			}
+		}
+
 		let disp_th = displace_bps / 10_000.0 * mid_price;
 		// If a cancel request errored upstream (not forwarded to strategy), clear pending cancel after a short TTL
 		let now_us = crate::xcommons::types::time::now_micros();

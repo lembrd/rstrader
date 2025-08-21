@@ -11,6 +11,8 @@ use crate::xcommons::types::{ExchangeId, OrderBookL2Update, StreamData, TradeUpd
 use crate::xcommons::position::Position;
 use crate::xcommons::oms::{XExecution, OrderRequest, OrderResponse};
 use crate::trading::account_state::ExchangeAccountAdapter;
+use crate::xcommons::circuit_breaker::CircuitBreaker;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct StrategyContext {
@@ -395,6 +397,11 @@ impl StrategyRunner {
 
         // Single-threaded dispatch loop with mailbox draining and deferred updates
         let mut io = StrategyIo { env: ctx.env.as_ref(), order_txs, update_scheduled: false };
+        // Circuit breaker for repeated order errors (system-level guard)
+        let order_error_threshold: u32 = std::env::var("ORDER_ERROR_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        let order_error_timeout_secs: u64 = std::env::var("ORDER_ERROR_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+        let order_error_breaker = CircuitBreaker::new(order_error_threshold, Duration::from_secs(order_error_timeout_secs));
+        // Warn on every benign failure (no rate limiting)
         loop {
             let first = match rx.recv().await {
                 Some(m) => m,
@@ -405,10 +412,53 @@ impl StrategyRunner {
                 match msg {
                     StrategyMessage::MarketDataL2 { sub, msg } => strategy.on_l2(sub, msg, &mut io),
                     StrategyMessage::MarketDataTrade { sub, msg } => strategy.on_trade(sub, msg, &mut io),
-                    StrategyMessage::Execution { account_id, exec } => strategy.on_execution(account_id, exec, &mut io),
+                    StrategyMessage::Execution { account_id, exec } => {
+                        if exec.exec_type == crate::xcommons::oms::ExecutionType::XOrderRejected {
+                            log::warn!(
+                                "[StrategyRunner] benign execution: XOrderRejected (cl_ord_id={}, native_ord_id={})",
+                                exec.cl_ord_id, exec.native_ord_id
+                            );
+                        }
+                        strategy.on_execution(account_id, exec, &mut io)
+                    },
                     StrategyMessage::Position { account_id, market_id, pos } => strategy.on_position(account_id, market_id, pos, &mut io),
                     StrategyMessage::Obs { sub, snapshot } => strategy.on_obs(sub, snapshot, &mut io),
-                    StrategyMessage::OrderResponse(r) => strategy.on_order_response(r, &mut io),
+                    StrategyMessage::OrderResponse(r) => {
+                        // Forward to strategy first
+                        let status = r.status;
+                        let cl = r.cl_ord_id;
+                        strategy.on_order_response(r, &mut io);
+                        // Update circuit breaker based on outcome
+                        use crate::xcommons::oms::OrderResponseStatus as ORS;
+                        match status {
+                            ORS::Ok => order_error_breaker.record_success(),
+                            ORS::FailedOrderNotFound => {
+                                // Benign race on cancel; warn every time
+                                log::warn!(
+                                    "[StrategyRunner] benign order error: FailedOrderNotFound (cl_ord_id={:?})",
+                                    cl
+                                );
+                            }
+                            ORS::FailedPostOnly => {
+                                // Common during post-only (including reduce-only rejects); warn every time
+                                log::warn!(
+                                    "[StrategyRunner] benign order error: FailedPostOnly (cl_ord_id={:?})",
+                                    cl
+                                );
+                            }
+                            ORS::Failed400 | ORS::Failed500 | ORS::FailedRateLimit => {
+                                order_error_breaker.record_failure();
+                                let cnt = order_error_breaker.failure_count();
+                                let thr = order_error_threshold;
+                                log::error!("[StrategyRunner] order error recorded (count={}/{}).", cnt, thr);
+                                if order_error_breaker.state() == crate::xcommons::circuit_breaker::CircuitState::Open {
+                                    log::error!("[StrategyRunner] too many order errors (>= {}). Exiting.", thr);
+                                    std::process::exit(2);
+                                }
+                            }
+                            _ => {}
+                        }
+                    },
                     StrategyMessage::Control(c) => strategy.on_control(c, &mut io),
                 }
             };

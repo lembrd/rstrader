@@ -278,11 +278,13 @@ impl AccountState {
             self.account_id, market_id, start_epoch_ts);
         // Backfill via REST strictly greater than max(last_point, start_epoch_ts)
         if let Some((lp_ts, lp_seq)) = self.datastore.last_point(self.account_id, market_id).await? {
-            let gt_ts = lp_ts.max(start_epoch_ts);
+            // Extend backfill window: start 6 hours before last_point (but not before epoch)
+            let six_hours_us: i64 = 6 * 60 * 60 * 1_000_000;
+            let gt_ts = lp_ts.saturating_sub(six_hours_us).max(start_epoch_ts);
             let lp_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(lp_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
             let gt_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(gt_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
             log::info!(
-                "[AccountState] last_point from PG: ts(us)={} ({}) seq={:?}; using gt_ts(us)={} ({}) (clamped by epoch)",
+                "[AccountState] last_point from PG: ts(us)={} ({}) seq={:?}; extended backfill gt_ts(us)={} ({}) (last_point-6h clamped by epoch)",
                 lp_ts, lp_rfc, lp_seq, gt_ts, gt_rfc
             );
             let hist = self.adapter.fetch_historical(self.account_id, market_id, gt_ts, lp_seq).await?;
@@ -318,7 +320,8 @@ impl AccountState {
             log::info!("[AccountState] replay from PG: count=0 base_ts(us)={} ({})", base_ts, base_rfc);
         }
         Self::stable_sort_executions(&mut execs);
-        self.apply_executions(market_id, &execs, fee_bps, contract_size)?;
+        // Do not broadcast during offline replay
+        self.apply_executions(market_id, &execs, fee_bps, contract_size, false)?;
         {
             let snapshot = self.ensure_position(market_id, fee_bps, contract_size).clone();
             log::info!(
@@ -344,11 +347,13 @@ impl AccountState {
         let last_point = self.datastore.last_point(self.account_id, market_id).await?;
         let (gt_ts, gt_seq) = match last_point {
             Some((ts, seq)) => {
-                let clamped = ts.max(start_epoch_ts);
+                // Extend backfill window: start 6 hours before last_point (but not before epoch)
+                let six_hours_us: i64 = 6 * 60 * 60 * 1_000_000;
+                let clamped = ts.saturating_sub(six_hours_us).max(start_epoch_ts);
                 let ts_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
                 let clamped_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(clamped).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
                 log::info!(
-                    "[AccountState] last_point from PG: ts(us)={} ({}) seq={:?}; using gt_ts(us)={} ({}) (clamped by epoch)",
+                    "[AccountState] last_point from PG: ts(us)={} ({}) seq={:?}; extended backfill gt_ts(us)={} ({}) (last_point-6h clamped by epoch)",
                     ts, ts_rfc, seq, clamped, clamped_rfc
                 );
                 (clamped, seq)
@@ -392,7 +397,8 @@ impl AccountState {
             log::info!("[AccountState] replay from PG: count=0 base_ts(us)={} ({})", base_ts, base_rfc);
         }
         Self::stable_sort_executions(&mut execs);
-        self.apply_executions(market_id, &execs, fee_bps, contract_size)?;
+        // Do not broadcast during offline replay
+        self.apply_executions(market_id, &execs, fee_bps, contract_size, false)?;
         {
             let snapshot = self.ensure_position(market_id, fee_bps, contract_size).clone();
             log::info!(
@@ -418,7 +424,8 @@ impl AccountState {
         // drain remaining and continue online
         let mut online: Vec<XExecution> = self.live_buffer.get_mut(&market_id).unwrap().drain(..).collect();
         Self::stable_sort_executions(&mut online);
-        self.apply_executions(market_id, &online, fee_bps, contract_size)?;
+        // Broadcast buffered live items after switching online
+        self.apply_executions(market_id, &online, fee_bps, contract_size, true)?;
         {
             let snapshot = self.ensure_position(market_id, fee_bps, contract_size).clone();
             log::info!(
@@ -435,7 +442,7 @@ impl AccountState {
         // continue consuming live until channel closes (disconnect)
         while let Some(e) = rx_buf.recv().await {
             let _ = self.datastore.upsert(&e).await?;
-            self.apply_executions(market_id, std::slice::from_ref(&e), fee_bps, contract_size)?;
+            self.apply_executions(market_id, std::slice::from_ref(&e), fee_bps, contract_size, true)?;
         }
 
         // Live was disconnected. Perform full restore per docs:
@@ -460,7 +467,8 @@ impl AccountState {
         Self::stable_sort_executions(&mut execs);
         // Reset in-memory position then re-apply
         self.positions.insert(market_id, Position::new(fee_bps / 10_000.0, contract_size));
-        self.apply_executions(market_id, &execs, fee_bps, contract_size)?;
+        // Do not broadcast during full restore replay
+        self.apply_executions(market_id, &execs, fee_bps, contract_size, false)?;
         // Emit snapshot after full restore
         {
             let snapshot = self.ensure_position(market_id, fee_bps, contract_size).clone();
@@ -487,7 +495,7 @@ impl AccountState {
             // consume until disconnect
             while let Some(e) = rx_buf.recv().await {
                 let _ = self.datastore.upsert(&e).await?;
-                self.apply_executions(market_id, std::slice::from_ref(&e), fee_bps, contract_size)?;
+                self.apply_executions(market_id, std::slice::from_ref(&e), fee_bps, contract_size, true)?;
             }
 
             // full restore again
@@ -507,7 +515,8 @@ impl AccountState {
             let mut execs = self.datastore.load_range(self.account_id, market_id, base_ts, None).await?;
             Self::stable_sort_executions(&mut execs);
             self.positions.insert(market_id, Position::new(fee_bps / 10_000.0, contract_size));
-            self.apply_executions(market_id, &execs, fee_bps, contract_size)?;
+            // Do not broadcast during restore replay
+            self.apply_executions(market_id, &execs, fee_bps, contract_size, false)?;
             // Emit snapshot after each restore cycle
             {
                 let snapshot = self.ensure_position(market_id, fee_bps, contract_size).clone();
@@ -536,7 +545,7 @@ impl AccountState {
         self.positions.entry(market_id).or_insert_with(|| Position::new(fee_percent, contract_size))
     }
 
-    fn apply_executions(&mut self, market_id: i64, execs: &[XExecution], fee_bps: f64, contract_size: f64) -> Result<()> {
+    fn apply_executions(&mut self, market_id: i64, execs: &[XExecution], fee_bps: f64, contract_size: f64, broadcast: bool) -> Result<()> {
         for e in execs {
             if !e.exec_type.is_position_change() { continue; }
             let qty_signed = match e.side { Side::Buy => e.last_qty.abs(), Side::Sell => -e.last_qty.abs(), Side::Unknown => 0.0 };
@@ -548,9 +557,11 @@ impl AccountState {
                 pos.trade_with_fee(qty_signed, e.last_px, fee_override);
                 pos.clone()
             };
-            // broadcast execution and updated position snapshot (best-effort)
-            let _ = self.exec_tx.send(e.clone());
-            let _ = self.pos_tx.send((market_id, snapshot));
+            if broadcast {
+                // broadcast execution and updated position snapshot (best-effort)
+                let _ = self.exec_tx.send(e.clone());
+                let _ = self.pos_tx.send((market_id, snapshot));
+            }
         }
         Ok(())
     }
