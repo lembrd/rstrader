@@ -89,6 +89,7 @@ impl Strategy for NaiveMm {
 	async fn configure(&mut self, reg: &mut StrategyRegistrar, _ctx: &StrategyContext, cfg: &Self::Config) -> AppResult<()> {
 		// Propagate strategy_id to environment so account runners tag TradeLog rows
 		std::env::set_var("STRATEGY_ID", cfg.strategy_id.to_string());
+        // StrategyStart is handled globally in StrategyRunner
 		for s in cfg.subscriptions.iter() {
 			let max_connections = if s.arb_streams_num > 1 { Some(s.arb_streams_num) } else { None };
 			let spec = SubscriptionSpec { stream_type: s.stream_type.clone(), exchange: s.exchange.clone(), instrument: s.instrument.clone(), max_connections };

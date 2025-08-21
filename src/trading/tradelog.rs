@@ -19,6 +19,7 @@ pub enum LogEventType {
     ApiEventOrderUpdate = 31,
     ApiEventTradeLite = 32,
 
+    StrategyStart = 80,
     ConnectivityInfo = 90,
 }
 
@@ -119,6 +120,50 @@ impl TradeLogService {
                 .await;
             if let Err(e) = res { log::warn!("[TradeLog] insert error: {}", e); }
         }
+        Ok(())
+    }
+
+    /// Log a single event without starting a background worker
+    pub async fn log_one(pool: Pool, strategy_id: i64, ev: TradeLogEvent) -> Result<()> {
+        let conn = pool.get().await.map_err(|e| AppError::io(format!("pg pool: {}", e)))?;
+        let body_param = postgres_types::Json(ev.body.clone());
+        let stmt = r#"INSERT INTO tradelog (
+                local_ts_us, exchange_ts_us, event_type,
+                strategy_id,
+                req_id, cl_ord_id, native_ord_id, market_id, account_id,
+                exec_type,
+                error_code, error_message,
+                source, body
+            ) VALUES (
+                $1, $2, $3,
+                $4,
+                $5, $6, $7, $8, $9,
+                $10,
+                $11, $12,
+                $13, $14
+            )"#;
+        conn
+            .execute(
+                stmt,
+                &[
+                    &ev.local_ts_us,
+                    &ev.exchange_ts_us,
+                    &(ev.event_type as i16),
+                    &strategy_id,
+                    &ev.req_id,
+                    &ev.cl_ord_id,
+                    &ev.native_ord_id,
+                    &ev.market_id,
+                    &ev.account_id,
+                    &ev.exec_type.map(|v| v as i16),
+                    &ev.error_code,
+                    &ev.error_message,
+                    &ev.source,
+                    &body_param,
+                ],
+            )
+            .await
+            .map_err(|e| AppError::io(format!("pg tradelog insert: {}", e)))?;
         Ok(())
     }
 }

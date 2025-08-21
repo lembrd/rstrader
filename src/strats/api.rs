@@ -131,7 +131,7 @@ impl StrategyRunner {
         mut strategy: S,
         ctx: StrategyContext,
         cfg: S::Config,
-    ) -> AppResult<()> {
+    ) -> AppResult<()> where S::Config: serde::Serialize {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StrategyMessage>(ctx.env.channel_capacity());
         let mut registrar = StrategyRegistrar::new(ctx.env.as_ref(), tx);
         strategy.configure(&mut registrar, &ctx, &cfg).await?;
@@ -191,6 +191,35 @@ impl StrategyRunner {
                 }
             }
         });
+
+        // Emit StrategyStart event with full serialized config (environment-wide, once per process)
+        {
+            // Init Postgres pool once
+            let db_url = std::env::var("DATABASE_URL")
+                .map_err(|e| crate::xcommons::error::AppError::config(format!("DATABASE_URL missing: {}", e)))?;
+            let cfg_pg: tokio_postgres::Config = db_url
+                .parse()
+                .map_err(|e| crate::xcommons::error::AppError::config(format!("pg url parse: {}", e)))?;
+            let mgr = deadpool_postgres::Manager::from_config(
+                cfg_pg,
+                tokio_postgres::NoTls,
+                deadpool_postgres::ManagerConfig { recycling_method: deadpool_postgres::RecyclingMethod::Fast },
+            );
+            let pool = deadpool_postgres::Pool::builder(mgr).max_size(4).build().unwrap();
+            let strategy_id: i64 = std::env::var("STRATEGY_ID")
+                .map_err(|e| crate::xcommons::error::AppError::config(format!("STRATEGY_ID missing: {}", e)))?
+                .parse()
+                .map_err(|e| crate::xcommons::error::AppError::config(format!("STRATEGY_ID parse: {}", e)))?;
+            let body = serde_json::to_value(&cfg).unwrap_or(serde_json::json!({"error":"serialize"}));
+            let mut ev = crate::trading::tradelog::build::event_base(
+                crate::trading::tradelog::LogEventType::StrategyStart,
+                "strategy",
+                body,
+            );
+            ev.account_id = None;
+            ev.market_id = None;
+            crate::trading::tradelog::TradeLogService::log_one(pool, strategy_id, ev).await?;
+        }
 
         // Start account runners and forward executions/positions into strategy mailbox
         let mut order_txs: HashMap<i64, tokio::sync::mpsc::Sender<OrderRequest>> = HashMap::new();
@@ -322,6 +351,7 @@ impl StrategyRunner {
                             while let Some(req) = req_rx.recv().await {
                                 let adapter_req = adapter_req.clone();
                                 let ftx2 = ftx2.clone();
+                                let req_copy = req.clone();
                                 tokio::spawn(async move {
                                     match adapter_req.send_request(req).await {
                                         Ok(resp) => {
@@ -329,13 +359,34 @@ impl StrategyRunner {
                                                 log::warn!("[StrategyRunner] mailbox overflow dropping OrderResponse. Error={}", e);
                                             }
                                         }
-                                        Err(e) => { log::error!("[StrategyRunner] send_request error for {}: {}", market_id, e); }
+                                        Err(e) => {
+                                            use crate::xcommons::oms::OrderResponseStatus;
+                                            let (req_id, cl_opt) = match req_copy {
+                                                crate::xcommons::oms::OrderRequest::Post(p) => (p.req_id, Some(p.cl_ord_id)),
+                                                crate::xcommons::oms::OrderRequest::Cancel(c) => (c.req_id, c.cl_ord_id),
+                                                crate::xcommons::oms::OrderRequest::CancelAll(a) => (a.req_id, None),
+                                            };
+                                            let now = crate::xcommons::types::time::now_micros();
+                                            let fail = crate::xcommons::oms::OrderResponse {
+                                                req_id,
+                                                timestamp: now,
+                                                rcv_timestamp: now,
+                                                cl_ord_id: cl_opt,
+                                                native_ord_id: None,
+                                                status: OrderResponseStatus::Failed500,
+                                                exec: None,
+                                            };
+                                            log::error!("[StrategyRunner] send_request error for {}: {} (broadcasting failure)", market_id, e);
+                                            let _ = ftx2.try_send(StrategyMessage::OrderResponse(fail));
+                                        }
                                     }
                                 });
                             }
                         });
                         if let Err(e) = account.run_market(market_id, start_epoch_ts, fee_bps, contract_size).await {
-                            log::error!("[StrategyRunner] run_market error for {}: {}", symbol, e);
+                            log::error!("[StrategyRunner] run_market error for {}: {} (exiting)", symbol, e);
+                            // Fatal on initialization failure
+                            std::process::exit(1);
                         }
                     });
                 }

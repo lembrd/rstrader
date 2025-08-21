@@ -1,8 +1,8 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde::de::{Deserializer, Error as DeError};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct NaiveMmConfig {
     pub strategy_id: i64,
     pub runtime: RuntimeSection,
@@ -14,10 +14,10 @@ pub struct NaiveMmConfig {
     #[serde(default = "default_displace_th_bps")] pub displace_th_bps: f64,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct RuntimeSection { pub channel_capacity: usize }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubscriptionItem {
     pub exchange: crate::xcommons::types::ExchangeId,
     pub stream_type: crate::xcommons::types::StreamType,
@@ -33,7 +33,7 @@ fn default_lot_size() -> f64 { 0.005 }
 fn default_spread_bps() -> f64 { 1.5 }
 fn default_displace_th_bps() -> f64 { 1.0 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct BinanceSection {
     pub api_key: String,
     pub secret: String,

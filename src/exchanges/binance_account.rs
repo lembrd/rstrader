@@ -41,6 +41,22 @@ pub struct BinanceFuturesAccountAdapter {
 }
 
 impl BinanceFuturesAccountAdapter {
+    fn map_binance_exec_type(s: &str) -> Option<ExecutionType> {
+        match s {
+            "TRADE" => Some(ExecutionType::XTrade),
+            "NEW" => Some(ExecutionType::XOrderNew),
+            "CANCELED" => Some(ExecutionType::XOrderCanceled),
+            "REPLACED" => Some(ExecutionType::XOrderReplaced),
+            "REJECTED" => Some(ExecutionType::XOrderRejected),
+            // Binance may emit PENDING_* less commonly via WS; keep unknown for others
+            _ => Some(ExecutionType::XUnknown),
+        }
+    }
+    fn extract_error_fields(v: &serde_json::Value) -> (Option<String>, Option<String>) {
+        let code = v.get("error").and_then(|e| e.get("code")).map(|c| c.to_string());
+        let msg = v.get("error").and_then(|e| e.get("msg")).and_then(|m| m.as_str()).map(|s| s.to_string());
+        (code, msg)
+    }
     pub fn new(api_key: String, secret: String, symbols: Vec<String>, ws_pubkey: Option<String>, ws_secret: Option<String>, tradelog: Option<TradeLogHandle>) -> Self {
         let market_to_symbol = symbols
             .iter()
@@ -209,12 +225,15 @@ impl BinanceFuturesAccountAdapter {
                     ev.cl_ord_id = meta.cl_ord_id;
                     ev.market_id = meta.market_id;
                     ev.account_id = meta.account_id;
+                    let (code, msg) = Self::extract_error_fields(&v);
+                    ev.error_code = code;
+                    ev.error_message = msg;
                     tlh.log(ev).await;
                 }
             }
             return Self::extract_result(v);
         }
-        let v = match tokio::time::timeout(Duration::from_secs(7), rx_once).await {
+        let v = match tokio::time::timeout(Duration::from_secs(3), rx_once).await {
             Ok(Ok(val)) => val,
             Ok(Err(_)) => {
                 if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
@@ -242,6 +261,9 @@ impl BinanceFuturesAccountAdapter {
                 ev.cl_ord_id = meta.cl_ord_id;
                 ev.market_id = meta.market_id;
                 ev.account_id = meta.account_id;
+                let (code, msg) = Self::extract_error_fields(&v);
+                ev.error_code = code;
+                ev.error_message = msg;
                 tlh.log(ev).await;
             }
         }
@@ -302,7 +324,9 @@ impl BinanceFuturesAccountAdapter {
                     Some(Ok(Message::Ping(_p))) => { /* optional: respond via write if needed */ }
                     Some(Ok(Message::Pong(_p))) => {}
                     Some(Ok(Message::Close(reason))) => { log::warn!("[Binance WS-API] close: {:?}", reason); break; }
-                    Some(Ok(_)) => {}
+                    Some(Ok(other)) => {
+                        log::warn!("[Binance WS-API] unexpected message: {:?}", other);
+                    }
                     Some(Err(e)) => { log::warn!("[Binance WS-API] recv error: {}", e); break; }
                     None => { log::warn!("[Binance WS-API] stream ended"); break; }
                 }
@@ -358,8 +382,14 @@ impl BinanceFuturesAccountAdapter {
         if let Some(native) = c.native_ord_id.clone() { params.insert("orderId".into(), native.into()); }
         let meta = TradeReqMeta { event_type: LogEventType::RequestOrderCancel, req_id: Some(c.req_id), cl_ord_id: c.cl_ord_id, market_id: Some(c.market_id), account_id: Some(c.account_id) };
         match self.ws_api_request("order.cancel", params, Some(meta)).await {
-            Ok(_v) => {},
+            Ok(_v) => {}
             Err(e) => {
+                let s = e.to_string();
+                // Map unknown order (-2011) to a benign failure response (race condition)
+                if s.contains("-2011") || s.contains("Unknown order") {
+                    let rcv_timestamp = chrono::Utc::now().timestamp_micros();
+                    return Ok(OrderResponse { req_id: c.req_id, timestamp: rcv_timestamp, rcv_timestamp, cl_ord_id: c.cl_ord_id, native_ord_id: None, status: OrderResponseStatus::FailedOrderNotFound, exec: None });
+                }
                 if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
                     prom.inc_ws_api_error_code("BINANCE_FUTURES", "order.cancel", "error");
                 }
@@ -407,6 +437,9 @@ impl BinanceFuturesAccountAdapter {
             ev.req_id = Some(a.req_id);
             ev.market_id = Some(a.market_id);
             ev.account_id = Some(a.account_id);
+            let (code, msg) = Self::extract_error_fields(&resp_json);
+            ev.error_code = code.or_else(|| if !status.is_success() { Some(status.as_u16().to_string()) } else { None });
+            ev.error_message = msg.or_else(|| if !status.is_success() { Some(text.clone()) } else { None });
             tlh.log(ev).await;
         }
         if !status.is_success() {
@@ -676,9 +709,10 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                                             if ev == "ORDER_TRADE_UPDATE" {
                                                 if let Some(o) = root.order.as_ref() {
                                                     let et = if o.exec_type == "TRADE" { LogEventType::ApiEventExecution } else { LogEventType::ApiEventOrderUpdate };
-                                                    (et, None, o.client_order_id.as_deref().and_then(|c| crate::xcommons::oms::clordid::parse_xcl(c)), Some(o.order_id.to_string()))
+                                                    let xet = Self::map_binance_exec_type(o.exec_type.as_str());
+                                                    (et, xet, o.client_order_id.as_deref().and_then(|c| crate::xcommons::oms::clordid::parse_xcl(c)), Some(o.order_id.to_string()))
                                                 } else { (LogEventType::ApiEventOrderUpdate, None, None, None) }
-                                            } else if ev == "TRADE_LITE" { (LogEventType::ApiEventTradeLite, None, None, None) }
+                                            } else if ev == "TRADE_LITE" { (LogEventType::ApiEventTradeLite, Some(ExecutionType::XTrade), None, None) }
                                             else { (LogEventType::ApiEventOrderUpdate, None, None, None) }
                                         } else { (LogEventType::ApiEventOrderUpdate, None, None, None) };
                                     let mut ev = tlog::event_base(event_type, "binance_user_ws", v);
