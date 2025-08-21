@@ -124,6 +124,10 @@ impl AppEnvironment for DefaultEnvironment {
         ));
 
         let mut runners = Vec::new();
+        let rec_mode = match params.recovery_mode.as_deref() {
+            Some("exit") | Some("Exit") => crate::trading::account_state::RecoveryMode::Exit,
+            _ => crate::trading::account_state::RecoveryMode::Restore,
+        };
         for symbol in params.symbols.iter().cloned() {
             let adapter = adapter.clone();
             let pool = pool.clone();
@@ -136,12 +140,14 @@ impl AppEnvironment for DefaultEnvironment {
                 "[Env] starting binance account runner: symbol={} market_id={} start_epoch_ts={} fee_bps={} contract_size={}",
                 symbol, market_id, start_epoch_ts, fee_bps, contract_size
             );
+            let rec_mode_clone = rec_mode.clone();
             let handle = tokio::spawn(async move {
                 let mut account = AccountState::new(
                     account_id,
                     ExchangeId::BinanceFutures,
                     Box::new(PostgresExecutionsDatastore::new(pool)),
                     adapter,
+                    rec_mode_clone,
                 );
                 // Subscribe to executions and positions and print them
                 let mut exec_rx = account.subscribe_executions();
@@ -195,6 +201,8 @@ pub struct BinanceAccountParams {
     pub fee_bps: f64,
     pub contract_size: f64,
     pub symbols: Vec<String>,
+    /// Recovery policy: "restore" (default) or "exit" on user-stream loss
+    pub recovery_mode: Option<String>,
 }
 
 

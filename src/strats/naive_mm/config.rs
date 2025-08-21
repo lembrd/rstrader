@@ -46,6 +46,9 @@ pub struct BinanceSection {
     pub fee_bps: f64,
     pub contract_size: f64,
     pub symbols: Vec<String>,
+    /// Recovery policy for user data stream: "restore" (default) or "exit" to fail fast
+    #[serde(default)]
+    pub recovery_mode: Option<String>,
 }
 
 #[derive(Deserialize)]

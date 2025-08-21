@@ -9,6 +9,7 @@ use crate::xcommons::types::ExchangeId;
 use async_trait::async_trait;
 use deadpool_postgres::Pool;
 use tokio::sync::broadcast;
+use std::time::Duration;
 
 /// Storage abstraction for executions with idempotent upsert semantics and ordered range queries
 #[async_trait]
@@ -216,6 +217,14 @@ pub trait ExchangeAccountAdapter: Send + Sync {
     async fn send_request(&self, req: OrderRequest) -> Result<OrderResponse>;
 }
 
+#[derive(Clone, Debug)]
+pub enum RecoveryMode {
+    /// Perform full REST backfill + replay and continue (current behavior)
+    Restore,
+    /// Perform full REST backfill + replay for safety, then exit process to be restarted by supervisor
+    Exit,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RestartPoint {
@@ -237,6 +246,8 @@ pub struct AccountState {
     pos_tx: broadcast::Sender<(i64, Position)>,
     /// Forward REST order responses to strategy via broadcast
     resp_tx: broadcast::Sender<OrderResponse>,
+    /// Recovery policy on user-stream disconnects
+    recovery_mode: RecoveryMode,
 }
 
 impl AccountState {
@@ -245,6 +256,7 @@ impl AccountState {
         exchange: crate::xcommons::types::ExchangeId,
         datastore: Box<dyn ExecutionsDatastore>,
         adapter: std::sync::Arc<dyn ExchangeAccountAdapter>,
+        recovery_mode: RecoveryMode,
     ) -> Self {
         Self {
             account_id,
@@ -256,6 +268,7 @@ impl AccountState {
             exec_tx: broadcast::channel(1024).0,
             pos_tx: broadcast::channel(1024).0,
             resp_tx: broadcast::channel(1024).0,
+            recovery_mode,
         }
     }
 
@@ -454,7 +467,17 @@ impl AccountState {
             let _ = self.pos_tx.send((market_id, snapshot));
         }
 
-        // Re-subscribe in a loop without recursive futures
+        // If configured to exit on disconnect, fail fast after restore
+        if let RecoveryMode::Exit = self.recovery_mode {
+            log::error!(
+                "[AccountState] user stream disconnected; performed restore; exiting process due to recovery_mode=Exit"
+            );
+            // Small delay to allow logs/metrics to flush
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            std::process::exit(1);
+        }
+
+        // Re-subscribe in a loop without recursive futures (Restore mode)
         loop {
             // subscribe
             let mut rx = self.adapter.subscribe_live(self.account_id, market_id).await?;
@@ -526,12 +549,6 @@ impl AccountState {
                 pos.clone()
             };
             // broadcast execution and updated position snapshot (best-effort)
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "[AccountState] apply exec ts={} mid={} side={:?} qty={} px={} native_id={}",
-                    e.timestamp, e.market_id, e.side, e.last_qty, e.last_px, e.native_execution_id
-                );
-            }
             let _ = self.exec_tx.send(e.clone());
             let _ = self.pos_tx.send((market_id, snapshot));
         }

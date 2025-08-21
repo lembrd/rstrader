@@ -220,6 +220,10 @@ impl StrategyRunner {
                     params.ed25519_key.clone(),
                     params.ed25519_secret.clone(),
                 ));
+                let rec_mode = match params.recovery_mode.as_deref() {
+                    Some("exit") | Some("Exit") => crate::trading::account_state::RecoveryMode::Exit,
+                    _ => crate::trading::account_state::RecoveryMode::Restore,
+                };
                 for symbol in params.symbols.iter().cloned() {
                     let adapter = adapter.clone();
                     let pool = pool.clone();
@@ -232,12 +236,14 @@ impl StrategyRunner {
                     let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<OrderRequest>(1024);
                     order_txs.insert(market_id, req_tx);
                     let adapter_req = adapter.clone();
+                    let rec_mode_clone = rec_mode.clone();
                     tokio::spawn(async move {
                         let mut account = AccountState::new(
                             account_id,
                             ExchangeId::BinanceFutures,
                             Box::new(PostgresExecutionsDatastore::new(pool)),
                             adapter,
+                            rec_mode_clone,
                         );
                         // Forward exec/pos into strategy mailbox
                         let mut exec_rx = account.subscribe_executions();
@@ -255,9 +261,7 @@ impl StrategyRunner {
                                             Ok(exec) => {
                                                 if ftx.send(StrategyMessage::Execution { account_id, exec: exec.clone() }).await.is_err() {
                                                     log::warn!("[StrategyRunner] dropping execution: mailbox closed");
-                                                } else {
-                                                    log::debug!("[StrategyRunner] forwarded execution: market_id={} side={} qty={} px={}", exec.market_id, exec.side as i8, exec.last_qty, exec.last_px);
-                                                }
+                                                } 
                                             }
                                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                                 log::warn!("[StrategyRunner] exec_rx lagged, skipped {} messages", skipped);
@@ -272,9 +276,7 @@ impl StrategyRunner {
                                             Ok((mid, pos)) => {
                                                 if ftx.send(StrategyMessage::Position { account_id, market_id: mid, pos: pos.clone() }).await.is_err() {
                                                     log::warn!("[StrategyRunner] dropping position: mailbox closed (market_id={})", mid);
-                                                } else {
-                                                    log::info!("[StrategyRunner] forwarded position: market_id={} amount={} avp={}", mid, pos.amount, pos.avp);
-                                                }
+                                                } 
                                             }
                                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                                 log::warn!("[StrategyRunner] pos_rx lagged, skipped {} messages", skipped);
