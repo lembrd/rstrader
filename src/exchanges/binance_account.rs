@@ -162,7 +162,13 @@ impl BinanceFuturesAccountAdapter {
         let sig_b64 = general_purpose::STANDARD.encode(sig.to_bytes());
         params.insert("signature".to_string(), serde_json::Value::from(sig_b64.clone()));
 
-        let req_id = format!("xtrader-{}", crate::xcommons::monoseq::next_id());
+        
+        // Prefer caller-provided req_id (from meta) to correlate request/response across layers
+        let req_id = if let Some(rid) = meta.as_ref().and_then(|m| m.req_id) {
+            format!("xtrader-{}", rid)
+        } else {
+            format!("xtrader-{}", crate::xcommons::monoseq::next_id())
+        };
         let req = serde_json::json!({
             "id": req_id,
             "method": method,
