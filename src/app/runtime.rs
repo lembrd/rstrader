@@ -37,7 +37,8 @@ async fn run_strategy_path(args: Args) -> Result<()> {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             use std::sync::Arc;
             use std::sync::atomic::{AtomicUsize, Ordering};
-            let listener = match TcpListener::bind("0.0.0.0:9898").await { Ok(l) => l, Err(_) => return };
+            let addr = std::env::var("PROM_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:9898".to_string());
+            let listener = match TcpListener::bind(&addr).await { Ok(l) => l, Err(_) => return };
             let active = Arc::new(AtomicUsize::new(0));
             const MAX_CONN: usize = 10;
             loop {
