@@ -8,6 +8,8 @@ pub struct NaiveMmConfig {
     pub runtime: RuntimeSection,
     pub subscriptions: Vec<SubscriptionItem>,
     pub binance: BinanceSection,
+    #[serde(default)]
+    pub hyper_params: HyperParams,
     #[serde(default = "default_max_position")] pub max_position: f64,
     #[serde(default = "default_lot_size")] pub lot_size: f64,
     #[serde(default = "default_spread_bps")] pub spread_bps: f64,
@@ -32,6 +34,29 @@ fn default_max_position() -> f64 { 0.015 }
 fn default_lot_size() -> f64 { 0.005 }
 fn default_spread_bps() -> f64 { 1.5 }
 fn default_displace_th_bps() -> f64 { 1.0 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HyperParams {
+    pub extra_fill_spread_bps_decay_factor: f64,
+    pub extra_fill_spread_bps_increase_on_trade: f64,
+    pub extra_fill_spread_bps_increase_on_mid_change: f64,
+    pub extra_fill_spread_bps_increase_on_cancel_request: f64,
+    pub spread_displace_inc_position_factor: f64,
+    pub spread_displace_dec_position_factor: f64,
+}
+
+impl Default for HyperParams {
+    fn default() -> Self {
+        Self {
+            extra_fill_spread_bps_decay_factor: 0.9985,
+            extra_fill_spread_bps_increase_on_trade: 0.5,
+            extra_fill_spread_bps_increase_on_mid_change: 0.01,
+            extra_fill_spread_bps_increase_on_cancel_request: 0.005,
+            spread_displace_inc_position_factor: 0.3,
+            spread_displace_dec_position_factor: 0.25,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct BinanceSection {

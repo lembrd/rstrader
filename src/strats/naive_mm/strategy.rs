@@ -10,7 +10,7 @@ use crate::xcommons::oms::OrderRequest;
 use crate::xcommons::position::Position;
 use crate::xcommons::xmarket_id::XMarketId;
 
-use super::config::NaiveMmConfig;
+use super::config::{NaiveMmConfig, HyperParams};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LiveOrderStatus { PendingNew, Live, PendingCancel }
@@ -36,6 +36,7 @@ pub struct NaiveMm {
 	// decision input
 	fair_px: f64,
 	last_mid: Option<f64>,
+	last_mid_price: f64,
 	// live bid/ask orders
 	bid_order: Option<LiveOrder>,
 	ask_order: Option<LiveOrder>,
@@ -49,6 +50,10 @@ pub struct NaiveMm {
 	last_cancel_req_ts_us_ask: Option<i64>,
 	// one-time cancel-all init
 	did_init: bool,
+	// extra fill spread;
+	extra_fill_spread_bps: f64,
+	// hyper params from config
+	hyper_params: HyperParams,
 }
 
 impl Default for NaiveMm {
@@ -67,6 +72,7 @@ impl Default for NaiveMm {
 			last_obs_ts_us: 0,
 			fair_px: 0.0,
 			last_mid: None,
+			last_mid_price: 0.0,
 			bid_order: None,
 			ask_order: None,
 			pending_cancel_bid: false,
@@ -76,6 +82,8 @@ impl Default for NaiveMm {
 			last_cancel_req_ts_us_bid: None,
 			last_cancel_req_ts_us_ask: None,
 			did_init: false,
+			extra_fill_spread_bps: 0.0,
+			hyper_params: HyperParams::default(),
 		}
 	}
 }
@@ -122,7 +130,9 @@ impl Strategy for NaiveMm {
 		self.lot_size = cfg.lot_size;
 		self.max_position = cfg.max_position;
 		self.spread_bps = cfg.spread_bps;
+		self.extra_fill_spread_bps = self.spread_bps * 2.0;
 		self.displace_bps = cfg.displace_th_bps;
+		self.hyper_params = cfg.hyper_params.clone();
 		self.binance_account_id = Some(cfg.binance.account_id);
 		Ok(())
 	}
@@ -158,7 +168,8 @@ impl Strategy for NaiveMm {
 		let best_bid_opt = snapshot.bids.iter().max_by(|a,b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
 		let best_ask_opt = snapshot.asks.iter().min_by(|a,b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
 		let (best_bid, best_ask) = match (best_bid_opt, best_ask_opt) { (Some(b), Some(a)) => (b, a), _ => return };
-		let mid_price = (best_bid.price * best_ask.qty + best_ask.price * best_bid.qty) / (best_bid.qty + best_ask.qty);
+		// let mid_price = (best_bid.price * best_ask.qty + best_ask.price * best_bid.qty) / (best_bid.qty + best_ask.qty);
+		let mid_price = (best_bid.price + best_ask.price ) / 2.0;
 		self.last_mid = Some(mid_price);
 		self.fair_px = mid_price;
 		if should_print {
@@ -177,12 +188,15 @@ impl Strategy for NaiveMm {
 				None => "None".to_string(),
 			};
 			log::info!(
-				"[naive_mm] on_obs: mid={} market_id={} ready={} bid={} ask={}",
+				"[naive_mm] on_obs: mid={} market_id={} ready={} bid={} ask={} pos={} pnl={} extra_fill_spread_bps={}",
 				mid_price,
 				market_id,
 				self.ready,
 				bid_state,
 				ask_state,
+				self.position.amount,
+				self.position.current_pnl(mid_price),
+				self.extra_fill_spread_bps
 			);
 		}
 		io.schedule_update();
@@ -208,8 +222,8 @@ impl Strategy for NaiveMm {
 
 	fn on_trade(&mut self, _sub: SubscriptionId, _msg: TradeUpdate, _io: &mut StrategyIo) {}
 
-	fn on_execution(&mut self, account_id: i64, exec: XExecution, io: &mut StrategyIo) {
-		// log::info!("[naive_mm] exec account_id={} market_id={} side={} qty={} px={} id={}", account_id, exec.market_id, exec.side as i8, exec.last_qty, exec.last_px, exec.native_execution_id);
+	fn on_execution(&mut self, _account_id: i64, exec: XExecution, io: &mut StrategyIo) {
+		// log::info!("[naive_mm] exec account_id={} market_id={} side={} qty={} px={} id={}", _account_id, exec.market_id, exec.side as i8, exec.last_qty, exec.last_px, exec.native_execution_id);
 		if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
 			let strategy = self.name();
 			let tick_ts = self.last_obs_ts_us;
@@ -229,6 +243,10 @@ impl Strategy for NaiveMm {
 			}
 		}
 		if exec.cl_ord_id != -1 {
+			if exec.exec_type == crate::xcommons::oms::ExecutionType::XTrade {
+				self.extra_fill_spread_bps += self.spread_bps * self.hyper_params.extra_fill_spread_bps_increase_on_trade;
+			}
+
 			if self.bid_order.map(|lo| lo.cl_ord_id == exec.cl_ord_id).unwrap_or(false) {
 				match exec.exec_type {
 					crate::xcommons::oms::ExecutionType::XOrderCanceled => { self.bid_order = None; self.pending_cancel_bid = false; }
@@ -341,8 +359,8 @@ impl Strategy for NaiveMm {
 		io.schedule_update();
 	}
 
-	fn on_position(&mut self, account_id: i64, market_id: i64, pos: Position, io: &mut StrategyIo) {
-		// log::info!("[naive_mm] position account_id={} market_id={} amount={} avp={} realized={} fees={} trades_count={} vol={} bps={}", account_id, market_id, pos.amount, pos.avp, pos.realized, pos.fees, pos.trades_count, pos.quote_volume, pos.bps());
+	fn on_position(&mut self, _account_id: i64, market_id: i64, pos: Position, io: &mut StrategyIo) {
+		// log::info!("[naive_mm] position account_id={} market_id={} amount={} avp={} realized={} fees={} trades_count={} vol={} bps={}", _account_id, market_id, pos.amount, pos.avp, pos.realized, pos.fees, pos.trades_count, pos.quote_volume, pos.bps());
 		self.position = pos;
 		self.market_id = Some(market_id);
 		self.ready = true;
@@ -361,10 +379,19 @@ impl Strategy for NaiveMm {
 	}
 
 	fn update(&mut self, io: &mut StrategyIo) {
+		
+		self.extra_fill_spread_bps = self.extra_fill_spread_bps * self.hyper_params.extra_fill_spread_bps_decay_factor;
+
 		let (Some(market_id), Some(mid_price)) = (self.market_id, self.last_mid) else {
 			log::debug!("[naive_mm] update skipped: market_id or mid missing. market_id={:?} mid_present={} ready={}", self.market_id, self.last_mid.is_some(), self.ready);
 			return
 		};
+		
+		if self.last_mid_price != mid_price {
+			self.extra_fill_spread_bps += self.spread_bps * self.hyper_params.extra_fill_spread_bps_increase_on_mid_change;
+		}
+
+		self.last_mid_price = mid_price;
 		// Become ready when order channel is available (initial positions may not be pushed immediately)
 		if !self.ready {
 			let has_tx = io.order_txs.contains_key(&market_id);
@@ -389,7 +416,7 @@ impl Strategy for NaiveMm {
 		let tick = 0.1f64;
 		let round_to_tick = |px: f64| -> f64 { (px / tick).round() * tick };
 		let strategy_name = self.name();
-		let spread_bps = self.spread_bps;
+		let spread_bps = self.spread_bps + self.extra_fill_spread_bps;
 		let displace_bps = self.displace_bps;
 		let lot = self.lot_size;
 		let symbol_clone_opt = self.symbol.clone();
@@ -399,13 +426,32 @@ impl Strategy for NaiveMm {
 		let mut bid_target = round_to_tick(mid_price * (1.0 - spread_bps / 10_000.0));
 		let mut ask_target = round_to_tick(mid_price * (1.0 + spread_bps / 10_000.0));
 
-		if pos_amt.abs() > 0.0 {
+		let spread_displace_inc_position_factor = self.hyper_params.spread_displace_inc_position_factor;
+		let spread_displace_dec_position_factor = self.hyper_params.spread_displace_dec_position_factor;
+
+		if pos_amt.abs() > 0.00001 {
 			if pos_amt > 0.0 { 
-				bid_target = round_to_tick(bid_target * (1.0 -((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * 0.2)));
+				bid_target = round_to_tick(bid_target * (1.0 - ((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * spread_displace_inc_position_factor)));
+				ask_target = round_to_tick(ask_target * (1.0 - ((pos_amt.abs() / lot) * (self.spread_bps / 10_000.0) * spread_displace_dec_position_factor)));
+				// ask_target = round_to_tick(ask_target * (1.0 + (self.extra_fill_spread_bps * 0.5) / 10_000.0));
 			} else {
-				ask_target = round_to_tick(ask_target * (1.0 +((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * 0.2)));
+				ask_target = round_to_tick(ask_target * (1.0 + ((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * spread_displace_inc_position_factor)));
+				bid_target = round_to_tick(bid_target * (1.0 + ((pos_amt.abs() / lot) * (self.spread_bps / 10_000.0) * spread_displace_dec_position_factor)));
+				// bid_target = round_to_tick(bid_target * (1.0 - (self.extra_fill_spread_bps * 0.5) / 10_000.0));
 			}
 		}
+		// if pos_amt.abs() > 0.00001 {
+		// 	if pos_amt > 0.0 { 
+		// 		bid_target = round_to_tick(bid_target * (1.0 - ((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * 0.2) - (self.extra_fill_spread_bps / 10_000.0)));
+		// 		ask_target = round_to_tick(ask_target * (1.0 + (self.extra_fill_spread_bps * 0.5) / 10_000.0));
+		// 	} else {
+		// 		ask_target = round_to_tick(ask_target * (1.0 + ((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * 0.2) + (self.extra_fill_spread_bps / 10_000.0)));
+		// 		bid_target = round_to_tick(bid_target * (1.0 - (self.extra_fill_spread_bps * 0.5) / 10_000.0));
+		// 	}
+		// } else {
+		// 	ask_target = round_to_tick(ask_target * (1.0 + (self.extra_fill_spread_bps * 1.0) / 10_000.0));
+		// 	bid_target = round_to_tick(bid_target * (1.0 - (self.extra_fill_spread_bps * 1.0) / 10_000.0));
+		// }
 
 		let disp_th = displace_bps / 10_000.0 * mid_price;
 		// If a cancel request errored upstream (not forwarded to strategy), clear pending cancel after a short TTL
@@ -430,6 +476,7 @@ impl Strategy for NaiveMm {
 				Some(lo) => {
 					let cl = lo.cl_ord_id; let px = lo.price;
 					if lo.status == LiveOrderStatus::Live && ((px - bid_target).abs() > disp_th || pos_amt >= self.max_position) {
+						self.extra_fill_spread_bps += self.spread_bps * self.hyper_params.extra_fill_spread_bps_increase_on_cancel_request;
 						let creq = CancelRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), market_id, account_id: self.binance_account_id.unwrap_or_default(), cl_ord_id: Some(cl), native_ord_id: None };
 						let sent = crate::xcommons::types::time::now_micros();
 						if !self.pending_cancel_bid && tx.try_send(OrderRequest::Cancel(creq)).is_ok() {
@@ -461,6 +508,7 @@ impl Strategy for NaiveMm {
 				Some(lo) => {
 					let cl = lo.cl_ord_id; let px = lo.price;
 					if lo.status == LiveOrderStatus::Live && ((px - ask_target).abs() > disp_th || -pos_amt >= self.max_position) {
+						self.extra_fill_spread_bps += self.spread_bps * self.hyper_params.extra_fill_spread_bps_increase_on_cancel_request;
 						let creq = CancelRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), market_id, account_id: self.binance_account_id.unwrap_or_default(), cl_ord_id: Some(cl), native_ord_id: None };
 						let sent = crate::xcommons::types::time::now_micros();
 						if !self.pending_cancel_ask && tx.try_send(OrderRequest::Cancel(creq)).is_ok() {
