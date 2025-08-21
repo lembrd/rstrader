@@ -671,27 +671,21 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                             // Log raw WS event
                             if let Some(tlh) = tradelog.as_ref() {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                                    let (event_type, exec_type_opt, ord_status_opt, side_opt, is_taker_opt, last_px_opt, last_qty_opt, cl_id_opt, native_id_opt) =
+                                    let (event_type, exec_type_opt, cl_id_opt, native_id_opt) =
                                         if let Some(ev) = root.event_type.as_deref() {
                                             if ev == "ORDER_TRADE_UPDATE" {
                                                 if let Some(o) = root.order.as_ref() {
                                                     let et = if o.exec_type == "TRADE" { LogEventType::ApiEventExecution } else { LogEventType::ApiEventOrderUpdate };
-                                                    let side_opt = match o.side.as_str() { "BUY" => Some(Side::Buy), "SELL" => Some(Side::Sell), _ => Some(Side::Unknown) };
-                                                    (et, None, None, side_opt, Some(!o.is_maker), o.last_filled_price.parse().ok(), o.last_filled_qty.parse().ok(), o.client_order_id.as_deref().and_then(|c| crate::xcommons::oms::clordid::parse_xcl(c)), Some(o.order_id.to_string()))
-                                                } else { (LogEventType::ApiEventOrderUpdate, None, None, None, None, None, None, None, None) }
-                                            } else if ev == "TRADE_LITE" { (LogEventType::ApiEventTradeLite, None, None, None, None, None, None, None, None) }
-                                            else { (LogEventType::ApiEventOrderUpdate, None, None, None, None, None, None, None, None) }
-                                        } else { (LogEventType::ApiEventOrderUpdate, None, None, None, None, None, None, None, None) };
+                                                    (et, None, o.client_order_id.as_deref().and_then(|c| crate::xcommons::oms::clordid::parse_xcl(c)), Some(o.order_id.to_string()))
+                                                } else { (LogEventType::ApiEventOrderUpdate, None, None, None) }
+                                            } else if ev == "TRADE_LITE" { (LogEventType::ApiEventTradeLite, None, None, None) }
+                                            else { (LogEventType::ApiEventOrderUpdate, None, None, None) }
+                                        } else { (LogEventType::ApiEventOrderUpdate, None, None, None) };
                                     let mut ev = tlog::event_base(event_type, "binance_user_ws", v);
                                     ev.market_id = Some(market_id);
                                     ev.account_id = Some(account_id);
                                     ev.exchange_ts_us = root.event_time.map(|ms| ms * 1000);
                                     ev.exec_type = exec_type_opt;
-                                    ev.ord_status = ord_status_opt;
-                                    ev.side = side_opt;
-                                    ev.is_taker = is_taker_opt;
-                                    ev.last_px = last_px_opt;
-                                    ev.last_qty = last_qty_opt;
                                     ev.cl_ord_id = cl_id_opt;
                                     ev.native_ord_id = native_id_opt;
                                     tlh.log(ev).await;

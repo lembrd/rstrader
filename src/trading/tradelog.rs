@@ -1,5 +1,5 @@
 use crate::xcommons::error::{AppError, Result};
-use crate::xcommons::oms::{ExecutionType, OrderResponseStatus, OrderStatus, Side};
+use crate::xcommons::oms::ExecutionType;
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -36,18 +36,6 @@ pub struct TradeLogEvent {
     pub account_id: Option<i64>,
 
     pub exec_type: Option<ExecutionType>,
-    pub ord_status: Option<OrderStatus>,
-    pub side: Option<Side>,
-    pub is_taker: Option<bool>,
-
-    pub last_px: Option<f64>,
-    pub last_qty: Option<f64>,
-    pub leaves_qty: Option<f64>,
-    pub ord_px: Option<f64>,
-    pub ord_qty: Option<f64>,
-    pub fee: Option<f64>,
-
-    pub response_status: Option<OrderResponseStatus>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
 
@@ -90,18 +78,16 @@ impl TradeLogService {
                     local_ts_us, exchange_ts_us, event_type,
                     strategy_id,
                     req_id, cl_ord_id, native_ord_id, market_id, account_id,
-                    exec_type, ord_status, side, is_taker,
-                    last_px, last_qty, leaves_qty, ord_px, ord_qty, fee,
-                    response_status, error_code, error_message,
+                    exec_type,
+                    error_code, error_message,
                     source, body
                 ) VALUES (
                     $1, $2, $3,
                     $4,
                     $5, $6, $7, $8, $9,
-                    $10, $11, $12, $13,
-                    $14, $15, $16, $17, $18, $19,
-                    $20, $21, $22,
-                    $23, $24
+                    $10,
+                    $11, $12,
+                    $13, $14
                 )"#,
             )
             .await
@@ -124,16 +110,6 @@ impl TradeLogService {
                         &ev.market_id,
                         &ev.account_id,
                         &ev.exec_type.map(|v| v as i16),
-                        &ev.ord_status.map(|v| v as i16),
-                        &ev.side.map(|v| match v { Side::Buy => 1i16, Side::Sell => -1i16, Side::Unknown => 0i16 }),
-                        &ev.is_taker,
-                        &ev.last_px,
-                        &ev.last_qty,
-                        &ev.leaves_qty,
-                        &ev.ord_px,
-                        &ev.ord_qty,
-                        &ev.fee,
-                        &ev.response_status.map(|v| v as i16),
                         &ev.error_code,
                         &ev.error_message,
                         &ev.source,
@@ -180,16 +156,6 @@ pub mod build {
             market_id: None,
             account_id: None,
             exec_type: None,
-            ord_status: None,
-            side: None,
-            is_taker: None,
-            last_px: None,
-            last_qty: None,
-            leaves_qty: None,
-            ord_px: None,
-            ord_qty: None,
-            fee: None,
-            response_status: None,
             error_code: None,
             error_message: None,
             source: Some(source.to_string()),

@@ -212,15 +212,21 @@ impl StrategyRunner {
             );
             let pool = deadpool_postgres::Pool::builder(mgr).max_size(16).build().unwrap();
 
+            // Start TradeLog worker for strategy runner using STRATEGY_ID env var (set by strategy configure)
+            let strategy_id: i64 = std::env::var("STRATEGY_ID")
+                .map_err(|e| crate::xcommons::error::AppError::config(format!("STRATEGY_ID missing: {}", e)))?
+                .parse()
+                .map_err(|e| crate::xcommons::error::AppError::config(format!("STRATEGY_ID parse: {}", e)))?;
+            let tradelog = crate::trading::tradelog::TradeLogService::start(pool.clone(), strategy_id);
+
             for params in accounts.into_iter() {
-                // For standalone strategy runner, no tradelog handle yet
                 let adapter = std::sync::Arc::new(BinanceFuturesAccountAdapter::new(
                     params.api_key.clone(),
                     params.secret.clone(),
                     params.symbols.clone(),
                     params.ed25519_key.clone(),
                     params.ed25519_secret.clone(),
-                    None,
+                    Some(tradelog.clone()),
                 ));
                 let rec_mode = match params.recovery_mode.as_deref() {
                     Some("exit") | Some("Exit") => crate::trading::account_state::RecoveryMode::Exit,
