@@ -128,7 +128,7 @@ enum SyncState {
 /// Binance Futures connector implementation
 pub struct BinanceFuturesConnector {
     rest_client: Client,
-    ws_stream: Option<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
+    ws_stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     connection_status: ConnectionStatus,
     sync_state: SyncState,
     symbol: Option<String>,
@@ -472,7 +472,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
         let local_ts = crate::xcommons::types::time::now_millis();
 
         Ok(OrderBookSnapshot {
-            market_id: crate::xcommons::xmarket_id::XMarketId::make(
+            market_id: XMarketId::make(
                 ExchangeId::BinanceFutures,
                 symbol,
             ),
@@ -556,10 +556,11 @@ impl ExchangeConnector for BinanceFuturesConnector {
                 ws_stream.next().await
             };
 
+            let rcv_timestamp = crate::xcommons::types::time::now_micros();
+
             match msg {
                 Some(Ok(Message::Text(text))) => {
                     // Processing WebSocket message
-                    let rcv_timestamp = crate::xcommons::types::time::now_millis();
 
                     // Handle based on sync state - for trade streams, skip depth parsing
                     match &self.sync_state {
@@ -649,7 +650,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
                     let raw_message = RawMessage {
                         exchange_id: ExchangeId::BinanceFutures,
                         data: text.into_bytes(),
-                        rcv_timestamp: rcv_timestamp,
+                        rcv_timestamp,
                     };
                     return Ok(Some(raw_message));
                 }
@@ -702,8 +703,8 @@ impl ExchangeConnector for BinanceFuturesConnector {
 
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.ws_stream.as_ref().and_then(|ws| match ws.get_ref() {
-            tokio_tungstenite::MaybeTlsStream::Plain(tcp) => tcp.peer_addr().ok(),
-            tokio_tungstenite::MaybeTlsStream::Rustls(tls) => {
+            MaybeTlsStream::Plain(tcp) => tcp.peer_addr().ok(),
+            MaybeTlsStream::Rustls(tls) => {
                 let (io, _) = tls.get_ref();
                 io.peer_addr().ok()
             }
@@ -752,7 +753,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
         log::info!("Binance trade stream connected for {}", symbol);
 
         // Message forwarding loop with idle watchdog
-        let mut last_frame_at = crate::xcommons::types::time::now_micros();
+        let mut last_frame_at = now_micros();
         let idle_timeout_us: i64 = 180_000_000; // 180s
         let mut watchdog = tokio::time::interval(Duration::from_millis(5_000));
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -775,7 +776,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
                 }
             };
 
-            let rcv_timestamp = crate::xcommons::types::time::now_micros();
+            let rcv_timestamp = now_micros();
             last_frame_at = rcv_timestamp;
 
             match msg {
@@ -873,7 +874,7 @@ impl BinanceProcessor {
 }
 
 impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
-    type Error = crate::xcommons::error::AppError;
+    type Error = AppError;
 
     fn base_processor(&mut self) -> &mut crate::exchanges::BaseProcessor {
         &mut self.base
@@ -885,20 +886,21 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
     fn process_message(
         &mut self,
-        raw_msg: crate::xcommons::types::RawMessage,
+        raw_msg: RawMessage,
         _symbol: &str,
         packet_id: u64,
         message_bytes: u32,
-    ) -> std::result::Result<Vec<crate::xcommons::types::OrderBookL2Update>, Self::Error> {
+    ) -> std::result::Result<Vec<OrderBookL2Update>, Self::Error> {
         // Track message received
         self.base.metrics.increment_received();
 
         // Calculate packet arrival timestamp (when network packet was received)
         // Use socket receive time from RawMessage for code latency measurement
         let rcv_timestamp = raw_msg.rcv_timestamp;
+        assert!(rcv_timestamp > 0, "Invalid rcv_timestamp ZERO");
 
         // Parse Binance message with timing
-        let parse_start = crate::xcommons::types::time::now_micros();
+        let parse_start = now_micros();
 
         let mut data_bytes = raw_msg.data;
 
@@ -906,7 +908,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         let json_value: serde_json::Value =
             serde_json::from_slice(&mut data_bytes).map_err(|_e| {
                 self.base.metrics.increment_parse_errors();
-                crate::xcommons::error::AppError::pipeline(ERROR_JSON_PARSE.to_string())
+                AppError::pipeline(ERROR_JSON_PARSE.to_string())
             })?;
 
         // Check if this is a subscription response (has "result" field)
@@ -928,13 +930,13 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         let depth_update: BinanceDepthUpdate = serde_json::from_value(json_value).map_err(|e| {
             self.base.metrics.increment_parse_errors();
             log::error!("CRITICAL: Failed to parse Binance depth update: {}", e);
-            crate::xcommons::error::AppError::pipeline(ERROR_DEPTH_PARSE.to_string())
+            AppError::pipeline(ERROR_DEPTH_PARSE.to_string())
         })?;
 
         // Removed per user request to reduce log spam
 
         // Calculate parse time
-        let parse_end = crate::xcommons::types::time::now_micros();
+        let parse_end = now_micros();
         if let Some(parse_time) = parse_end.checked_sub(parse_start) {
             self.base.metrics.update_parse_time(parse_time as u64);
         }
@@ -949,7 +951,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         }
 
         // Start transformation timing
-        let transform_start = crate::xcommons::types::time::now_micros();
+        let transform_start = now_micros();
 
         // Calculate overhead time (time between parse end and transform start)
         if let Some(overhead_time) = transform_start.checked_sub(parse_end) {
@@ -966,17 +968,17 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         let timestamp_micros =
             crate::xcommons::types::time::millis_to_micros(depth_update.event_time);
 
-        let xmarket_id = crate::xcommons::xmarket_id::XMarketId::make(
+        let xmarket_id = XMarketId::make(
             ExchangeId::BinanceFutures,
             &depth_update.symbol,
         );
         // Process bid updates using fast float parsing
         for bid in depth_update.bids {
             let price = fast_float::parse::<f64, _>(&bid[0]).map_err(|_e| {
-                crate::xcommons::error::AppError::pipeline(ERROR_PRICE_PARSE.to_string())
+                AppError::pipeline(ERROR_PRICE_PARSE.to_string())
             })?;
             let qty = fast_float::parse::<f64, _>(&bid[1]).map_err(|_e| {
-                crate::xcommons::error::AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
+                AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
             })?;
 
             let seq_id = self.next_sequence_id();
@@ -1004,7 +1006,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
                 } else {
                     crate::xcommons::types::L2Action::Update
                 },
-                side: crate::xcommons::oms::Side::Buy,
+                side: Side::Buy,
                 price,
                 qty,
             });
@@ -1013,10 +1015,10 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         // Process ask updates using fast float parsing
         for ask in depth_update.asks {
             let price = fast_float::parse::<f64, _>(&ask[0]).map_err(|_e| {
-                crate::xcommons::error::AppError::pipeline(ERROR_PRICE_PARSE.to_string())
+                AppError::pipeline(ERROR_PRICE_PARSE.to_string())
             })?;
             let qty = fast_float::parse::<f64, _>(&ask[1]).map_err(|_e| {
-                crate::xcommons::error::AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
+                AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
             })?;
 
             let seq_id = self.next_sequence_id();
@@ -1034,14 +1036,14 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
                 } else {
                     crate::xcommons::types::L2Action::Update
                 },
-                side: crate::xcommons::oms::Side::Sell,
+                side: Side::Sell,
                 price,
                 qty,
             });
         }
 
         // Calculate transformation time
-        let transform_end = crate::xcommons::types::time::now_micros();
+        let transform_end = now_micros();
         if let Some(transform_time) = transform_end.checked_sub(transform_start) {
             self.base
                 .metrics
@@ -1062,7 +1064,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
         // Calculate CODE LATENCY: From network packet arrival to business logic ready
         // This measures the FULL time spent in Rust code processing
-        let processing_complete = crate::xcommons::types::time::now_micros();
+        let processing_complete = now_micros();
         if let Some(code_latency) = processing_complete.checked_sub(rcv_timestamp) {
             if code_latency >= 0 {
                 self.base.metrics.update_code_latency(code_latency as u64);
@@ -1075,11 +1077,11 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
     fn process_trade_message(
         &mut self,
-        raw_msg: crate::xcommons::types::RawMessage,
+        raw_msg: RawMessage,
         _symbol: &str,
         packet_id: u64,
         message_bytes: u32,
-    ) -> std::result::Result<Vec<crate::xcommons::types::TradeUpdate>, Self::Error> {
+    ) -> std::result::Result<Vec<TradeUpdate>, Self::Error> {
         // Track message received
         self.base.metrics.increment_received();
 
@@ -1088,16 +1090,16 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         let rcv_timestamp = raw_msg.rcv_timestamp;
 
         // Parse Binance trade message with timing
-        let parse_start = crate::xcommons::types::time::now_micros();
+        let parse_start = now_micros();
         let mut data_bytes = raw_msg.data;
         let trade_update: BinanceTradeUpdate =
             serde_json::from_slice(&mut data_bytes).map_err(|_e| {
                 self.base.metrics.increment_parse_errors();
-                crate::xcommons::error::AppError::pipeline(ERROR_TRADE_PARSE.to_string())
+                AppError::pipeline(ERROR_TRADE_PARSE.to_string())
             })?;
 
         // Calculate parse time
-        let parse_end = crate::xcommons::types::time::now_micros();
+        let parse_end = now_micros();
         if let Some(parse_time) = parse_end.checked_sub(parse_start) {
             self.base.metrics.update_parse_time(parse_time as u64);
         }
@@ -1114,7 +1116,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         }
 
         // Start transformation timing
-        let transform_start = crate::xcommons::types::time::now_micros();
+        let transform_start = now_micros();
 
         // Calculate overhead time (time between parse end and transform start)
         if let Some(overhead_time) = transform_start.checked_sub(parse_end) {
@@ -1123,11 +1125,11 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
         // Parse price and quantity
         let price = fast_float::parse::<f64, _>(&trade_update.price).map_err(|_e| {
-            crate::xcommons::error::AppError::pipeline(ERROR_PRICE_PARSE.to_string())
+            AppError::pipeline(ERROR_PRICE_PARSE.to_string())
         })?;
 
         let qty = fast_float::parse::<f64, _>(&trade_update.quantity).map_err(|_e| {
-            crate::xcommons::error::AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
+            AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
         })?;
 
         let trade_side = if trade_update.is_buyer_maker {
@@ -1137,7 +1139,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         };
 
         let seq_id = self.next_sequence_id();
-        let trade = crate::xcommons::types::TradeUpdate {
+        let trade = TradeUpdate {
             timestamp: crate::xcommons::types::time::millis_to_micros(trade_update.trade_time),
             rcv_timestamp,
             market_id: XMarketId::make(ExchangeId::BinanceFutures, &trade_update.symbol),
@@ -1151,7 +1153,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         };
 
         // Calculate transformation time
-        let transform_end = crate::xcommons::types::time::now_micros();
+        let transform_end = now_micros();
         if let Some(transform_time) = transform_end.checked_sub(transform_start) {
             self.base
                 .metrics
@@ -1168,7 +1170,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         self.base.metrics.update_packet_metrics(1, 1, message_bytes);
 
         // Calculate CODE LATENCY: From network packet arrival to business logic ready
-        let processing_complete = crate::xcommons::types::time::now_micros();
+        let processing_complete = now_micros();
         if let Some(code_latency) = processing_complete.checked_sub(rcv_timestamp) {
             if code_latency >= 0 {
                 self.base.metrics.update_code_latency(code_latency as u64);

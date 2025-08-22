@@ -5,49 +5,49 @@ use crate::xcommons::error::{AppError, Result};
 use crate::xcommons::types::{time, Metrics, OrderBookL2Update, RawMessage};
 
 use crate::xcommons::types::ExchangeId;
-
-/// Stream processor for transforming raw messages to unified format
-/// Now uses trait-based architecture for exchange-specific processing
-pub struct StreamProcessor {
-    processor:
-        Box<dyn crate::exchanges::ExchangeProcessor<Error = crate::xcommons::error::AppError>>,
-}
-
-impl StreamProcessor {
-    pub fn new(
-        processor: Box<
-            dyn crate::exchanges::ExchangeProcessor<Error = crate::xcommons::error::AppError>,
-        >,
-    ) -> Self {
-        Self { processor }
-    }
-
-    pub fn process_raw_message(
-        &mut self,
-        raw_msg: RawMessage,
-        symbol: &str,
-    ) -> Result<Vec<OrderBookL2Update>> {
-        // Single timestamp capture at start
-        let rcv_timestamp = time::now_micros();
-        let packet_id = self.processor.next_packet_id();
-        let message_bytes = raw_msg.data.len() as u32;
-
-        // Delegate to exchange-specific processor
-        let updates = self
-            .processor
-            .process_message(raw_msg, symbol, packet_id, message_bytes)?;
-
-        Ok(updates)
-    }
-
-    pub fn update_throughput(&mut self, messages_per_sec: f64) {
-        self.processor.update_throughput(messages_per_sec);
-    }
-
-    pub fn metrics(&self) -> &Metrics {
-        self.processor.metrics()
-    }
-}
+//
+// /// Stream processor for transforming raw messages to unified format
+// /// Now uses trait-based architecture for exchange-specific processing
+// pub struct StreamProcessor {
+//     processor:
+//         Box<dyn crate::exchanges::ExchangeProcessor<Error = crate::xcommons::error::AppError>>,
+// }
+//
+// impl StreamProcessor {
+//     pub fn new(
+//         processor: Box<
+//             dyn crate::exchanges::ExchangeProcessor<Error = crate::xcommons::error::AppError>,
+//         >,
+//     ) -> Self {
+//         Self { processor }
+//     }
+//
+//     pub fn process_raw_message(
+//         &mut self,
+//         raw_msg: RawMessage,
+//         symbol: &str,
+//     ) -> Result<Vec<OrderBookL2Update>> {
+//         // Single timestamp capture at start
+//
+//         let packet_id = self.processor.next_packet_id();
+//         let message_bytes = raw_msg.data.len() as u32;
+//
+//         // Delegate to exchange-specific processor
+//         let updates = self
+//             .processor
+//             .process_message(raw_msg, symbol, packet_id, message_bytes)?;
+//
+//         Ok(updates)
+//     }
+//
+//     pub fn update_throughput(&mut self, messages_per_sec: f64) {
+//         self.processor.update_throughput(messages_per_sec);
+//     }
+//
+//     pub fn metrics(&self) -> &Metrics {
+//         self.processor.metrics()
+//     }
+// }
 
 pub struct MetricsReporter {
     symbol: String,
@@ -113,95 +113,63 @@ impl MetricsReporter {
         }
     }
 }
-
-pub async fn run_stream_processor(
-    mut rx: mpsc::Receiver<RawMessage>,
-    tx: mpsc::Sender<OrderBookL2Update>,
-    symbol: String,
-    verbose: bool,
-    okx_registry: Option<std::sync::Arc<crate::exchanges::okx::InstrumentRegistry>>,
-) -> Result<()> {
-    // We'll determine the exchange from the first message
-    let mut processor: Option<StreamProcessor> = None;
-
-    let mut reporter = if verbose {
-        Some(MetricsReporter::new(symbol.clone(), 10)) // Report every 10 seconds
-    } else {
-        None
-    };
-
-    log::info!("Stream processor started for {}", symbol);
-
-    while let Some(raw_msg) = rx.recv().await {
-        // Initialize processor on first message
-        if processor.is_none() {
-            let exchange_processor = crate::exchanges::ProcessorFactory::create_processor(
-                raw_msg.exchange_id,
-                okx_registry.clone(),
-            );
-            processor = Some(StreamProcessor::new(exchange_processor));
-
-            // Set exchange info for reporter
-            if let Some(ref mut reporter) = reporter {
-                reporter.set_exchange(raw_msg.exchange_id.clone());
-            }
-        }
-
-        let processor = processor.as_mut().unwrap();
-
-        match processor.process_raw_message(raw_msg, &symbol) {
-            Ok(updates) => {
-                for update in updates {
-                    if let Err(e) = tx.send(update).await {
-                        log::error!("Failed to send processed update: {}", e);
-                        return Err(AppError::pipeline("Channel send failed".to_string()));
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!("Failed to process raw message: {}", e);
-                // Continue processing other messages for fail-fast behavior
-            }
-        }
-
-        // Report metrics if verbose mode
-        if let Some(ref mut reporter) = reporter {
-            reporter.maybe_report(processor.metrics());
-        }
-    }
-
-    log::info!("Stream processor for {} completed", symbol);
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    // keep module imported above; no need to reimport here
-
-    #[test]
-    fn test_stream_processor_creation() {
-        let processor =
-            StreamProcessor::new(crate::exchanges::ProcessorFactory::create_binance_processor());
-        // Basic sanity check - processor should be created successfully
-        // Basic sanity check - processor should be created successfully
-        // Basic sanity check - processor should be created successfully
-        assert_eq!(
-            processor.metrics().messages_processed,
-            processor.metrics().messages_processed
-        );
-    }
-
-    #[test]
-    fn test_metrics_reporter() {
-        let mut reporter = MetricsReporter::new("TESTBTC".to_string(), 1);
-        let metrics = Metrics::default();
-
-        // Should not report immediately
-        reporter.maybe_report(&metrics);
-
-        // Should report after interval
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        reporter.maybe_report(&metrics);
-    }
-}
+//
+// pub async fn run_stream_processor(
+//     mut rx: mpsc::Receiver<RawMessage>,
+//     tx: mpsc::Sender<OrderBookL2Update>,
+//     symbol: String,
+//     verbose: bool,
+//     okx_registry: Option<std::sync::Arc<crate::exchanges::okx::InstrumentRegistry>>,
+// ) -> Result<()> {
+//     // We'll determine the exchange from the first message
+//     let mut processor: Option<StreamProcessor> = None;
+//
+//     let mut reporter = if verbose {
+//         Some(MetricsReporter::new(symbol.clone(), 10)) // Report every 10 seconds
+//     } else {
+//         None
+//     };
+//
+//     log::info!("Stream processor started for {}", symbol);
+//
+//     while let Some(raw_msg) = rx.recv().await {
+//         // Initialize processor on first message
+//         if processor.is_none() {
+//             let exchange_processor = crate::exchanges::ProcessorFactory::create_processor(
+//                 raw_msg.exchange_id,
+//                 okx_registry.clone(),
+//             );
+//             processor = Some(StreamProcessor::new(exchange_processor));
+//
+//             // Set exchange info for reporter
+//             if let Some(ref mut reporter) = reporter {
+//                 reporter.set_exchange(raw_msg.exchange_id.clone());
+//             }
+//         }
+//
+//         let processor = processor.as_mut().unwrap();
+//
+//         match processor.process_raw_message(raw_msg, &symbol) {
+//             Ok(updates) => {
+//                 for update in updates {
+//                     if let Err(e) = tx.send(update).await {
+//                         log::error!("Failed to send processed update: {}", e);
+//                         return Err(AppError::pipeline("Channel send failed".to_string()));
+//                     }
+//                 }
+//             }
+//             Err(e) => {
+//                 log::error!("Failed to process raw message: {}", e);
+//                 // Continue processing other messages for fail-fast behavior
+//             }
+//         }
+//
+//         // Report metrics if verbose mode
+//         if let Some(ref mut reporter) = reporter {
+//             reporter.maybe_report(processor.metrics());
+//         }
+//     }
+//
+//     log::info!("Stream processor for {} completed", symbol);
+//     Ok(())
+// }
