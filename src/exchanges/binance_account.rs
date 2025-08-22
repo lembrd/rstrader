@@ -621,21 +621,23 @@ impl BinanceFuturesAccountAdapter {
             let req_network_latency = rcv_timestamp - tc.send_ts;
             let rcv_network_latency = tc.rcv_ts - tc.initial_exchange_ts;
 
-            // Log or record metrics
+        
             log::info!("CANCEL latencies[{}] - Total: {}μs, req_net: {}μs, rcv_net: {}μs before_strategy: {}μs code_latency: {}μs",
             tc.initial_message,rcv_timestamp - tc.initial_exchange_ts, req_network_latency, rcv_network_latency, before_strategy, code_latency);
 
-            // You could also store these in metrics/prometheus here
-            if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+            
+            if tc.initial_exchange_ts > 0 {
+                if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
                 // Record each latency metric in the Prometheus histograms
-                prom.observe_order_latencies(
-                    "BINANCE_FUTURES",
-                    &symbol,
-                    code_latency as u64,
-                    before_strategy as u64,
-                    req_network_latency as u64,
-                    rcv_network_latency as u64,
-                );
+                    prom.observe_order_latencies(
+                        "BINANCE_FUTURES",
+                        &symbol,
+                        code_latency as u64,
+                        before_strategy as u64,
+                        req_network_latency as u64,
+                        rcv_network_latency as u64,
+                    );
+                }
             }
         }
 

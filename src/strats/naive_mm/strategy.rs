@@ -218,9 +218,9 @@ impl Strategy for NaiveMm {
             (Some(b), Some(a)) => (b, a),
             _ => return,
         };
-        let mid_price = (best_bid.price * best_ask.qty + best_ask.price * best_bid.qty)
-            / (best_bid.qty + best_ask.qty);
-        // let mid_price = (best_bid.price + best_ask.price) / 2.0;
+        // let mid_price = (best_bid.price * best_ask.qty + best_ask.price * best_bid.qty)
+            // / (best_bid.qty + best_ask.qty);
+        let mid_price = (best_bid.price + best_ask.price) / 2.0;
         self.last_mid = Some(mid_price);
         self.fair_px = mid_price;
         if should_print {
@@ -535,7 +535,7 @@ impl Strategy for NaiveMm {
 
     fn update(&mut self, io: &mut StrategyIo) {
         self.updates_counter += 1;
-        self.extra_fill_spread_bps += self.spread_bps * 0.0005;
+        // self.extra_fill_spread_bps += self.spread_bps * 0.001;
         self.extra_fill_spread_bps =
             self.extra_fill_spread_bps * self.hyper_params.extra_fill_spread_bps_decay_factor;
 

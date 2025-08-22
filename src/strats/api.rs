@@ -13,8 +13,8 @@ use crate::xcommons::oms::{OrderRequest, OrderResponse, TracingTimeStamps, XExec
 use crate::xcommons::position::Position;
 use crate::xcommons::types::time::now_micros;
 use crate::xcommons::types::{
-    ExchangeId, OrderBookL2Update, OrderBookSnapshot, StreamData, StreamType as CoreStreamType,
-    SubscriptionSpec, TradeUpdate,
+    ExchangeId, OrderBookL2Update, OrderBookSnapshot, StreamData, StreamType, SubscriptionSpec,
+    TradeUpdate,
 };
 use std::time::Duration;
 
