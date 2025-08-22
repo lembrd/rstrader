@@ -3,9 +3,9 @@ use crate::xcommons::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, Ra
 use async_trait::async_trait;
 
 pub mod binance;
+pub mod binance_account;
 pub mod deribit;
 pub mod okx;
-pub mod binance_account;
 
 /// Error types for exchange operations
 #[allow(dead_code)]
@@ -84,7 +84,9 @@ pub trait ExchangeConnector: Send + Sync {
     async fn disconnect(&mut self) -> Result<(), Self::Error>;
 
     /// Get peer socket address if connected
-    fn peer_addr(&self) -> Option<std::net::SocketAddr> { None }
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
 
     /// Check if connection is healthy
     fn is_connected(&self) -> bool {
@@ -166,7 +168,7 @@ pub trait ExchangeProcessor: Send + Sync {
         &mut self,
         raw_msg: crate::xcommons::types::RawMessage,
         symbol: &str,
-        rcv_timestamp: i64,
+
         packet_id: u64,
         message_bytes: u32,
     ) -> Result<Vec<crate::xcommons::types::OrderBookL2Update>, Self::Error>;
@@ -176,7 +178,7 @@ pub trait ExchangeProcessor: Send + Sync {
         &mut self,
         raw_msg: crate::xcommons::types::RawMessage,
         symbol: &str,
-        rcv_timestamp: i64,
+
         packet_id: u64,
         message_bytes: u32,
     ) -> Result<Vec<crate::xcommons::types::TradeUpdate>, Self::Error>;
@@ -186,24 +188,41 @@ pub trait ExchangeProcessor: Send + Sync {
         &mut self,
         raw_msg: crate::xcommons::types::RawMessage,
         symbol: &str,
-        rcv_timestamp: i64,
+
         packet_id: u64,
         message_bytes: u32,
         stream_type: crate::xcommons::types::StreamType,
     ) -> Result<Vec<crate::xcommons::types::StreamData>, Self::Error> {
         match stream_type {
             crate::xcommons::types::StreamType::L2 => {
-                let l2_updates = self.process_message(raw_msg, symbol, rcv_timestamp, packet_id, message_bytes)?;
-                Ok(l2_updates.into_iter().map(crate::xcommons::types::StreamData::L2).collect())
+                let l2_updates =
+                    self.process_message(raw_msg, symbol, packet_id, message_bytes)?;
+                Ok(l2_updates
+                    .into_iter()
+                    .map(crate::xcommons::types::StreamData::L2)
+                    .collect())
             }
             crate::xcommons::types::StreamType::Trade => {
-                let trade_updates = self.process_trade_message(raw_msg, symbol, rcv_timestamp, packet_id, message_bytes)?;
-                Ok(trade_updates.into_iter().map(crate::xcommons::types::StreamData::Trade).collect())
+                let trade_updates = self.process_trade_message(
+                    raw_msg,
+                    symbol,
+
+                    packet_id,
+                    message_bytes,
+                )?;
+                Ok(trade_updates
+                    .into_iter()
+                    .map(crate::xcommons::types::StreamData::Trade)
+                    .collect())
             }
             crate::xcommons::types::StreamType::Obs => {
                 // OBS piggybacks on L2; upstream should never call with Obs. Fallback to L2.
-                let l2_updates = self.process_message(raw_msg, symbol, rcv_timestamp, packet_id, message_bytes)?;
-                Ok(l2_updates.into_iter().map(crate::xcommons::types::StreamData::L2).collect())
+                let l2_updates =
+                    self.process_message(raw_msg, symbol, packet_id, message_bytes)?;
+                Ok(l2_updates
+                    .into_iter()
+                    .map(crate::xcommons::types::StreamData::L2)
+                    .collect())
             }
         }
     }
@@ -247,8 +266,8 @@ pub struct ProcessorFactory;
 
 impl ProcessorFactory {
     /// Create processor for Binance Futures
-    pub fn create_binance_processor() -> Box<dyn ExchangeProcessor<Error = crate::xcommons::error::AppError>>
-    {
+    pub fn create_binance_processor(
+    ) -> Box<dyn ExchangeProcessor<Error = crate::xcommons::error::AppError>> {
         Box::new(binance::BinanceProcessor::new())
     }
 
@@ -273,8 +292,8 @@ impl ProcessorFactory {
     }
 
     /// Create processor for Deribit
-    pub fn create_deribit_processor() -> Box<dyn ExchangeProcessor<Error = crate::xcommons::error::AppError>>
-    {
+    pub fn create_deribit_processor(
+    ) -> Box<dyn ExchangeProcessor<Error = crate::xcommons::error::AppError>> {
         Box::new(deribit::DeribitProcessor::new())
     }
 
@@ -285,8 +304,12 @@ impl ProcessorFactory {
     ) -> Box<dyn ExchangeProcessor<Error = crate::xcommons::error::AppError>> {
         match exchange_id {
             crate::xcommons::types::ExchangeId::BinanceFutures => Self::create_binance_processor(),
-            crate::xcommons::types::ExchangeId::OkxSwap => Self::create_okx_swap_processor(okx_registry),
-            crate::xcommons::types::ExchangeId::OkxSpot => Self::create_okx_spot_processor(okx_registry),
+            crate::xcommons::types::ExchangeId::OkxSwap => {
+                Self::create_okx_swap_processor(okx_registry)
+            }
+            crate::xcommons::types::ExchangeId::OkxSpot => {
+                Self::create_okx_spot_processor(okx_registry)
+            }
             crate::xcommons::types::ExchangeId::Deribit => Self::create_deribit_processor(),
         }
     }
@@ -302,7 +325,9 @@ impl ConnectorFactory {
         okx_spot_registry: Option<std::sync::Arc<okx::InstrumentRegistry>>,
     ) -> Box<dyn ExchangeConnector<Error = crate::xcommons::error::AppError>> {
         match exchange {
-            crate::xcommons::types::ExchangeId::BinanceFutures => Box::new(binance::BinanceFuturesConnector::new()),
+            crate::xcommons::types::ExchangeId::BinanceFutures => {
+                Box::new(binance::BinanceFuturesConnector::new())
+            }
             crate::xcommons::types::ExchangeId::OkxSwap => {
                 let reg = okx_swap_registry.expect("OKX SWAP registry not initialized");
                 Box::new(okx::OkxConnector::new_swap(reg))

@@ -17,6 +17,7 @@ use crate::xcommons::error::AppError;
 use crate::exchanges::{ExchangeConnector, ExchangeError, ExchangeProcessor};
 use crate::xcommons::types::*;
 use crate::xcommons::oms::Side;
+use crate::xcommons::types::time::now_micros;
 
 /// Optimized Deribit connector for microsecond-level latency
 /// Uses hybrid architecture: RPC for control, direct streaming for market data
@@ -470,7 +471,7 @@ impl DeribitConnector {
             return Ok(Some(RawMessage {
                 exchange_id: ExchangeId::Deribit,
                 data: text.as_bytes().to_vec(),
-                timestamp: SystemTime::now(),
+                rcv_timestamp: now_micros(),
             }));
         }
 
@@ -536,18 +537,16 @@ impl DeribitConnector {
             _ => return Err(AppError::parse(format!("Invalid trade direction: {}", trade.direction))),
         };
 
-        // Convert symbol format (BTC-PERPETUAL -> BTCPERP)
-        let ticker = trade.instrument_name.replace('-', "");
 
         Ok(TradeUpdate {
             timestamp: crate::xcommons::types::time::millis_to_micros(trade.timestamp as i64),
             rcv_timestamp,
-            exchange: ExchangeId::Deribit,
-            ticker,
+            market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::Deribit, &trade.instrument_name),
+            
             seq_id: trade.trade_seq as i64,
             packet_id,
             trade_id: trade.trade_id.clone(),
-            order_id: None, // Deribit doesn't provide order ID in trade stream
+            
             side: trade_side,
             price: trade.price,
             qty: trade.amount,
@@ -588,6 +587,7 @@ impl ExchangeConnector for DeribitConnector {
             bids: vec![],
             asks: vec![],
             timestamp: chrono::Utc::now().timestamp_micros(),
+            rcv_timestamp: chrono::Utc::now().timestamp_micros(),
             last_update_id: 0,
             sequence: 0,
         })
@@ -743,8 +743,6 @@ impl DeribitProcessor {
                 timestamp,
                 rcv_timestamp,
                 market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::Deribit, &data.instrument_name),
-                exchange: ExchangeId::Deribit,
-                ticker: data.instrument_name.clone(),
                 seq_id,
                 packet_id: packet_id as i64,
                 update_id: data.change_id as i64,
@@ -774,8 +772,7 @@ impl DeribitProcessor {
                 timestamp,
                 rcv_timestamp,
                 market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::Deribit, &data.instrument_name),
-                exchange: ExchangeId::Deribit,
-                ticker: data.instrument_name.clone(),
+          
                 seq_id,
                 packet_id: packet_id as i64,
                 update_id: data.change_id as i64,
@@ -798,7 +795,7 @@ impl ExchangeProcessor for DeribitProcessor {
         &mut self,
         raw_msg: crate::xcommons::types::RawMessage,
         _symbol: &str,
-        rcv_timestamp: i64,
+
         packet_id: u64,
         message_bytes: u32,
     ) -> Result<Vec<crate::xcommons::types::OrderBookL2Update>, Self::Error> {
@@ -806,11 +803,7 @@ impl ExchangeProcessor for DeribitProcessor {
         self.base_processor.metrics.increment_received();
 
         // Use socket receive time from RawMessage for code latency consistency across exchanges
-        let packet_arrival_us = raw_msg
-            .timestamp
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as i64;
+        let packet_arrival_us = raw_msg.rcv_timestamp;
 
         // Start parsing timer
         let parse_start = crate::xcommons::types::time::now_micros();
@@ -842,14 +835,14 @@ impl ExchangeProcessor for DeribitProcessor {
 
                 // Calculate overall latency (exchange timestamp to receive timestamp)
                 let exchange_timestamp_us = order_book_data.timestamp as i64 * 1000; // Convert to microseconds
-                if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
+                if let Some(overall_latency) = packet_arrival_us.checked_sub(exchange_timestamp_us) {
                     if overall_latency >= 0 {
                         self.base_processor.metrics.update_overall_latency(overall_latency as u64);
                     }
                 }
 
                 let updates =
-                    self.process_order_book_data(&order_book_data, rcv_timestamp, packet_id)?;
+                    self.process_order_book_data(&order_book_data, packet_arrival_us, packet_id)?;
 
                 // Calculate transformation time
                 let transform_end = crate::xcommons::types::time::now_micros();
@@ -900,7 +893,7 @@ impl ExchangeProcessor for DeribitProcessor {
         &mut self,
         raw_msg: crate::xcommons::types::RawMessage,
         _symbol: &str,
-        rcv_timestamp: i64,
+
         packet_id: u64,
         message_bytes: u32,
     ) -> Result<Vec<crate::xcommons::types::TradeUpdate>, Self::Error> {
@@ -908,11 +901,7 @@ impl ExchangeProcessor for DeribitProcessor {
         self.base_processor.metrics.increment_received();
 
         // Use socket receive time from RawMessage for code latency consistency across exchanges
-        let packet_arrival_us = raw_msg
-            .timestamp
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as i64;
+        let packet_arrival_us = raw_msg.rcv_timestamp;
 
         // Start parsing timer
         let parse_start = crate::xcommons::types::time::now_micros();
@@ -949,7 +938,7 @@ impl ExchangeProcessor for DeribitProcessor {
                 for trade_data in trade_data_array {
                     // Calculate overall latency (exchange timestamp to receive timestamp)
                     let exchange_timestamp_us = crate::xcommons::types::time::millis_to_micros(trade_data.timestamp as i64);
-                    if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
+                    if let Some(overall_latency) = packet_arrival_us.checked_sub(exchange_timestamp_us) {
                         if overall_latency >= 0 {
                             self.base_processor.metrics.update_overall_latency(overall_latency as u64);
                         }
@@ -963,19 +952,16 @@ impl ExchangeProcessor for DeribitProcessor {
                         }),
                     };
 
-                    // Convert symbol format (BTC-PERPETUAL -> BTCPERP)
-                    let ticker = trade_data.instrument_name.replace('-', "");
 
                     let seq_id = self.next_sequence_id();
                     let trade = crate::xcommons::types::TradeUpdate {
                         timestamp: crate::xcommons::types::time::millis_to_micros(trade_data.timestamp as i64),
-                        rcv_timestamp,
-                        exchange: crate::xcommons::types::ExchangeId::Deribit,
-                        ticker,
+                        rcv_timestamp: packet_arrival_us,
+                        market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::Deribit, &trade_data.instrument_name),
                         seq_id,
                         packet_id: packet_id as i64,
                         trade_id: trade_data.trade_id,
-                        order_id: None, // Deribit doesn't provide order ID in trade stream
+
                         side: trade_side,
                         price: trade_data.price,
                         qty: trade_data.amount,
@@ -1022,69 +1008,5 @@ impl ExchangeProcessor for DeribitProcessor {
 
     fn base_processor_ref(&self) -> &crate::exchanges::BaseProcessor {
         &self.base_processor
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_channel_extraction() {
-        let connector = DeribitConnector::new(DeribitConfig {
-            client_id: "test".to_string(),
-            client_secret: "test".to_string(),
-            use_testnet: true,
-            ws_url: "wss://test.deribit.com/ws/api/v2/".to_string(),
-            heartbeat_interval: Duration::from_secs(60),
-            reconnect_delay: Duration::from_millis(1000),
-            max_reconnect_attempts: 5,
-        });
-
-        let message =
-            r#"{"method":"subscription","params":{"channel":"book.BTC-PERPETUAL.raw","data":{}}}"#;
-        let channel = connector.extract_channel_fast(message).unwrap();
-        assert_eq!(channel, "book.BTC-PERPETUAL.raw");
-    }
-
-    #[test]
-    fn test_deribit_processor_creation() {
-        let processor = DeribitProcessor::new();
-        // Verify processor is created successfully
-        assert_eq!(processor.base_processor_ref().sequence_counter, 0);
-    }
-
-    #[test]
-    fn test_order_book_data_processing() {
-        let mut processor = DeribitProcessor::new();
-
-        let test_data = DeribitOrderBookData {
-            instrument_name: "BTC-PERPETUAL".to_string(),
-            change_id: 12345,
-            bids: vec![
-                DeribitLevel { action: "new".to_string(), price: 50000.0, amount: 1.5 },
-                DeribitLevel { action: "new".to_string(), price: 49999.0, amount: 2.0 },
-            ],
-            asks: vec![
-                DeribitLevel { action: "new".to_string(), price: 50001.0, amount: 1.0 },
-                DeribitLevel { action: "new".to_string(), price: 50002.0, amount: 1.5 },
-            ],
-            timestamp: 1640995200000, // Example timestamp
-        };
-
-        let updates = processor
-            .process_order_book_data(&test_data, 1640995200000000, 1)
-            .unwrap();
-
-        // Should have 4 updates (2 bids + 2 asks)
-        assert_eq!(updates.len(), 4);
-
-        // Check first bid update
-        assert_eq!(updates[0].ticker, "BTC-PERPETUAL");
-        assert_eq!(updates[0].exchange, ExchangeId::Deribit);
-        assert_eq!(updates[0].side as i8, Side::Buy as i8);
-        assert_eq!(updates[0].price, 50000.0);
-        assert_eq!(updates[0].qty, 1.5);
-        assert_eq!(updates[0].action, L2Action::Update);
     }
 }

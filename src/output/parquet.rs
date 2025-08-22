@@ -127,13 +127,13 @@ impl ParquetSink {
         let exchange_array = StringArray::from(
             self.buffer
                 .iter()
-                .map(|u| u.exchange.to_string())
+                .map(|u| u.market_id.to_string())// TODO:!!!
                 .collect::<Vec<_>>(),
         );
         let ticker_array = StringArray::from(
             self.buffer
                 .iter()
-                .map(|u| u.ticker.clone())
+                .map(|u| u.market_id.to_string()) // TODO:!!!
                 .collect::<Vec<_>>(),
         );
         let seq_id_array =

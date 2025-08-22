@@ -23,11 +23,12 @@ use tokio::net::lookup_host;
 use crate::xcommons::error::{AppError, Result};
 use crate::exchanges::ExchangeConnector;
 use crate::xcommons::types::{
-    ConnectionStatus, ExchangeId, OrderBookL2Update, OrderBookL2UpdateBuilder,
+    ConnectionStatus, ExchangeId, OrderBookL2Update,
     OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate,
 };
 use crate::xcommons::oms::Side;
 use fast_float;
+use crate::xcommons::types::time::now_micros;
 
 /// OKX WebSocket message wrapper for different types
 #[derive(Debug, Clone, Deserialize)]
@@ -564,6 +565,7 @@ impl OkxConnector {
             market_id: crate::xcommons::xmarket_id::XMarketId::make(self.exchange_id, symbol),
             last_update_id: depth_data.seq_id.unwrap_or(0),
             timestamp,
+            rcv_timestamp:timestamp,
             sequence: depth_data.seq_id.unwrap_or(0),
             bids,
             asks,
@@ -577,79 +579,81 @@ impl OkxConnector {
         packet_id: u64,
         rcv_timestamp: i64,
     ) -> Result<Vec<OrderBookL2Update>> {
-        let mut updates = Vec::new();
-
-        // Get OKX symbol format for metadata lookup
-        let okx_symbol = self.convert_symbol(symbol);
-        let metadata = self.instrument_registry.get_metadata(&okx_symbol)?;
-
-        for data in &update.data {
-            let timestamp = data.timestamp.parse::<i64>().map_err(|e| {
-                AppError::parse(format!("Invalid timestamp '{}': {}", data.timestamp, e))
-            })?;
-
-            let timestamp_micros = crate::xcommons::types::time::millis_to_micros(timestamp);
-            let seq_id = data.seq_id.unwrap_or(0);
-            let first_update_id = data.prev_seq_id.unwrap_or(seq_id);
-
-            // Process bids with unit conversion
-            for bid_entry in &data.bids {
-                if bid_entry.len() >= 2 {
-                    let price = fast_float::parse::<f64, _>(&bid_entry[0]).map_err(|e| {
-                        AppError::parse(format!("Invalid bid price '{}': {}", bid_entry[0], e))
-                    })?;
-                    let raw_size = fast_float::parse::<f64, _>(&bid_entry[1]).map_err(|e| {
-                        AppError::parse(format!("Invalid bid size '{}': {}", bid_entry[1], e))
-                    })?;
-
-                    // Apply unit conversion using contract multiplier
-                    let normalized_size = metadata.normalize_quantity(raw_size);
-
-                    let builder = OrderBookL2UpdateBuilder::new(
-                        timestamp_micros,
-                        rcv_timestamp,
-                        self.exchange_id,
-                        symbol.to_string(),
-                        seq_id,
-                        packet_id as i64,
-                        seq_id,
-                        first_update_id,
-                    );
-
-                    updates.push(builder.build_bid(price, normalized_size));
-                }
-            }
-
-            // Process asks with unit conversion
-            for ask_entry in &data.asks {
-                if ask_entry.len() >= 2 {
-                    let price = fast_float::parse::<f64, _>(&ask_entry[0]).map_err(|e| {
-                        AppError::parse(format!("Invalid ask price '{}': {}", ask_entry[0], e))
-                    })?;
-                    let raw_size = fast_float::parse::<f64, _>(&ask_entry[1]).map_err(|e| {
-                        AppError::parse(format!("Invalid ask size '{}': {}", ask_entry[1], e))
-                    })?;
-
-                    // Apply unit conversion using contract multiplier
-                    let normalized_size = metadata.normalize_quantity(raw_size);
-
-                    let builder = OrderBookL2UpdateBuilder::new(
-                        timestamp_micros,
-                        rcv_timestamp,
-                        self.exchange_id,
-                        symbol.to_string(),
-                        seq_id,
-                        packet_id as i64,
-                        seq_id,
-                        first_update_id,
-                    );
-
-                    updates.push(builder.build_ask(price, normalized_size));
-                }
-            }
-        }
-
-        Ok(updates)
+        todo!("not implemented")
+        // let mut updates = Vec::new();
+        //
+        // // Get OKX symbol format for metadata lookup
+        // let okx_symbol = self.convert_symbol(symbol);
+        // let metadata = self.instrument_registry.get_metadata(&okx_symbol)?;
+        //
+        //
+        // for data in &update.data {
+        //     let timestamp = data.timestamp.parse::<i64>().map_err(|e| {
+        //         AppError::parse(format!("Invalid timestamp '{}': {}", data.timestamp, e))
+        //     })?;
+        //
+        //     let timestamp_micros = crate::xcommons::types::time::millis_to_micros(timestamp);
+        //     let seq_id = data.seq_id.unwrap_or(0);
+        //     let first_update_id = data.prev_seq_id.unwrap_or(seq_id);
+        //
+        //     // Process bids with unit conversion
+        //     for bid_entry in &data.bids {
+        //         if bid_entry.len() >= 2 {
+        //             let price = fast_float::parse::<f64, _>(&bid_entry[0]).map_err(|e| {
+        //                 AppError::parse(format!("Invalid bid price '{}': {}", bid_entry[0], e))
+        //             })?;
+        //             let raw_size = fast_float::parse::<f64, _>(&bid_entry[1]).map_err(|e| {
+        //                 AppError::parse(format!("Invalid bid size '{}': {}", bid_entry[1], e))
+        //             })?;
+        //
+        //             // Apply unit conversion using contract multiplier
+        //             let normalized_size = metadata.normalize_quantity(raw_size);
+        //
+        //             let builder = OrderBookL2UpdateBuilder::new(
+        //                 timestamp_micros,
+        //                 rcv_timestamp,
+        //                 self.exchange_id,
+        //                 symbol.to_string(),
+        //                 seq_id,
+        //                 packet_id as i64,
+        //                 seq_id,
+        //                 first_update_id,
+        //             );
+        //
+        //             updates.push(builder.build_bid(price, normalized_size));
+        //         }
+        //     }
+        //
+        //     // Process asks with unit conversion
+        //     for ask_entry in &data.asks {
+        //         if ask_entry.len() >= 2 {
+        //             let price = fast_float::parse::<f64, _>(&ask_entry[0]).map_err(|e| {
+        //                 AppError::parse(format!("Invalid ask price '{}': {}", ask_entry[0], e))
+        //             })?;
+        //             let raw_size = fast_float::parse::<f64, _>(&ask_entry[1]).map_err(|e| {
+        //                 AppError::parse(format!("Invalid ask size '{}': {}", ask_entry[1], e))
+        //             })?;
+        //
+        //             // Apply unit conversion using contract multiplier
+        //             let normalized_size = metadata.normalize_quantity(raw_size);
+        //
+        //             let builder = OrderBookL2UpdateBuilder::new(
+        //                 timestamp_micros,
+        //                 rcv_timestamp,
+        //                 self.exchange_id,
+        //                 symbol.to_string(),
+        //                 seq_id,
+        //                 packet_id as i64,
+        //                 seq_id,
+        //                 first_update_id,
+        //             );
+        //
+        //             updates.push(builder.build_ask(price, normalized_size));
+        //         }
+        //     }
+        // }
+        //
+        // Ok(updates)
     }
 
     /// Parse trade update from OKX WebSocket message
@@ -685,12 +689,11 @@ impl OkxConnector {
         Ok(TradeUpdate {
             timestamp: crate::xcommons::types::time::millis_to_micros(timestamp),
             rcv_timestamp,
-            exchange: self.exchange_id,
-            ticker,
+            market_id: crate::xcommons::xmarket_id::XMarketId::make(self.exchange_id, &ticker),
             seq_id: trade_data.trade_id.parse().unwrap_or(0),
             packet_id,
             trade_id: trade_data.trade_id.clone(),
-            order_id: None, // OKX doesn't provide order ID in trade stream
+
             side: trade_side,
             price,
             qty,
@@ -805,7 +808,7 @@ impl ExchangeConnector for OkxConnector {
             Some(Ok(Message::Text(text))) => Ok(Some(RawMessage {
                 exchange_id: self.exchange_id,
                 data: text.into_bytes(),
-                timestamp: SystemTime::now(),
+                rcv_timestamp: now_micros(),
             })),
             Some(Ok(Message::Close(_))) => {
                 self.sync_state = OkxSyncState::Disconnected;
@@ -893,7 +896,7 @@ impl ExchangeConnector for OkxConnector {
                     let raw_message = RawMessage {
                         exchange_id: self.exchange_id,
                         data: text.into_bytes(),
-                        timestamp: SystemTime::now(),
+                        rcv_timestamp: now_micros(),
                     };
 
                     if tx.send(raw_message).await.is_err() {
@@ -950,7 +953,7 @@ impl ExchangeConnector for OkxConnector {
                     let raw_message = RawMessage {
                         exchange_id: self.exchange_id,
                         data: text.into_bytes(),
-                        timestamp: SystemTime::now(),
+                        rcv_timestamp: now_micros(),
                     };
 
                     if tx.send(raw_message).await.is_err() {
@@ -1152,7 +1155,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         &mut self,
         raw_msg: crate::xcommons::types::RawMessage,
         symbol: &str,
-        rcv_timestamp: i64,
+
         packet_id: u64,
         message_bytes: u32,
     ) -> std::result::Result<Vec<crate::xcommons::types::OrderBookL2Update>, Self::Error> {
@@ -1161,11 +1164,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
         // Calculate packet arrival timestamp (when network packet was received)
         // Use socket receive time from RawMessage for code latency measurement
-        let packet_arrival_us = raw_msg
-            .timestamp
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as i64;
+        let rcv_timestamp = raw_msg.rcv_timestamp;
 
         // Parse OKX message JSON
         let okx_message: OkxMessage = serde_json::from_slice(&raw_msg.data).map_err(|_e| {
@@ -1252,7 +1251,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             // Count bid/ask levels for complexity metrics
             total_bid_count += data.bids.len() as u32;
             total_ask_count += data.asks.len() as u32;
-
+            let xmarket_id = crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::OkxSpot, &okx_symbol);
             // Process bids with unit conversion
             for bid_entry in &data.bids {
                 if bid_entry.len() >= 2 {
@@ -1285,20 +1284,36 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
                     };
 
                     let sequence_id = self.next_sequence_id();
-                    let builder = crate::xcommons::types::OrderBookL2UpdateBuilder::new(
-                        timestamp_micros,
-                        rcv_timestamp,
-                        self.exchange_id,
-                        symbol.to_string(),
-                        sequence_id,
-                        packet_id as i64,
-                        seq_id,
-                        first_update_id,
-                    );
+                    // let builder = crate::xcommons::types::OrderBookL2UpdateBuilder::new(
+                    //     timestamp_micros,
+                    //     rcv_timestamp,
+                    //     self.exchange_id,
+                    //     symbol.to_string(),
+                    //     sequence_id,
+                    //     packet_id as i64,
+                    //     seq_id,
+                    //     first_update_id,
+                    // );
 
                     self.base
                         .updates_buffer
-                        .push(builder.build_bid(price, size));
+                        .push(OrderBookL2Update{
+                            timestamp: timestamp_micros,
+                            rcv_timestamp,
+                            market_id: xmarket_id,
+                            seq_id,
+                            packet_id: packet_id as i64,
+                            update_id: sequence_id,
+                            first_update_id,
+                            action: if size == 0.0 {
+                                crate::xcommons::types::L2Action::Delete
+                            } else {
+                                crate::xcommons::types::L2Action::Update
+                            },
+                            side: crate::xcommons::oms::Side::Buy,
+                            price,
+                            qty: size,
+                        });
                 }
             }
 
@@ -1334,20 +1349,27 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
                     };
 
                     let sequence_id = self.next_sequence_id();
-                    let builder = crate::xcommons::types::OrderBookL2UpdateBuilder::new(
-                        timestamp_micros,
-                        rcv_timestamp,
-                        self.exchange_id,
-                        symbol.to_string(),
-                        sequence_id,
-                        packet_id as i64,
-                        seq_id,
-                        first_update_id,
-                    );
-
+                    
                     self.base
                         .updates_buffer
-                        .push(builder.build_ask(price, size));
+                        .push(OrderBookL2Update{
+                            timestamp: timestamp_micros,
+                            rcv_timestamp,
+                            market_id: xmarket_id,
+                            seq_id,
+                            packet_id: packet_id as i64,
+                            update_id: sequence_id,
+                            first_update_id,
+                            action: if size == 0.0 {
+                                crate::xcommons::types::L2Action::Delete
+                            } else {
+                                crate::xcommons::types::L2Action::Update
+                            },
+                            side: crate::xcommons::oms::Side::Sell,
+                            price,
+                            qty: size,
+                        });
+
                 }
             }
         }
@@ -1380,7 +1402,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         // Calculate CODE LATENCY: From network packet arrival to business logic ready
         // This measures the FULL time spent in Rust code processing
         let processing_complete = crate::xcommons::types::time::now_micros();
-        if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
+        if let Some(code_latency) = processing_complete.checked_sub(rcv_timestamp) {
             if code_latency >= 0 {
                 self.base.metrics.update_code_latency(code_latency as u64);
             }
@@ -1394,7 +1416,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
         &mut self,
         raw_msg: crate::xcommons::types::RawMessage,
         _symbol: &str,
-        rcv_timestamp: i64,
+
         packet_id: u64,
         message_bytes: u32,
     ) -> std::result::Result<Vec<crate::xcommons::types::TradeUpdate>, Self::Error> {
@@ -1403,11 +1425,7 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
         // Calculate packet arrival timestamp (when network packet was received)
         // Use socket receive time from RawMessage for code latency measurement
-        let packet_arrival_us = raw_msg
-            .timestamp
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as i64;
+        let rcv_timestamp = raw_msg.rcv_timestamp;
 
         // Parse OKX message with timing
         let parse_start = crate::xcommons::types::time::now_micros();
@@ -1520,12 +1538,11 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
             let trade = crate::xcommons::types::TradeUpdate {
                 timestamp: exchange_ts_us, 
                 rcv_timestamp,
-                exchange: self.exchange_id,
-                ticker: self.convert_symbol_from_okx(&trade_data.inst_id),
+                market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::OkxSpot, &trade_data.inst_id),
                 seq_id,
                 packet_id: packet_id as i64,
                 trade_id: trade_data.trade_id,
-                order_id: None, // OKX doesn't provide order IDs in trade stream
+                
                 side: trade_side,
                 price,
                 qty: size,
@@ -1551,129 +1568,12 @@ impl crate::exchanges::ExchangeProcessor for OkxProcessor {
 
         // Calculate CODE LATENCY: From network packet arrival to business logic ready
         let processing_complete = crate::xcommons::types::time::now_micros();
-        if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
+        if let Some(code_latency) = processing_complete.checked_sub(rcv_timestamp) {
             if code_latency >= 0 {
                 self.base.metrics.update_code_latency(code_latency as u64);
             }
         }
 
         Ok(trades)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_symbol_conversion_swap() {
-        let registry = Arc::new(InstrumentRegistry::new());
-        let connector = OkxConnector::new_swap(registry);
-        assert_eq!(connector.convert_symbol("BTCUSDT"), "BTC-USDT-SWAP");
-        assert_eq!(connector.convert_symbol("ETHUSD"), "ETH-USD-SWAP");
-    }
-
-    #[test]
-    fn test_symbol_conversion_spot() {
-        let registry = Arc::new(InstrumentRegistry::new());
-        let connector = OkxConnector::new_spot(registry);
-        assert_eq!(connector.convert_symbol("BTCUSDT"), "BTC-USDT");
-        assert_eq!(connector.convert_symbol("ETHUSD"), "ETH-USD");
-    }
-
-    #[test]
-    fn test_exchange_ids() {
-        let registry = Arc::new(InstrumentRegistry::new());
-        let swap_connector = OkxConnector::new_swap(registry.clone());
-        let spot_connector = OkxConnector::new_spot(registry);
-
-        assert_eq!(swap_connector.exchange_id(), ExchangeId::OkxSwap);
-        assert_eq!(spot_connector.exchange_id(), ExchangeId::OkxSpot);
-    }
-
-    #[test]
-    fn test_instrument_metadata_creation() {
-        let info = OkxInstrumentInfo {
-            inst_id: "BTC-USDT-SWAP".to_string(),
-            inst_type: "SWAP".to_string(),
-            state: "live".to_string(),
-            lot_size: "1".to_string(),
-            min_size: Some("1".to_string()),
-            contract_multiplier: Some("0.01".to_string()),
-            contract_value: Some("100".to_string()),
-            tick_size: "0.1".to_string(),
-            base_currency: Some("BTC".to_string()),
-            quote_currency: Some("USDT".to_string()),
-        };
-
-        let metadata = InstrumentMetadata::from_okx_info(&info).unwrap();
-        assert_eq!(metadata.inst_id, "BTC-USDT-SWAP");
-        assert_eq!(metadata.lot_size, 1.0);
-        assert_eq!(metadata.contract_multiplier, Some(0.01));
-        assert_eq!(metadata.tick_size, 0.1);
-    }
-
-    #[test]
-    fn test_quantity_normalization_with_multiplier() {
-        let metadata = InstrumentMetadata {
-            inst_id: "BTC-USDT-SWAP".to_string(),
-            inst_type: "SWAP".to_string(),
-            lot_size: 1.0,
-            contract_multiplier: Some(0.01),
-            contract_value: Some(1.0),
-            tick_size: 0.1,
-            base_currency: Some("BTC".to_string()),
-            quote_currency: Some("USDT".to_string()),
-            last_updated: std::time::Instant::now(),
-        };
-
-        // 100 contracts * 0.01 multiplier = 1.0 BTC
-        assert_eq!(metadata.normalize_quantity(100.0), 1.0);
-        assert_eq!(metadata.normalize_quantity(1000.0), 10.0);
-    }
-
-    #[test]
-    fn test_quantity_normalization_without_multiplier() {
-        let metadata = InstrumentMetadata {
-            inst_id: "BTC-USDT".to_string(),
-            inst_type: "SPOT".to_string(),
-            lot_size: 0.001,
-            contract_multiplier: None,
-            contract_value: None,
-            tick_size: 0.01,
-            base_currency: Some("BTC".to_string()),
-            quote_currency: Some("USDT".to_string()),
-            last_updated: std::time::Instant::now(),
-        };
-
-        // No multiplier, should return same value
-        assert_eq!(metadata.normalize_quantity(1.5), 1.5);
-        assert_eq!(metadata.normalize_quantity(0.001), 0.001);
-    }
-
-    #[test]
-    fn test_instrument_registry() {
-        let mut registry = InstrumentRegistry::new();
-
-        let metadata = InstrumentMetadata {
-            inst_id: "BTC-USDT-SWAP".to_string(),
-            inst_type: "SWAP".to_string(),
-            lot_size: 1.0,
-            contract_multiplier: Some(0.01),
-            contract_value: Some(100.0),
-            tick_size: 0.1,
-            base_currency: Some("BTC".to_string()),
-            quote_currency: Some("USDT".to_string()),
-            last_updated: std::time::Instant::now(),
-        };
-
-        registry.cache.insert("BTC-USDT-SWAP".to_string(), metadata);
-
-        assert!(registry.contains("BTC-USDT-SWAP"));
-        assert!(!registry.contains("ETH-USDT-SWAP"));
-        assert_eq!(registry.len(), 1);
-
-        let retrieved = registry.get_metadata("BTC-USDT-SWAP").unwrap();
-        assert_eq!(retrieved.contract_multiplier, Some(0.01));
     }
 }

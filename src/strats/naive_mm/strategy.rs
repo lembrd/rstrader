@@ -1,541 +1,890 @@
 use async_trait::async_trait;
 
 use crate::app::env::BinanceAccountParams;
-use crate::xcommons::types::SubscriptionSpec;
-use crate::strats::api::{Strategy, StrategyContext, StrategyRegistrar, SubscriptionId, StrategyIo};
+use crate::strats::api::{
+    Strategy, StrategyContext, StrategyIo, StrategyRegistrar, SubscriptionId,
+};
 use crate::xcommons::error::Result as AppResult;
-use crate::xcommons::types::{OrderBookL2Update, TradeUpdate, OrderBookSnapshot};
-use crate::xcommons::oms::{XExecution, Side, OrderMode, TimeInForce, PostRequest, CancelRequest, CancelAllRequest};
 use crate::xcommons::oms::OrderRequest;
+use crate::xcommons::oms::{
+    CancelAllRequest, CancelRequest, OrderMode, PostRequest, Side, TimeInForce, XExecution,
+};
 use crate::xcommons::position::Position;
+use crate::xcommons::types::SubscriptionSpec;
+use crate::xcommons::types::{OrderBookL2Update, OrderBookSnapshot, TradeUpdate};
 use crate::xcommons::xmarket_id::XMarketId;
 
-use super::config::{NaiveMmConfig, HyperParams};
+use super::config::{HyperParams, NaiveMmConfig};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LiveOrderStatus { PendingNew, Live, PendingCancel }
+enum LiveOrderStatus {
+    PendingNew,
+    Live,
+    PendingCancel,
+}
 
 #[derive(Clone, Copy)]
-struct LiveOrder { status: LiveOrderStatus, cl_ord_id: i64, price: f64 }
+struct LiveOrder {
+    status: LiveOrderStatus,
+    cl_ord_id: i64,
+    price: f64,
+}
 
 pub struct NaiveMm {
-	// trading params
-	lot_size: f64,
-	max_position: f64,
-	spread_bps: f64,
-	displace_bps: f64,
-	binance_account_id: Option<i64>,
-	// single market context
-	market_id: Option<i64>,
-	symbol: Option<String>,
-	ready: bool,
-	position: Position,
-	// last obs/print
-	obs_last_print_us: i64,
-	last_obs_ts_us: i64,
-	// decision input
-	fair_px: f64,
-	last_mid: Option<f64>,
-	last_mid_price: f64,
-	// live bid/ask orders
-	bid_order: Option<LiveOrder>,
-	ask_order: Option<LiveOrder>,
-	// pending cancel flags
-	pending_cancel_bid: bool,
-	pending_cancel_ask: bool,
-	// request timestamps for metrics
-	last_post_req_ts_us_bid: Option<i64>,
-	last_post_req_ts_us_ask: Option<i64>,
-	last_cancel_req_ts_us_bid: Option<i64>,
-	last_cancel_req_ts_us_ask: Option<i64>,
-	// one-time cancel-all init
-	did_init: bool,
-	// extra fill spread;
-	extra_fill_spread_bps: f64,
-	// hyper params from config
-	hyper_params: HyperParams,
+    // trading params
+    lot_size: f64,
+    max_position: f64,
+    spread_bps: f64,
+    displace_bps: f64,
+    binance_account_id: Option<i64>,
+    // single market context
+    market_id: Option<i64>,
+    symbol: Option<String>,
+    ready: bool,
+    position: Position,
+    // last obs/print
+    obs_last_print_us: i64,
+    last_obs_ts_us: i64,
+    // decision input
+    fair_px: f64,
+    last_mid: Option<f64>,
+    last_mid_price: f64,
+    // live bid/ask orders
+    bid_order: Option<LiveOrder>,
+    ask_order: Option<LiveOrder>,
+    // pending cancel flags
+    pending_cancel_bid: bool,
+    pending_cancel_ask: bool,
+    // request timestamps for metrics
+    last_post_req_ts_us_bid: Option<i64>,
+    last_post_req_ts_us_ask: Option<i64>,
+    last_cancel_req_ts_us_bid: Option<i64>,
+    last_cancel_req_ts_us_ask: Option<i64>,
+    // one-time cancel-all init
+    did_init: bool,
+    // extra fill spread;
+    extra_fill_spread_bps: f64,
+    // hyper params from config
+    hyper_params: HyperParams,
+    events_counter: i64,
+    updates_counter: i64,
 }
 
 impl Default for NaiveMm {
-	fn default() -> Self {
-		Self {
-			lot_size: 0.005,
-			max_position: 0.015,
-			spread_bps: 1.5,
-			displace_bps: 1.0,
-			binance_account_id: None,
-			market_id: None,
-			symbol: None,
-			ready: false,
-			position: Position::new(0.0, 1.0),
-			obs_last_print_us: 0,
-			last_obs_ts_us: 0,
-			fair_px: 0.0,
-			last_mid: None,
-			last_mid_price: 0.0,
-			bid_order: None,
-			ask_order: None,
-			pending_cancel_bid: false,
-			pending_cancel_ask: false,
-			last_post_req_ts_us_bid: None,
-			last_post_req_ts_us_ask: None,
-			last_cancel_req_ts_us_bid: None,
-			last_cancel_req_ts_us_ask: None,
-			did_init: false,
-			extra_fill_spread_bps: 0.0,
-			hyper_params: HyperParams::default(),
-		}
-	}
+    fn default() -> Self {
+        Self {
+            lot_size: 0.005,
+            max_position: 0.015,
+            spread_bps: 1.5,
+            displace_bps: 1.0,
+            binance_account_id: None,
+            market_id: None,
+            symbol: None,
+            ready: false,
+            position: Position::new(0.0, 1.0),
+            obs_last_print_us: 0,
+            last_obs_ts_us: 0,
+            fair_px: 0.0,
+            last_mid: None,
+            last_mid_price: 0.0,
+            bid_order: None,
+            ask_order: None,
+            pending_cancel_bid: false,
+            pending_cancel_ask: false,
+            last_post_req_ts_us_bid: None,
+            last_post_req_ts_us_ask: None,
+            last_cancel_req_ts_us_bid: None,
+            last_cancel_req_ts_us_ask: None,
+            did_init: false,
+            extra_fill_spread_bps: 0.0,
+            hyper_params: HyperParams::default(),
+            events_counter: 0,
+            updates_counter: 0,
+        }
+    }
 }
 
 #[async_trait]
 impl Strategy for NaiveMm {
-	type Config = NaiveMmConfig;
-	
-	fn name(&self) -> &'static str { "naive_mm" }
+    type Config = NaiveMmConfig;
 
-	async fn configure(&mut self, reg: &mut StrategyRegistrar, _ctx: &StrategyContext, cfg: &Self::Config) -> AppResult<()> {
-		// Propagate strategy_id to environment so account runners tag TradeLog rows
-		std::env::set_var("STRATEGY_ID", cfg.strategy_id.to_string());
+    fn name(&self) -> &'static str {
+        "naive_mm"
+    }
+
+    async fn configure(
+        &mut self,
+        reg: &mut StrategyRegistrar,
+        _ctx: &StrategyContext,
+        cfg: &Self::Config,
+    ) -> AppResult<()> {
+        // Propagate strategy_id to environment so account runners tag TradeLog rows
+        std::env::set_var("STRATEGY_ID", cfg.strategy_id.to_string());
         // StrategyStart is handled globally in StrategyRunner
-		for s in cfg.subscriptions.iter() {
-			let max_connections = if s.arb_streams_num > 1 { Some(s.arb_streams_num) } else { None };
-			let spec = SubscriptionSpec { stream_type: s.stream_type.clone(), exchange: s.exchange.clone(), instrument: s.instrument.clone(), max_connections };
-			match spec.stream_type {
-				crate::xcommons::types::StreamType::L2 => { let _ = reg.subscribe_l2(spec); }
-				crate::xcommons::types::StreamType::Trade => { let _ = reg.subscribe_trades(spec); }
-				crate::xcommons::types::StreamType::Obs => { let _ = reg.subscribe_obs(spec.clone()); }
-			}
-		}
+        for s in cfg.subscriptions.iter() {
+            let market_id = XMarketId::make(s.exchange, &*s.instrument);
 
-		// Initialize symbol and market_id from config (first symbol)
-		if let Some(sym) = cfg.binance.symbols.get(0).cloned() {
-			let mid = XMarketId::make(crate::xcommons::types::ExchangeId::BinanceFutures, &sym);
-			self.symbol = Some(sym);
-			self.market_id = Some(mid);
-		}
+            let max_connections = if s.arb_streams_num > 1 {
+                Some(s.arb_streams_num)
+            } else {
+                None
+            };
+            let spec = SubscriptionSpec {
+                stream_type: s.stream_type.clone(),
+                exchange: s.exchange.clone(),
+                instrument: s.instrument.clone(),
+                max_connections,
+                market_id,
+            };
+            match spec.stream_type {
+                crate::xcommons::types::StreamType::L2 => {
+                    let _ = reg.subscribe_l2(spec);
+                }
+                crate::xcommons::types::StreamType::Trade => {
+                    let _ = reg.subscribe_trades(spec);
+                }
+                crate::xcommons::types::StreamType::Obs => {
+                    let _ = reg.subscribe_obs(spec.clone());
+                }
+            }
+        }
 
-		reg.subscribe_binance_futures_accounts(BinanceAccountParams {
-			api_key: cfg.binance.api_key.clone(),
-			secret: cfg.binance.secret.clone(),
-			ed25519_key: cfg.binance.ed25519_key.clone(),
-			ed25519_secret: cfg.binance.ed25519_secret.clone(),
-			account_id: cfg.binance.account_id,
-			start_epoch_ts: cfg.binance.start_epoch_ts,
-			fee_bps: cfg.binance.fee_bps,
-			contract_size: cfg.binance.contract_size,
-			symbols: cfg.binance.symbols.clone(),
-			recovery_mode: cfg.binance.recovery_mode.clone(),
-		});
-		self.lot_size = cfg.lot_size;
-		self.max_position = cfg.max_position;
-		self.spread_bps = cfg.spread_bps;
-		self.extra_fill_spread_bps = self.spread_bps * 2.0;
-		self.displace_bps = cfg.displace_th_bps;
-		self.hyper_params = cfg.hyper_params.clone();
-		self.binance_account_id = Some(cfg.binance.account_id);
-		Ok(())
-	}
+        // Initialize symbol and market_id from config (first symbol)
+        if let Some(sym) = cfg.binance.symbols.get(0).cloned() {
+            let mid = XMarketId::make(crate::xcommons::types::ExchangeId::BinanceFutures, &sym);
+            self.symbol = Some(sym);
+            self.market_id = Some(mid);
+        }
 
-	fn on_l2(&mut self, _sub: SubscriptionId, msg: OrderBookL2Update, io: &mut StrategyIo) {
-		self.fair_px = msg.price;
-		io.schedule_update();
-	}
+        reg.subscribe_binance_futures_accounts(BinanceAccountParams {
+            api_key: cfg.binance.api_key.clone(),
+            secret: cfg.binance.secret.clone(),
+            ed25519_key: cfg.binance.ed25519_key.clone(),
+            ed25519_secret: cfg.binance.ed25519_secret.clone(),
+            account_id: cfg.binance.account_id,
+            start_epoch_ts: cfg.binance.start_epoch_ts,
+            fee_bps: cfg.binance.fee_bps,
+            contract_size: cfg.binance.contract_size,
+            symbols: cfg.binance.symbols.clone(),
+            recovery_mode: cfg.binance.recovery_mode.clone(),
+        });
+        self.lot_size = cfg.lot_size;
+        self.max_position = cfg.max_position;
+        self.spread_bps = cfg.spread_bps;
+        self.extra_fill_spread_bps = self.spread_bps * 2.0;
+        self.displace_bps = cfg.displace_th_bps;
+        self.hyper_params = cfg.hyper_params.clone();
+        self.binance_account_id = Some(cfg.binance.account_id);
+        Ok(())
+    }
 
-	fn on_obs(&mut self, _sub: SubscriptionId, snapshot: OrderBookSnapshot, io: &mut StrategyIo) {
-		const PRINT_INTERVAL_US: i64 = 5_000_000; // 5 seconds
-		let now_us = crate::xcommons::types::time::now_micros();
-		let should_print = now_us - self.obs_last_print_us >= PRINT_INTERVAL_US;
-		if should_print { self.obs_last_print_us = now_us; }
+    fn on_l2(&mut self, msg: OrderBookL2Update, io: &mut StrategyIo) {
+        // self.fair_px = msg.price;
+        self.events_counter += 1;
+        io.schedule_update();
+    }
 
-		let market_id = self.market_id.unwrap_or_default();
-		// self.market_id = Some(market_id);
-		self.last_obs_ts_us = snapshot.timestamp;
-		let is_ready = self.ready;
+    fn on_obs(&mut self, snapshot: OrderBookSnapshot, io: &mut StrategyIo) {
+        self.events_counter += 1;
 
-		if is_ready && !self.did_init {
-			if let Some(tx) = io.order_txs.get(&market_id) {
-				if let Some(account_id) = self.binance_account_id {
-					let req = CancelAllRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), market_id, account_id };
-					if let Err(e) = tx.try_send(OrderRequest::CancelAll(req)) {
-						log::warn!("[naive_mm] mailbox overflow dropping CancelAll request: {}", e);
-					}
-					self.did_init = true;
-				}
-			}
-		}
+        const PRINT_INTERVAL_US: i64 = 5_000_000; // 5 seconds
+        let now_us = crate::xcommons::types::time::now_micros();
+        let should_print = now_us - self.obs_last_print_us >= PRINT_INTERVAL_US;
+        if should_print {
+            self.obs_last_print_us = now_us;
+        }
 
-		let best_bid_opt = snapshot.bids.iter().max_by(|a,b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
-		let best_ask_opt = snapshot.asks.iter().min_by(|a,b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
-		let (best_bid, best_ask) = match (best_bid_opt, best_ask_opt) { (Some(b), Some(a)) => (b, a), _ => return };
-		// let mid_price = (best_bid.price * best_ask.qty + best_ask.price * best_bid.qty) / (best_bid.qty + best_ask.qty);
-		let mid_price = (best_bid.price + best_ask.price ) / 2.0;
-		self.last_mid = Some(mid_price);
-		self.fair_px = mid_price;
-		if should_print {
-			let bid_state = match self.bid_order {
-				Some(lo) => {
-					let st = match lo.status { LiveOrderStatus::PendingNew => "PendingNew", LiveOrderStatus::Live => "Live", LiveOrderStatus::PendingCancel => "PendingCancel" };
-					format!("{}@{:.2}/{}", st, lo.price, lo.cl_ord_id)
-				}
-				None => "None".to_string(),
-			};
-			let ask_state = match self.ask_order {
-				Some(lo) => {
-					let st = match lo.status { LiveOrderStatus::PendingNew => "PendingNew", LiveOrderStatus::Live => "Live", LiveOrderStatus::PendingCancel => "PendingCancel" };
-					format!("{}@{:.2}/{}", st, lo.price, lo.cl_ord_id)
-				}
-				None => "None".to_string(),
-			};
-			log::info!(
-				"[naive_mm] on_obs: mid={} market_id={} ready={} bid={} ask={} pos={} pnl={} extra_fill_spread_bps={}",
+        let market_id = self.market_id.unwrap_or_default();
+        // self.market_id = Some(market_id);
+        self.last_obs_ts_us = snapshot.timestamp;
+        let is_ready = self.ready;
+
+        if is_ready && !self.did_init {
+            if let Some(tx) = io.order_txs.get(&market_id) {
+                if let Some(account_id) = self.binance_account_id {
+                    let req = CancelAllRequest {
+                        req_id: crate::xcommons::monoseq::next_id(),
+                        timestamp: crate::xcommons::types::time::now_micros(),
+                        market_id,
+                        account_id,
+                    };
+                    if let Err(e) = tx.try_send(OrderRequest::CancelAll(req)) {
+                        log::warn!("mailbox overflow dropping CancelAll request: {}", e);
+                    }
+                    self.did_init = true;
+                }
+            }
+        }
+
+        let best_bid_opt = snapshot.bids.iter().max_by(|a, b| {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let best_ask_opt = snapshot.asks.iter().min_by(|a, b| {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let (best_bid, best_ask) = match (best_bid_opt, best_ask_opt) {
+            (Some(b), Some(a)) => (b, a),
+            _ => return,
+        };
+        // let mid_price = (best_bid.price * best_ask.qty + best_ask.price * best_bid.qty) / (best_bid.qty + best_ask.qty);
+        let mid_price = (best_bid.price + best_ask.price) / 2.0;
+        self.last_mid = Some(mid_price);
+        self.fair_px = mid_price;
+        if should_print {
+            let bid_state = match self.bid_order {
+                Some(lo) => {
+                    let st = match lo.status {
+                        LiveOrderStatus::PendingNew => "PendingNew",
+                        LiveOrderStatus::Live => "Live",
+                        LiveOrderStatus::PendingCancel => "PendingCancel",
+                    };
+                    format!("{}@{:.2}/{}", st, lo.price, lo.cl_ord_id)
+                }
+                None => "None".to_string(),
+            };
+            let ask_state = match self.ask_order {
+                Some(lo) => {
+                    let st = match lo.status {
+                        LiveOrderStatus::PendingNew => "PendingNew",
+                        LiveOrderStatus::Live => "Live",
+                        LiveOrderStatus::PendingCancel => "PendingCancel",
+                    };
+                    format!("{}@{:.2}/{}", st, lo.price, lo.cl_ord_id)
+                }
+                None => "None".to_string(),
+            };
+            log::info!(
+				"on_obs: mid={} bid={} ask={} pos={:.3} pnl={:.3} extra_fill_spread_bps={:.3} events_counter={} updates_counter={}",
 				mid_price,
-				market_id,
-				self.ready,
 				bid_state,
 				ask_state,
 				self.position.amount,
 				self.position.current_pnl(mid_price),
-				self.extra_fill_spread_bps
+				self.extra_fill_spread_bps,
+				self.events_counter,
+				self.updates_counter
 			);
-		}
-		io.schedule_update();
 
-		if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
-			let pos = self.position.clone();
-			let pnl = pos.current_pnl(mid_price);
-			let bps = pos.bps();
-			if let Some(symbol) = self.symbol.as_ref() {
-				prom.set_strategy_metrics(self.name(), symbol, pnl, pos.amount, bps);
-				prom.set_strategy_mid_price(self.name(), symbol, mid_price);
-			}
-		}
+            self.events_counter = 0;
+            self.updates_counter = 0;
+        }
 
-		if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
-			let symbol = self.symbol.as_deref().unwrap_or("UNKNOWN");
-			if let Ok(g) = crate::metrics::GLOBAL_METRICS.lock() {
-				let h = &g.latency_histograms;
-				prom.set_strategy_latency_quantiles(self.name(), symbol, None, None, None, None, Some(h.code_us.value_at_quantile(0.50)), Some(h.code_us.value_at_quantile(0.99)), None, None);
-			}
-		}
-	}
+        io.schedule_update();
+    }
 
-	fn on_trade(&mut self, _sub: SubscriptionId, _msg: TradeUpdate, _io: &mut StrategyIo) {}
+    fn on_trade(&mut self, _msg: TradeUpdate, _io: &mut StrategyIo) {}
 
-	fn on_execution(&mut self, _account_id: i64, exec: XExecution, io: &mut StrategyIo) {
-		// log::info!("[naive_mm] exec account_id={} market_id={} side={} qty={} px={} id={}", _account_id, exec.market_id, exec.side as i8, exec.last_qty, exec.last_px, exec.native_execution_id);
-		if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
-			let strategy = self.name();
-			let tick_ts = self.last_obs_ts_us;
-			let base_ts = if tick_ts <= exec.timestamp { tick_ts } else { exec.timestamp };
-			let ttt = (exec.rcv_timestamp - base_ts).max(0) as u64;
-			if let Ok(mut g) = crate::metrics::GLOBAL_METRICS.lock() {
-				let h = &mut g.latency_histograms;
-				if exec.exec_type == crate::xcommons::oms::ExecutionType::XOrderCanceled { h.record_tick_to_cancel(ttt); } else { h.record_tick_to_trade(ttt); }
-			}
-			if let Ok(g) = crate::metrics::GLOBAL_METRICS.lock() {
-				if let Some(symbol) = self.symbol.as_ref() {
-					let h = &g.latency_histograms;
-					prom.set_strategy_latency_quantiles(strategy, symbol, Some(h.tick_to_trade_us.value_at_quantile(0.50)), Some(h.tick_to_trade_us.value_at_quantile(0.99)), Some(h.tick_to_cancel_us.value_at_quantile(0.50)), Some(h.tick_to_cancel_us.value_at_quantile(0.99)), Some(h.code_us.value_at_quantile(0.50)), Some(h.code_us.value_at_quantile(0.99)), None, None);
-				} else {
-					log::debug!("[naive_mm] skip latency metrics on_execution: symbol unknown yet");
-				}
-			}
-		}
-		if exec.cl_ord_id != -1 {
-			if exec.exec_type == crate::xcommons::oms::ExecutionType::XTrade {
-				self.extra_fill_spread_bps += self.spread_bps * self.hyper_params.extra_fill_spread_bps_increase_on_trade;
-			}
+    fn on_execution(&mut self, exec: XExecution, io: &mut StrategyIo) {
+        // log::info!("[naive_mm] exec account_id={} market_id={} side={} qty={} px={} id={}", _account_id, exec.market_id, exec.side as i8, exec.last_qty, exec.last_px, exec.native_execution_id);
+        if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+            let strategy = self.name();
+            let tick_ts = self.last_obs_ts_us;
+            let base_ts = if tick_ts <= exec.timestamp {
+                tick_ts
+            } else {
+                exec.timestamp
+            };
+            let ttt = (exec.rcv_timestamp - base_ts).max(0) as u64;
+            if let Ok(mut g) = crate::metrics::GLOBAL_METRICS.lock() {
+                let h = &mut g.latency_histograms;
+                if exec.exec_type == crate::xcommons::oms::ExecutionType::XOrderCanceled {
+                    h.record_tick_to_cancel(ttt);
+                } else {
+                    h.record_tick_to_trade(ttt);
+                }
+            }
+            if let Ok(g) = crate::metrics::GLOBAL_METRICS.lock() {
+                if let Some(symbol) = self.symbol.as_ref() {
+                    let h = &g.latency_histograms;
+                    prom.set_strategy_latency_quantiles(
+                        strategy,
+                        symbol,
+                        Some(h.tick_to_trade_us.value_at_quantile(0.50)),
+                        Some(h.tick_to_trade_us.value_at_quantile(0.99)),
+                        Some(h.tick_to_cancel_us.value_at_quantile(0.50)),
+                        Some(h.tick_to_cancel_us.value_at_quantile(0.99)),
+                        Some(h.code_us.value_at_quantile(0.50)),
+                        Some(h.code_us.value_at_quantile(0.99)),
+                        None,
+                        None,
+                    );
+                } else {
+                    log::debug!("skip latency metrics on_execution: symbol unknown yet");
+                }
+            }
+        }
+        if exec.cl_ord_id != -1 {
+            if exec.exec_type == crate::xcommons::oms::ExecutionType::XTrade {
+                self.extra_fill_spread_bps +=
+                    self.spread_bps * self.hyper_params.extra_fill_spread_bps_increase_on_trade;
+            }
 
-			if self.bid_order.map(|lo| lo.cl_ord_id == exec.cl_ord_id).unwrap_or(false) {
-				match exec.exec_type {
-					crate::xcommons::oms::ExecutionType::XOrderCanceled => { self.bid_order = None; self.pending_cancel_bid = false; }
-					crate::xcommons::oms::ExecutionType::XOrderNew | crate::xcommons::oms::ExecutionType::XOrderReplaced => {
-						if let Some(ref mut lo) = self.bid_order { lo.status = LiveOrderStatus::Live; }
-					}
-					_ => {
-						if exec.ord_status.is_alive() {
-							if let Some(ref mut lo) = self.bid_order { lo.status = LiveOrderStatus::Live; }
-						} else {
-							self.bid_order = None; self.pending_cancel_bid = false;
-						}
-					}
-				}
-			}
-			if self.ask_order.map(|lo| lo.cl_ord_id == exec.cl_ord_id).unwrap_or(false) {
-				match exec.exec_type {
-					crate::xcommons::oms::ExecutionType::XOrderCanceled => { self.ask_order = None; self.pending_cancel_ask = false; }
-					crate::xcommons::oms::ExecutionType::XOrderNew | crate::xcommons::oms::ExecutionType::XOrderReplaced => {
-						if let Some(ref mut lo) = self.ask_order { lo.status = LiveOrderStatus::Live; }
-					}
-					_ => {
-						if exec.ord_status.is_alive() {
-							if let Some(ref mut lo) = self.ask_order { lo.status = LiveOrderStatus::Live; }
-						} else {
-							self.ask_order = None; self.pending_cancel_ask = false;
-						}
-					}
-				}
-			}
-		}
-		io.schedule_update();
-	}
+            if self
+                .bid_order
+                .map(|lo| lo.cl_ord_id == exec.cl_ord_id)
+                .unwrap_or(false)
+            {
+                match exec.exec_type {
+                    crate::xcommons::oms::ExecutionType::XOrderCanceled => {
+                        self.bid_order = None;
+                        self.pending_cancel_bid = false;
+                    }
+                    crate::xcommons::oms::ExecutionType::XOrderNew
+                    | crate::xcommons::oms::ExecutionType::XOrderReplaced => {
+                        if let Some(ref mut lo) = self.bid_order {
+                            lo.status = LiveOrderStatus::Live;
+                        }
+                    }
+                    _ => {
+                        if exec.ord_status.is_alive() {
+                            if let Some(ref mut lo) = self.bid_order {
+                                lo.status = LiveOrderStatus::Live;
+                            }
+                        } else {
+                            self.bid_order = None;
+                            self.pending_cancel_bid = false;
+                        }
+                    }
+                }
+            }
+            if self
+                .ask_order
+                .map(|lo| lo.cl_ord_id == exec.cl_ord_id)
+                .unwrap_or(false)
+            {
+                match exec.exec_type {
+                    crate::xcommons::oms::ExecutionType::XOrderCanceled => {
+                        self.ask_order = None;
+                        self.pending_cancel_ask = false;
+                    }
+                    crate::xcommons::oms::ExecutionType::XOrderNew
+                    | crate::xcommons::oms::ExecutionType::XOrderReplaced => {
+                        if let Some(ref mut lo) = self.ask_order {
+                            lo.status = LiveOrderStatus::Live;
+                        }
+                    }
+                    _ => {
+                        if exec.ord_status.is_alive() {
+                            if let Some(ref mut lo) = self.ask_order {
+                                lo.status = LiveOrderStatus::Live;
+                            }
+                        } else {
+                            self.ask_order = None;
+                            self.pending_cancel_ask = false;
+                        }
+                    }
+                }
+            }
+        }
+        self.events_counter += 1;
+        io.schedule_update();
+    }
 
-	fn on_order_response(&mut self, resp: crate::xcommons::oms::OrderResponse, io: &mut StrategyIo) {
-		if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
-			let strategy = self.name();
-			let symbol = self.symbol.clone().unwrap_or_else(|| "UNKNOWN".to_string());
-			let post_net = if let Some(cl) = resp.cl_ord_id {
-				if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) { self.last_post_req_ts_us_bid.map(|sent| (resp.rcv_timestamp - sent).max(0) as u64) }
-				else if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) { self.last_post_req_ts_us_ask.map(|sent| (resp.rcv_timestamp - sent).max(0) as u64) }
-				else { None }
-			} else { None };
-			let cancel_net = if let Some(cl) = resp.cl_ord_id {
-				if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) { self.last_cancel_req_ts_us_bid.map(|sent| (resp.rcv_timestamp - sent).max(0) as u64) }
-				else if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) { self.last_cancel_req_ts_us_ask.map(|sent| (resp.rcv_timestamp - sent).max(0) as u64) }
-				else { None }
-			} else { None };
-			if let Ok(mut g) = crate::metrics::GLOBAL_METRICS.lock() {
-				let h = &mut g.latency_histograms;
-				if let Some(nu) = post_net { h.record_post_network_latency(nu); }
-				if let Some(nu) = cancel_net { h.record_cancel_network_latency(nu); }
-			}
-			if let Ok(g2) = crate::metrics::GLOBAL_METRICS.lock() {
-				let h2 = &g2.latency_histograms;
-				prom.set_strategy_post_cancel_latencies(strategy, &symbol, Some(h2.post_network_us.value_at_quantile(0.50)), Some(h2.post_network_us.value_at_quantile(0.99)), Some(h2.cancel_network_us.value_at_quantile(0.50)), Some(h2.cancel_network_us.value_at_quantile(0.99)));
-			}
-			if resp.status == crate::xcommons::oms::OrderResponseStatus::Ok {
-				if let Some(cl) = resp.cl_ord_id {
-					// If we were canceling this order, clear it; otherwise treat as Post ACK and mark Live
-					if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
-						if self.pending_cancel_bid { self.pending_cancel_bid = false; self.bid_order = None; }
-						else if let Some(ref mut lo) = self.bid_order { lo.status = LiveOrderStatus::Live; }
-					}
-					if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
-						if self.pending_cancel_ask { self.pending_cancel_ask = false; self.ask_order = None; }
-						else if let Some(ref mut lo) = self.ask_order { lo.status = LiveOrderStatus::Live; }
-					}
-				}
-			}
-			if resp.status == crate::xcommons::oms::OrderResponseStatus::FailedPostOnly {
-				if let Some(cl) = resp.cl_ord_id {
-					if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) { self.bid_order = None; self.last_post_req_ts_us_bid = None; }
-					if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) { self.ask_order = None; self.last_post_req_ts_us_ask = None; }
-				}
-			}
-			// If the API reports order not found on a cancel request, clear the slot (race: fill before cancel ACK)
-			if resp.status == crate::xcommons::oms::OrderResponseStatus::FailedOrderNotFound {
-				if let Some(cl) = resp.cl_ord_id {
-					if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) { self.pending_cancel_bid = false; self.bid_order = None; }
-					if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) { self.pending_cancel_ask = false; self.ask_order = None; }
-				}
-			}
-			// Generic failure handling: clear pending-new posts; release pending-cancel flags to avoid stalls
-			if resp.status == crate::xcommons::oms::OrderResponseStatus::Failed400
-				|| resp.status == crate::xcommons::oms::OrderResponseStatus::Failed500
-				|| resp.status == crate::xcommons::oms::OrderResponseStatus::FailedRateLimit
-			{
-				if let Some(cl) = resp.cl_ord_id {
-					// BUY side
-					if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
-						match self.bid_order.as_ref().map(|o| o.status) {
-							Some(LiveOrderStatus::PendingNew) => { self.bid_order = None; self.last_post_req_ts_us_bid = None; },
-							Some(LiveOrderStatus::PendingCancel) => { self.pending_cancel_bid = false; if let Some(ref mut lo) = self.bid_order { lo.status = LiveOrderStatus::Live; } },
-							_ => {}
-						}
-					}
-					// SELL side
-					if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
-						match self.ask_order.as_ref().map(|o| o.status) {
-							Some(LiveOrderStatus::PendingNew) => { self.ask_order = None; self.last_post_req_ts_us_ask = None; },
-							Some(LiveOrderStatus::PendingCancel) => { self.pending_cancel_ask = false; if let Some(ref mut lo) = self.ask_order { lo.status = LiveOrderStatus::Live; } },
-							_ => {}
-						}
-					}
-				}
-			}
-		}
-		// After processing an order response, trigger a decision pass
-		io.schedule_update();
-	}
+    fn on_order_response(
+        &mut self,
+        resp: crate::xcommons::oms::OrderResponse,
+        io: &mut StrategyIo,
+    ) {
+        if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+            let strategy = self.name();
+            let symbol = self.symbol.clone().unwrap_or_else(|| "UNKNOWN".to_string());
+            let post_net = if let Some(cl) = resp.cl_ord_id {
+                if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+                    self.last_post_req_ts_us_bid
+                        .map(|sent| (resp.rcv_timestamp - sent).max(0) as u64)
+                } else if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+                    self.last_post_req_ts_us_ask
+                        .map(|sent| (resp.rcv_timestamp - sent).max(0) as u64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let cancel_net = if let Some(cl) = resp.cl_ord_id {
+                if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+                    self.last_cancel_req_ts_us_bid
+                        .map(|sent| (resp.rcv_timestamp - sent).max(0) as u64)
+                } else if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+                    self.last_cancel_req_ts_us_ask
+                        .map(|sent| (resp.rcv_timestamp - sent).max(0) as u64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Ok(mut g) = crate::metrics::GLOBAL_METRICS.lock() {
+                let h = &mut g.latency_histograms;
+                if let Some(nu) = post_net {
+                    h.record_post_network_latency(nu);
+                }
+                if let Some(nu) = cancel_net {
+                    h.record_cancel_network_latency(nu);
+                }
+            }
+            if let Ok(g2) = crate::metrics::GLOBAL_METRICS.lock() {
+                let h2 = &g2.latency_histograms;
+                prom.set_strategy_post_cancel_latencies(
+                    strategy,
+                    &symbol,
+                    Some(h2.post_network_us.value_at_quantile(0.50)),
+                    Some(h2.post_network_us.value_at_quantile(0.99)),
+                    Some(h2.cancel_network_us.value_at_quantile(0.50)),
+                    Some(h2.cancel_network_us.value_at_quantile(0.99)),
+                );
+            }
+            if resp.status == crate::xcommons::oms::OrderResponseStatus::Ok {
+                if let Some(cl) = resp.cl_ord_id {
+                    // If we were canceling this order, clear it; otherwise treat as Post ACK and mark Live
+                    if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+                        if self.pending_cancel_bid {
+                            self.pending_cancel_bid = false;
+                            self.bid_order = None;
+                        } else if let Some(ref mut lo) = self.bid_order {
+                            lo.status = LiveOrderStatus::Live;
+                        }
+                    }
+                    if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+                        if self.pending_cancel_ask {
+                            self.pending_cancel_ask = false;
+                            self.ask_order = None;
+                        } else if let Some(ref mut lo) = self.ask_order {
+                            lo.status = LiveOrderStatus::Live;
+                        }
+                    }
+                }
+            }
+            if resp.status == crate::xcommons::oms::OrderResponseStatus::FailedPostOnly {
+                if let Some(cl) = resp.cl_ord_id {
+                    if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+                        self.bid_order = None;
+                        self.last_post_req_ts_us_bid = None;
+                    }
+                    if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+                        self.ask_order = None;
+                        self.last_post_req_ts_us_ask = None;
+                    }
+                }
+            }
+            // If the API reports order not found on a cancel request, clear the slot (race: fill before cancel ACK)
+            if resp.status == crate::xcommons::oms::OrderResponseStatus::FailedOrderNotFound {
+                if let Some(cl) = resp.cl_ord_id {
+                    if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+                        self.pending_cancel_bid = false;
+                        self.bid_order = None;
+                    }
+                    if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+                        self.pending_cancel_ask = false;
+                        self.ask_order = None;
+                    }
+                }
+            }
+            // Generic failure handling: clear pending-new posts; release pending-cancel flags to avoid stalls
+            if resp.status == crate::xcommons::oms::OrderResponseStatus::Failed400
+                || resp.status == crate::xcommons::oms::OrderResponseStatus::Failed500
+                || resp.status == crate::xcommons::oms::OrderResponseStatus::FailedRateLimit
+            {
+                if let Some(cl) = resp.cl_ord_id {
+                    // BUY side
+                    if self.bid_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+                        match self.bid_order.as_ref().map(|o| o.status) {
+                            Some(LiveOrderStatus::PendingNew) => {
+                                self.bid_order = None;
+                                self.last_post_req_ts_us_bid = None;
+                            }
+                            Some(LiveOrderStatus::PendingCancel) => {
+                                self.pending_cancel_bid = false;
+                                if let Some(ref mut lo) = self.bid_order {
+                                    lo.status = LiveOrderStatus::Live;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // SELL side
+                    if self.ask_order.map(|o| o.cl_ord_id == cl).unwrap_or(false) {
+                        match self.ask_order.as_ref().map(|o| o.status) {
+                            Some(LiveOrderStatus::PendingNew) => {
+                                self.ask_order = None;
+                                self.last_post_req_ts_us_ask = None;
+                            }
+                            Some(LiveOrderStatus::PendingCancel) => {
+                                self.pending_cancel_ask = false;
+                                if let Some(ref mut lo) = self.ask_order {
+                                    lo.status = LiveOrderStatus::Live;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        self.events_counter += 1;
+        io.schedule_update();
+    }
 
-	fn on_position(&mut self, _account_id: i64, market_id: i64, pos: Position, io: &mut StrategyIo) {
-		// log::info!("[naive_mm] position account_id={} market_id={} amount={} avp={} realized={} fees={} trades_count={} vol={} bps={}", _account_id, market_id, pos.amount, pos.avp, pos.realized, pos.fees, pos.trades_count, pos.quote_volume, pos.bps());
-		self.position = pos;
-		self.market_id = Some(market_id);
-		self.ready = true;
-		// log::info!("[naive_mm] on_position: ready set, market_id={} symbol={:?}", market_id, self.symbol);
-		// Update strategy metrics on position event as well to avoid waiting for next OBS tick
-		if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
-			if let Some(symbol) = self.symbol.as_ref() {
-				let mid = self.last_mid.unwrap_or(self.fair_px);
-				let pnl = self.position.current_pnl(if mid.is_finite() && mid > 0.0 { mid } else { self.position.avp.max(0.0) });
-				prom.set_strategy_metrics(self.name(), symbol, pnl, self.position.amount, self.position.bps());
-			} else {
-				log::debug!("[naive_mm] skip strategy metrics on_position: symbol unknown yet");
-			}
-		}
-		io.schedule_update();
-	}
+    fn on_position(
+        &mut self,
+        _account_id: i64,
+        market_id: i64,
+        pos: Position,
+        io: &mut StrategyIo,
+    ) {
+        // log::info!("[naive_mm] position account_id={} market_id={} amount={} avp={} realized={} fees={} trades_count={} vol={} bps={}", _account_id, market_id, pos.amount, pos.avp, pos.realized, pos.fees, pos.trades_count, pos.quote_volume, pos.bps());
+        self.position = pos;
+        self.market_id = Some(market_id);
+        self.ready = true;
+        self.events_counter += 1;
+        io.schedule_update();
+    }
 
-	fn update(&mut self, io: &mut StrategyIo) {
-		
-		self.extra_fill_spread_bps = self.extra_fill_spread_bps * self.hyper_params.extra_fill_spread_bps_decay_factor;
+    fn update(&mut self, io: &mut StrategyIo) {
+        self.updates_counter += 1;
+        self.extra_fill_spread_bps =
+            self.extra_fill_spread_bps * self.hyper_params.extra_fill_spread_bps_decay_factor;
 
-		let (Some(market_id), Some(mid_price)) = (self.market_id, self.last_mid) else {
-			log::debug!("[naive_mm] update skipped: market_id or mid missing. market_id={:?} mid_present={} ready={}", self.market_id, self.last_mid.is_some(), self.ready);
-			return
-		};
-		
-		if self.last_mid_price != mid_price {
-			self.extra_fill_spread_bps += self.spread_bps * self.hyper_params.extra_fill_spread_bps_increase_on_mid_change;
-		}
+        let (Some(market_id), Some(mid_price)) = (self.market_id, self.last_mid) else {
+            log::debug!(
+                "update skipped: market_id or mid missing. market_id={:?} mid_present={} ready={}",
+                self.market_id,
+                self.last_mid.is_some(),
+                self.ready
+            );
+            return;
+        };
 
-		self.last_mid_price = mid_price;
-		// Become ready when order channel is available (initial positions may not be pushed immediately)
-		if !self.ready {
-			let has_tx = io.order_txs.contains_key(&market_id);
-			if has_tx {
-				self.ready = true;
-				log::info!("[naive_mm] became ready: market_id={} symbol={:?}", market_id, self.symbol);
-				// One-time cancel-all on first readiness
-				if !self.did_init {
-					if let Some(tx) = io.order_txs.get(&market_id) {
-						if let Some(account_id) = self.binance_account_id {
-							let req = CancelAllRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), market_id, account_id };
-							if let Err(e) = tx.try_send(OrderRequest::CancelAll(req)) { log::warn!("[naive_mm] mailbox overflow dropping CancelAll request: {}", e); }
-							self.did_init = true;
-						}
-					}
-				}
-			} else {
-				log::warn!("[naive_mm] update: not ready and no order tx for market_id={} symbol={:?}", market_id, self.symbol);
-				return;
-			}
-		}
-		let tick = 0.1f64;
-		let round_to_tick = |px: f64| -> f64 { (px / tick).round() * tick };
-		let strategy_name = self.name();
-		let spread_bps = self.spread_bps + self.extra_fill_spread_bps;
-		let displace_bps = self.displace_bps;
-		let lot = self.lot_size;
-		let symbol_clone_opt = self.symbol.clone();
-		let pos_amt = self.position.amount;
+        if self.last_mid_price != mid_price {
+            self.extra_fill_spread_bps += self.spread_bps
+                * self
+                    .hyper_params
+                    .extra_fill_spread_bps_increase_on_mid_change;
+        }
 
+        self.last_mid_price = mid_price;
+        // Become ready when order channel is available (initial positions may not be pushed immediately)
+        if !self.ready {
+            let has_tx = io.order_txs.contains_key(&market_id);
+            if has_tx {
+                self.ready = true;
+                log::info!(
+                    "became ready: market_id={} symbol={:?}",
+                    market_id,
+                    self.symbol
+                );
+                // One-time cancel-all on first readiness
+                if !self.did_init {
+                    if let Some(tx) = io.order_txs.get(&market_id) {
+                        if let Some(account_id) = self.binance_account_id {
+                            let req = CancelAllRequest {
+                                req_id: crate::xcommons::monoseq::next_id(),
+                                timestamp: crate::xcommons::types::time::now_micros(),
+                                market_id,
+                                account_id,
+                            };
+                            if let Err(e) = tx.try_send(OrderRequest::CancelAll(req)) {
+                                log::warn!("mailbox overflow dropping CancelAll request: {}", e);
+                            }
+                            self.did_init = true;
+                        }
+                    }
+                }
+            } else {
+                log::warn!(
+                    "update: not ready and no order tx for market_id={} symbol={:?}",
+                    market_id,
+                    self.symbol
+                );
+                return;
+            }
+        }
+        let tick = 0.1f64;
+        let round_to_tick = |px: f64| -> f64 { (px / tick).round() * tick };
+        let strategy_name = self.name();
+        let spread_bps = self.spread_bps + self.extra_fill_spread_bps;
+        let displace_bps = self.displace_bps;
+        let lot = self.lot_size;
+        let symbol_clone_opt = self.symbol.clone();
+        let pos_amt = self.position.amount;
 
-		let mut bid_target = round_to_tick(mid_price * (1.0 - spread_bps / 10_000.0));
-		let mut ask_target = round_to_tick(mid_price * (1.0 + spread_bps / 10_000.0));
+        let mut bid_target = round_to_tick(mid_price * (1.0 - spread_bps / 10_000.0));
+        let mut ask_target = round_to_tick(mid_price * (1.0 + spread_bps / 10_000.0));
 
-		let spread_displace_inc_position_factor = self.hyper_params.spread_displace_inc_position_factor;
-		let spread_displace_dec_position_factor = self.hyper_params.spread_displace_dec_position_factor;
+        let spread_displace_inc_position_factor =
+            self.hyper_params.spread_displace_inc_position_factor;
+        let spread_displace_dec_position_factor =
+            self.hyper_params.spread_displace_dec_position_factor;
 
-		if pos_amt.abs() > 0.00001 {
-			if pos_amt > 0.0 { 
-				bid_target = round_to_tick(bid_target * (1.0 - ((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * spread_displace_inc_position_factor)));
-				ask_target = round_to_tick(ask_target * (1.0 - ((pos_amt.abs() / lot) * (self.spread_bps / 10_000.0) * spread_displace_dec_position_factor)));
-				// ask_target = round_to_tick(ask_target * (1.0 + (self.extra_fill_spread_bps * 0.5) / 10_000.0));
-			} else {
-				ask_target = round_to_tick(ask_target * (1.0 + ((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * spread_displace_inc_position_factor)));
-				bid_target = round_to_tick(bid_target * (1.0 + ((pos_amt.abs() / lot) * (self.spread_bps / 10_000.0) * spread_displace_dec_position_factor)));
-				// bid_target = round_to_tick(bid_target * (1.0 - (self.extra_fill_spread_bps * 0.5) / 10_000.0));
-			}
-		}
-		// if pos_amt.abs() > 0.00001 {
-		// 	if pos_amt > 0.0 { 
-		// 		bid_target = round_to_tick(bid_target * (1.0 - ((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * 0.2) - (self.extra_fill_spread_bps / 10_000.0)));
-		// 		ask_target = round_to_tick(ask_target * (1.0 + (self.extra_fill_spread_bps * 0.5) / 10_000.0));
-		// 	} else {
-		// 		ask_target = round_to_tick(ask_target * (1.0 + ((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * 0.2) + (self.extra_fill_spread_bps / 10_000.0)));
-		// 		bid_target = round_to_tick(bid_target * (1.0 - (self.extra_fill_spread_bps * 0.5) / 10_000.0));
-		// 	}
-		// } else {
-		// 	ask_target = round_to_tick(ask_target * (1.0 + (self.extra_fill_spread_bps * 1.0) / 10_000.0));
-		// 	bid_target = round_to_tick(bid_target * (1.0 - (self.extra_fill_spread_bps * 1.0) / 10_000.0));
-		// }
+        if pos_amt.abs() > 0.00001 {
+            if pos_amt > 0.0 {
+                bid_target = round_to_tick(
+                    bid_target
+                        * (1.0
+                            - ((pos_amt.abs() / lot)
+                                * (spread_bps / 10_000.0)
+                                * spread_displace_inc_position_factor)),
+                );
+                ask_target = round_to_tick(
+                    ask_target
+                        * (1.0
+                            - ((pos_amt.abs() / lot)
+                                * (self.spread_bps / 10_000.0)
+                                * spread_displace_dec_position_factor)),
+                );
+                // ask_target = round_to_tick(ask_target * (1.0 + (self.extra_fill_spread_bps * 0.5) / 10_000.0));
+            } else {
+                ask_target = round_to_tick(
+                    ask_target
+                        * (1.0
+                            + ((pos_amt.abs() / lot)
+                                * (spread_bps / 10_000.0)
+                                * spread_displace_inc_position_factor)),
+                );
+                bid_target = round_to_tick(
+                    bid_target
+                        * (1.0
+                            + ((pos_amt.abs() / lot)
+                                * (self.spread_bps / 10_000.0)
+                                * spread_displace_dec_position_factor)),
+                );
+                // bid_target = round_to_tick(bid_target * (1.0 - (self.extra_fill_spread_bps * 0.5) / 10_000.0));
+            }
+        }
+        // if pos_amt.abs() > 0.00001 {
+        // 	if pos_amt > 0.0 {
+        // 		bid_target = round_to_tick(bid_target * (1.0 - ((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * 0.2) - (self.extra_fill_spread_bps / 10_000.0)));
+        // 		ask_target = round_to_tick(ask_target * (1.0 + (self.extra_fill_spread_bps * 0.5) / 10_000.0));
+        // 	} else {
+        // 		ask_target = round_to_tick(ask_target * (1.0 + ((pos_amt.abs() / lot) * (spread_bps / 10_000.0) * 0.2) + (self.extra_fill_spread_bps / 10_000.0)));
+        // 		bid_target = round_to_tick(bid_target * (1.0 - (self.extra_fill_spread_bps * 0.5) / 10_000.0));
+        // 	}
+        // } else {
+        // 	ask_target = round_to_tick(ask_target * (1.0 + (self.extra_fill_spread_bps * 1.0) / 10_000.0));
+        // 	bid_target = round_to_tick(bid_target * (1.0 - (self.extra_fill_spread_bps * 1.0) / 10_000.0));
+        // }
 
-		let disp_th = displace_bps / 10_000.0 * mid_price;
-		// If a cancel request errored upstream (not forwarded to strategy), clear pending cancel after a short TTL
-		let now_us = crate::xcommons::types::time::now_micros();
-		const CANCEL_TTL_US: i64 = 800_000; // 0.8s safety
-		if self.pending_cancel_bid {
-			if let Some(sent) = self.last_cancel_req_ts_us_bid {
-				if now_us - sent > CANCEL_TTL_US { self.pending_cancel_bid = false; self.bid_order = None; }
-			}
-		}
-		if self.pending_cancel_ask {
-			if let Some(sent) = self.last_cancel_req_ts_us_ask {
-				if now_us - sent > CANCEL_TTL_US { self.pending_cancel_ask = false; self.ask_order = None; }
-			}
-		}
-		let has_tx = io.order_txs.contains_key(&market_id);
-		if !has_tx {
-			log::warn!("[naive_mm] no order tx for market_id={} symbol={:?}", market_id, self.symbol);
-		}
-		if let Some(tx) = io.order_txs.get(&market_id) {
-			match self.bid_order {
-				Some(lo) => {
-					let cl = lo.cl_ord_id; let px = lo.price;
-					if lo.status == LiveOrderStatus::Live && ((px - bid_target).abs() > disp_th || pos_amt >= self.max_position) {
-						self.extra_fill_spread_bps += self.spread_bps * self.hyper_params.extra_fill_spread_bps_increase_on_cancel_request;
-						let creq = CancelRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), market_id, account_id: self.binance_account_id.unwrap_or_default(), cl_ord_id: Some(cl), native_ord_id: None };
-						let sent = crate::xcommons::types::time::now_micros();
-						if !self.pending_cancel_bid && tx.try_send(OrderRequest::Cancel(creq)).is_ok() {
-							self.last_cancel_req_ts_us_bid = Some(sent);
-							self.pending_cancel_bid = true;
-							if let Some(ref mut cur) = self.bid_order { cur.status = LiveOrderStatus::PendingCancel; }
-							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { if let Some(ref sym) = symbol_clone_opt { prom.inc_strategy_cancel_request(strategy_name, sym); } }
-						} else if !self.pending_cancel_bid {
-							log::warn!("[naive_mm] mailbox overflow dropping Cancel BUY request for market_id={} symbol={:?}", market_id, self.symbol);
-						}
-					}
-				}
-				None => {
-					// Strict guard: do not post BUY at or above max long exposure
-					if pos_amt < self.max_position && self.bid_order.is_none() {
-						let reduce_only = pos_amt < 0.0; // reduce-only if currently short
-						let preq = PostRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), cl_ord_id: crate::xcommons::monoseq::next_id(), market_id, account_id: self.binance_account_id.unwrap_or_default(), side: Side::Buy, qty: lot, price: bid_target, ord_mode: OrderMode::MLimit, tif: TimeInForce::TifGoodTillCancel, post_only: true, reduce_only, metadata: Default::default() };
-						let cl = preq.cl_ord_id;
-						if tx.try_send(OrderRequest::Post(preq)).is_ok() {
-							self.bid_order = Some(LiveOrder { status: LiveOrderStatus::PendingNew, cl_ord_id: cl, price: bid_target });
-							let sent = crate::xcommons::types::time::now_micros();
-							self.last_post_req_ts_us_bid = Some(sent);
-							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { if let Some(ref sym) = symbol_clone_opt { prom.inc_strategy_post_request(strategy_name, sym); } }
-						} else { log::warn!("[naive_mm] mailbox overflow dropping Post BUY for market_id={} symbol={:?}", market_id, self.symbol); }
-					}
-				}
-			}
-			match self.ask_order {
-				Some(lo) => {
-					let cl = lo.cl_ord_id; let px = lo.price;
-					if lo.status == LiveOrderStatus::Live && ((px - ask_target).abs() > disp_th || -pos_amt >= self.max_position) {
-						self.extra_fill_spread_bps += self.spread_bps * self.hyper_params.extra_fill_spread_bps_increase_on_cancel_request;
-						let creq = CancelRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), market_id, account_id: self.binance_account_id.unwrap_or_default(), cl_ord_id: Some(cl), native_ord_id: None };
-						let sent = crate::xcommons::types::time::now_micros();
-						if !self.pending_cancel_ask && tx.try_send(OrderRequest::Cancel(creq)).is_ok() {
-							self.last_cancel_req_ts_us_ask = Some(sent);
-							self.pending_cancel_ask = true;
-							if let Some(ref mut cur) = self.ask_order { cur.status = LiveOrderStatus::PendingCancel; }
-							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { if let Some(ref sym) = symbol_clone_opt { prom.inc_strategy_cancel_request(strategy_name, sym); } }
-						} else if !self.pending_cancel_ask {
-							log::warn!("[naive_mm] mailbox overflow dropping Cancel SELL request for market_id={} symbol={:?}", market_id, self.symbol);
-						}
-					}
-				}
-				None => {
-					// Strict guard: do not post SELL at or above max short exposure
-					if -pos_amt < self.max_position && self.ask_order.is_none() {
-						let reduce_only = pos_amt > 0.0; // reduce-only if currently long
-						let preq = PostRequest { req_id: crate::xcommons::monoseq::next_id(), timestamp: crate::xcommons::types::time::now_micros(), cl_ord_id: crate::xcommons::monoseq::next_id(), market_id, account_id: self.binance_account_id.unwrap_or_default(), side: Side::Sell, qty: lot, price: ask_target, ord_mode: OrderMode::MLimit, tif: TimeInForce::TifGoodTillCancel, post_only: true, reduce_only, metadata: Default::default() };
-						let cl = preq.cl_ord_id;
-						if tx.try_send(OrderRequest::Post(preq)).is_ok() {
-							self.ask_order = Some(LiveOrder { status: LiveOrderStatus::PendingNew, cl_ord_id: cl, price: ask_target });
-							let sent = crate::xcommons::types::time::now_micros();
-							self.last_post_req_ts_us_ask = Some(sent);
-							if let Some(prom) = crate::metrics::PROM_EXPORTER.get() { if let Some(ref sym) = symbol_clone_opt { prom.inc_strategy_post_request(strategy_name, sym); } }
-						} else { log::warn!("[naive_mm] mailbox overflow dropping Post SELL for market_id={} symbol={:?}", market_id, self.symbol); }
-					}
-				}
-			}
-		}
-	}
+        let disp_th = displace_bps / 10_000.0 * mid_price;
+        // If a cancel request errored upstream (not forwarded to strategy), clear pending cancel after a short TTL
+        let now_us = crate::xcommons::types::time::now_micros();
+        const CANCEL_TTL_US: i64 = 800_000; // 0.8s safety
+        if self.pending_cancel_bid {
+            if let Some(sent) = self.last_cancel_req_ts_us_bid {
+                if now_us - sent > CANCEL_TTL_US {
+                    self.pending_cancel_bid = false;
+                    self.bid_order = None;
+                }
+            }
+        }
+        if self.pending_cancel_ask {
+            if let Some(sent) = self.last_cancel_req_ts_us_ask {
+                if now_us - sent > CANCEL_TTL_US {
+                    self.pending_cancel_ask = false;
+                    self.ask_order = None;
+                }
+            }
+        }
+        let has_tx = io.order_txs.contains_key(&market_id);
+        if !has_tx {
+            log::warn!(
+                "no order tx for market_id={} symbol={:?}",
+                market_id,
+                self.symbol
+            );
+        }
+        if let Some(tx) = io.order_txs.get(&market_id) {
+            match self.bid_order {
+                Some(lo) => {
+                    let cl = lo.cl_ord_id;
+                    let px = lo.price;
+                    if lo.status == LiveOrderStatus::Live
+                        && ((px - bid_target).abs() > disp_th || pos_amt >= self.max_position)
+                    {
+                        self.extra_fill_spread_bps += self.spread_bps
+                            * self
+                                .hyper_params
+                                .extra_fill_spread_bps_increase_on_cancel_request;
+                        let creq = CancelRequest {
+                            req_id: crate::xcommons::monoseq::next_id(),
+                            timestamp: crate::xcommons::types::time::now_micros(),
+                            market_id,
+                            account_id: self.binance_account_id.unwrap_or_default(),
+                            cl_ord_id: Some(cl),
+                            native_ord_id: None,
+                        };
+                        let sent = crate::xcommons::types::time::now_micros();
+                        if !self.pending_cancel_bid
+                            && tx.try_send(OrderRequest::Cancel(creq)).is_ok()
+                        {
+                            self.last_cancel_req_ts_us_bid = Some(sent);
+                            self.pending_cancel_bid = true;
+                            if let Some(ref mut cur) = self.bid_order {
+                                cur.status = LiveOrderStatus::PendingCancel;
+                            }
+                            if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+                                if let Some(ref sym) = symbol_clone_opt {
+                                    prom.inc_strategy_cancel_request(strategy_name, sym);
+                                }
+                            }
+                        } else if !self.pending_cancel_bid {
+                            log::warn!("mailbox overflow dropping Cancel BUY request for market_id={} symbol={:?}", market_id, self.symbol);
+                        }
+                    }
+                }
+                None => {
+                    // Strict guard: do not post BUY at or above max long exposure
+                    if pos_amt < self.max_position && self.bid_order.is_none() {
+                        let reduce_only = pos_amt < 0.0; // reduce-only if currently short
+                        let preq = PostRequest {
+                            req_id: crate::xcommons::monoseq::next_id(),
+                            timestamp: crate::xcommons::types::time::now_micros(),
+                            cl_ord_id: crate::xcommons::monoseq::next_id(),
+                            market_id,
+                            account_id: self.binance_account_id.unwrap_or_default(),
+                            side: Side::Buy,
+                            qty: lot,
+                            price: bid_target,
+                            ord_mode: OrderMode::MLimit,
+                            tif: TimeInForce::TifGoodTillCancel,
+                            post_only: true,
+                            reduce_only,
+                            metadata: Default::default(),
+                        };
+                        let cl = preq.cl_ord_id;
+                        if tx.try_send(OrderRequest::Post(preq)).is_ok() {
+                            self.bid_order = Some(LiveOrder {
+                                status: LiveOrderStatus::PendingNew,
+                                cl_ord_id: cl,
+                                price: bid_target,
+                            });
+                            let sent = crate::xcommons::types::time::now_micros();
+                            self.last_post_req_ts_us_bid = Some(sent);
+                            if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+                                if let Some(ref sym) = symbol_clone_opt {
+                                    prom.inc_strategy_post_request(strategy_name, sym);
+                                }
+                            }
+                        } else {
+                            log::warn!(
+                                "mailbox overflow dropping Post BUY for market_id={} symbol={:?}",
+                                market_id,
+                                self.symbol
+                            );
+                        }
+                    }
+                }
+            }
+            match self.ask_order {
+                Some(lo) => {
+                    let cl = lo.cl_ord_id;
+                    let px = lo.price;
+                    if lo.status == LiveOrderStatus::Live
+                        && ((px - ask_target).abs() > disp_th || -pos_amt >= self.max_position)
+                    {
+                        self.extra_fill_spread_bps += self.spread_bps
+                            * self
+                                .hyper_params
+                                .extra_fill_spread_bps_increase_on_cancel_request;
+                        let creq = CancelRequest {
+                            req_id: crate::xcommons::monoseq::next_id(),
+                            timestamp: crate::xcommons::types::time::now_micros(),
+                            market_id,
+                            account_id: self.binance_account_id.unwrap_or_default(),
+                            cl_ord_id: Some(cl),
+                            native_ord_id: None,
+                        };
+                        let sent = crate::xcommons::types::time::now_micros();
+                        if !self.pending_cancel_ask
+                            && tx.try_send(OrderRequest::Cancel(creq)).is_ok()
+                        {
+                            self.last_cancel_req_ts_us_ask = Some(sent);
+                            self.pending_cancel_ask = true;
+                            if let Some(ref mut cur) = self.ask_order {
+                                cur.status = LiveOrderStatus::PendingCancel;
+                            }
+                            if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+                                if let Some(ref sym) = symbol_clone_opt {
+                                    prom.inc_strategy_cancel_request(strategy_name, sym);
+                                }
+                            }
+                        } else if !self.pending_cancel_ask {
+                            log::warn!("mailbox overflow dropping Cancel SELL request for market_id={} symbol={:?}", market_id, self.symbol);
+                        }
+                    }
+                }
+                None => {
+                    // Strict guard: do not post SELL at or above max short exposure
+                    if -pos_amt < self.max_position && self.ask_order.is_none() {
+                        let reduce_only = pos_amt > 0.0; // reduce-only if currently long
+                        let preq = PostRequest {
+                            req_id: crate::xcommons::monoseq::next_id(),
+                            timestamp: crate::xcommons::types::time::now_micros(),
+                            cl_ord_id: crate::xcommons::monoseq::next_id(),
+                            market_id,
+                            account_id: self.binance_account_id.unwrap_or_default(),
+                            side: Side::Sell,
+                            qty: lot,
+                            price: ask_target,
+                            ord_mode: OrderMode::MLimit,
+                            tif: TimeInForce::TifGoodTillCancel,
+                            post_only: true,
+                            reduce_only,
+                            metadata: Default::default(),
+                        };
+                        let cl = preq.cl_ord_id;
+                        if tx.try_send(OrderRequest::Post(preq)).is_ok() {
+                            self.ask_order = Some(LiveOrder {
+                                status: LiveOrderStatus::PendingNew,
+                                cl_ord_id: cl,
+                                price: ask_target,
+                            });
+                            let sent = crate::xcommons::types::time::now_micros();
+                            self.last_post_req_ts_us_ask = Some(sent);
+                            if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+                                if let Some(ref sym) = symbol_clone_opt {
+                                    prom.inc_strategy_post_request(strategy_name, sym);
+                                }
+                            }
+                        } else {
+                            log::warn!(
+                                "mailbox overflow dropping Post SELL for market_id={} symbol={:?}",
+                                market_id,
+                                self.symbol
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+            let pos = self.position.clone();
+            let pnl = pos.current_pnl(mid_price);
+            let bps = pos.bps();
+            let symbol = self.symbol.as_deref().unwrap_or("UNKNOWN");
+
+            prom.set_strategy_metrics(self.name(), symbol, pnl, pos.amount, bps);
+            prom.set_strategy_mid_price(self.name(), symbol, mid_price);
+
+            if let Ok(g) = crate::metrics::GLOBAL_METRICS.lock() {
+                let h = &g.latency_histograms;
+                prom.set_strategy_latency_quantiles(
+                    self.name(),
+                    symbol,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(h.code_us.value_at_quantile(0.50)),
+                    Some(h.code_us.value_at_quantile(0.99)),
+                    None,
+                    None,
+                );
+            }
+        }
+    }
 }

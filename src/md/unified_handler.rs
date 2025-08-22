@@ -3,9 +3,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::xcommons::error::{AppError, Result};
 use crate::exchanges::{ExchangeConnector, ExchangeProcessor};
-use crate::xcommons::types::{RawMessage, ExchangeId, StreamData, StreamType, SubscriptionSpec};
+use crate::xcommons::error::{AppError, Result};
+use crate::xcommons::types::{ExchangeId, RawMessage, StreamData, StreamType, SubscriptionSpec};
 
 /// Unified exchange handler that combines connector and processor into a single async task
 /// This eliminates the overhead of dual task spawning and inter-task communication
@@ -40,10 +40,7 @@ impl UnifiedExchangeHandler {
 
     /// Run the unified handler - combines both connector and processor logic
     /// This eliminates the need for intermediate channels and async task overhead
-    pub async fn run(
-        mut self,
-        output_tx: mpsc::Sender<StreamData>,
-    ) -> Result<()> {
+    pub async fn run(mut self, output_tx: mpsc::Sender<StreamData>) -> Result<()> {
         log::info!(
             "[{}] Starting UnifiedExchangeHandler for {:?}@{}",
             self.index,
@@ -118,10 +115,12 @@ impl UnifiedExchangeHandler {
             .connector
             .get_snapshot(&self.subscription.instrument)
             .await
-            .map_err(|e| AppError::data(format!(
-                "Failed to get snapshot for {} on {:?}: {}",
-                self.subscription.instrument, self.subscription.exchange, e
-            )))?;
+            .map_err(|e| {
+                AppError::data(format!(
+                    "Failed to get snapshot for {} on {:?}: {}",
+                    self.subscription.instrument, self.subscription.exchange, e
+                ))
+            })?;
 
         // Give connector a chance to prepare internal sync state and reconcile buffered deltas
         self.connector
@@ -136,7 +135,9 @@ impl UnifiedExchangeHandler {
                         for update in updates {
                             if let Err(e) = output_tx.send(update).await {
                                 log::error!("Failed to send replayed update: {}", e);
-                                return Err(AppError::pipeline("Output channel send failed".to_string()));
+                                return Err(AppError::pipeline(
+                                    "Output channel send failed".to_string(),
+                                ));
                             }
                         }
                     }
@@ -203,12 +204,7 @@ impl UnifiedExchangeHandler {
         self.connector
             .subscribe_trades(&self.subscription.instrument)
             .await
-            .map_err(|e| {
-                AppError::stream(format!(
-                    "Failed to subscribe to trade stream: {}",
-                    e
-                ))
-            })?;
+            .map_err(|e| AppError::stream(format!("Failed to subscribe to trade stream: {}", e)))?;
 
         // Direct message processing loop with cancellation support
         loop {
@@ -258,24 +254,24 @@ impl UnifiedExchangeHandler {
 
     /// Process raw message directly using the exchange processor
     async fn process_raw_message(&mut self, raw_msg: RawMessage) -> Result<Vec<StreamData>> {
-        let rcv_timestamp = crate::xcommons::types::time::now_micros();
         let packet_id = self.processor.next_packet_id();
         let message_bytes = raw_msg.data.len() as u32;
 
         let stream_data = self.processor.process_unified_message(
             raw_msg,
             &self.subscription.instrument,
-            rcv_timestamp,
             packet_id,
             message_bytes,
             self.subscription.stream_type,
         )?;
-        
+
         Ok(stream_data)
     }
 
     /// Get exchange ID for this handler
-    fn get_exchange_id(&self) -> ExchangeId { self.subscription.exchange }
+    fn get_exchange_id(&self) -> ExchangeId {
+        self.subscription.exchange
+    }
 }
 
 /// Factory for creating unified exchange handlers
@@ -291,11 +287,11 @@ impl UnifiedHandlerFactory {
         okx_spot_registry: Option<Arc<crate::exchanges::okx::InstrumentRegistry>>,
         cancellation_token: CancellationToken,
     ) -> Result<UnifiedExchangeHandler> {
-        use crate::xcommons::types::ExchangeId as ExId;
         use crate::exchanges::binance::BinanceFuturesConnector;
+        use crate::exchanges::deribit::{DeribitConfig, DeribitConnector};
         use crate::exchanges::okx::OkxConnector;
-        use crate::exchanges::deribit::{DeribitConnector, DeribitConfig};
         use crate::exchanges::ProcessorFactory;
+        use crate::xcommons::types::ExchangeId as ExId;
 
         // Create connector based on exchange type
         let connector: Box<dyn ExchangeConnector<Error = AppError>> = match subscription.exchange {
@@ -329,18 +325,14 @@ impl UnifiedHandlerFactory {
         // Create processor based on exchange type
         let processor = match subscription.exchange {
             ExId::BinanceFutures => ProcessorFactory::create_binance_processor(),
-            ExId::OkxSwap => {
-                ProcessorFactory::create_processor(
-                    crate::xcommons::types::ExchangeId::OkxSwap,
-                    okx_swap_registry
-                )
-            }
-            ExId::OkxSpot => {
-                ProcessorFactory::create_processor(
-                    crate::xcommons::types::ExchangeId::OkxSpot,
-                    okx_spot_registry
-                )
-            }
+            ExId::OkxSwap => ProcessorFactory::create_processor(
+                crate::xcommons::types::ExchangeId::OkxSwap,
+                okx_swap_registry,
+            ),
+            ExId::OkxSpot => ProcessorFactory::create_processor(
+                crate::xcommons::types::ExchangeId::OkxSpot,
+                okx_spot_registry,
+            ),
             ExId::Deribit => ProcessorFactory::create_deribit_processor(),
         };
 

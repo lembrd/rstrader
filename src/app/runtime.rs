@@ -68,40 +68,6 @@ async fn run_strategy_path(args: Args) -> Result<()> {
         }
     });
 
-    // Try MD Collector first; if it fails, try NaiveMM
-    let md_cfg: std::result::Result<MdCollectorConfig, serde_yaml::Error> = serde_yaml::from_str(&buf);
-    if let Ok(cfg) = md_cfg {
-        // existing MD collector path
-        // metrics and exporters setup is above
-        let env = super::env::DefaultEnvironment::new(cfg.runtime.channel_capacity, args.verbose, prom_registry.clone());
-        let ctx = StrategyContext { env: std::sync::Arc::new(env) };
-        // Configure sink from YAML in strategy mode
-        let sink_cfg = match &cfg.sink {
-            crate::strats::md_collector::config::SinkSection::Parquet { output_dir } => EnvSinkConfig::Parquet { output_dir: output_dir.clone() },
-            crate::strats::md_collector::config::SinkSection::Questdb => EnvSinkConfig::QuestDb,
-        };
-        // Map config subscriptions into SubscriptionSpec and run sink (now using typed enums from YAML)
-        use crate::xcommons::types::SubscriptionSpec;
-        let subscriptions: Vec<SubscriptionSpec> = cfg
-            .subscriptions
-            .into_iter()
-            .map(|s| {
-                let max_connections = if s.arb_streams_num > 1 { Some(s.arb_streams_num) } else { None };
-                Ok(SubscriptionSpec { stream_type: s.stream_type, exchange: s.exchange, instrument: s.instrument, max_connections })
-            })
-            .collect::<std::result::Result<_, AppError>>()?;
-
-        let rx = ctx.env.start_subscriptions(subscriptions);
-        let handle = ctx.env.start_sink(sink_cfg, rx)?;
-        if let Some(seconds) = args.shutdown_after {
-            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
-            handle.abort();
-            log::info!("Shutdown timer elapsed; stopped sink task");
-            return Ok(());
-        }
-        let _ = handle.await.map_err(|e| AppError::internal(format!("sink join error: {}", e)))?;
-        return Ok(());
-    }
 
     // Try NaiveMM strategy
     let cfg: NaiveMmConfig = serde_yaml::from_str(&buf).map_err(|e| AppError::cli(format!("Invalid YAML for known strategies: {}", e)))?;

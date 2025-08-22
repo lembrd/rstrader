@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 /// Side enumeration for orders and executions
 #[repr(i8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum Side {
     Unknown = 0,
     Buy = 1,

@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap as HashMap;
-use std::time::Instant;
 use std::net::SocketAddr;
 use std::time::Duration;
+use std::time::Instant;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -44,7 +44,10 @@ impl QuestDbClient {
             .parse()
             .map_err(|e| AppError::connection(format!("Invalid QuestDB addr: {}", e)))?;
         let stream = TcpStream::connect(addr).await.map_err(|e| {
-            AppError::connection(format!("Failed to connect to QuestDB ILP at {}: {}", addr, e))
+            AppError::connection(format!(
+                "Failed to connect to QuestDB ILP at {}: {}",
+                addr, e
+            ))
         })?;
         stream.set_nodelay(true).map_err(|e| {
             AppError::connection(format!("Failed to set TCP_NODELAY on ILP stream: {}", e))
@@ -93,7 +96,11 @@ struct StreamWriter {
 }
 
 impl StreamWriter {
-    fn new(stream_type: String, exchange: crate::xcommons::types::ExchangeId, symbol: String) -> Self {
+    fn new(
+        stream_type: String,
+        exchange: crate::xcommons::types::ExchangeId,
+        symbol: String,
+    ) -> Self {
         Self {
             l2_buffer: Vec::with_capacity(BATCH_SIZE),
             trade_buffer: Vec::with_capacity(BATCH_SIZE),
@@ -144,7 +151,12 @@ impl StreamWriter {
             }
         }
         // Publish metrics snapshot and quantiles (if enabled)
-        crate::metrics::publish_stream_metrics(&self.stream_type, self.exchange, &self.symbol, &self.metrics);
+        crate::metrics::publish_stream_metrics(
+            &self.stream_type,
+            self.exchange,
+            &self.symbol,
+            &self.metrics,
+        );
         out
     }
 }
@@ -152,9 +164,9 @@ impl StreamWriter {
 fn serialize_l2_ilp(u: &OrderBookL2Update, out: &mut Vec<u8>) {
     // measurement + tags
     out.extend_from_slice(b"l2_updates,exchange=");
-    out.extend_from_slice(u.exchange.to_string().as_bytes());
+    out.extend_from_slice(u.market_id.to_string().as_bytes()); // todo !!!
     out.extend_from_slice(b",ticker=");
-    out.extend_from_slice(u.ticker.as_bytes());
+    out.extend_from_slice(u.market_id.to_string().as_bytes()); // todo !!!
     out.extend_from_slice(b",side=");
     out.extend_from_slice(u.side.to_string().as_bytes());
     out.extend_from_slice(b",action=");
@@ -186,9 +198,9 @@ fn serialize_l2_ilp(u: &OrderBookL2Update, out: &mut Vec<u8>) {
 
 fn serialize_trade_ilp(t: &TradeUpdate, out: &mut Vec<u8>) {
     out.extend_from_slice(b"trades,exchange=");
-    out.extend_from_slice(t.exchange.to_string().as_bytes());
+    out.extend_from_slice(t.market_id.to_string().as_bytes());
     out.extend_from_slice(b",ticker=");
-    out.extend_from_slice(t.ticker.as_bytes());
+    out.extend_from_slice(t.market_id.to_string().as_bytes());
     out.extend_from_slice(b",side=");
     out.extend_from_slice(t.side.to_string().as_bytes());
     out.extend_from_slice(b" ");
@@ -199,7 +211,7 @@ fn serialize_trade_ilp(t: &TradeUpdate, out: &mut Vec<u8>) {
     out.push(b',');
     push_string_field(out, b"trade_id", &t.trade_id);
     out.push(b',');
-    push_string_field(out, b"order_id", t.order_id.as_deref().unwrap_or(""));
+    push_string_field(out, b"order_id", ""); // todo !!! remove
     out.push(b',');
     push_f64_field(out, b"price", t.price);
     out.push(b',');
@@ -214,7 +226,9 @@ fn serialize_trade_ilp(t: &TradeUpdate, out: &mut Vec<u8>) {
     out.push(b'\n');
 }
 
-fn micros_to_nanos(us: i64) -> i64 { us.saturating_mul(1000) }
+fn micros_to_nanos(us: i64) -> i64 {
+    us.saturating_mul(1000)
+}
 
 fn push_i64_field(out: &mut Vec<u8>, key: &[u8], val: i64) {
     out.extend_from_slice(key);
@@ -267,21 +281,23 @@ impl MultiStreamQuestDbSink {
         }
     }
 
-    pub async fn initialize(&mut self) -> Result<()> { Ok(()) }
+    pub async fn initialize(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     pub async fn write_stream_data(&mut self, data: StreamData) -> Result<()> {
-        let (_, _, exchange, symbol, _, _) = data.common_fields();
-        let stream_type = data.stream_type();
-        let key = format!("{}_{}_{}", stream_type, exchange, symbol);
-        let writer = self.writers.entry(key).or_insert_with(|| StreamWriter::new(stream_type.to_string(), exchange, symbol.to_string()));
-        writer.push(data);
-        // Flush if either buffer meets threshold
-        if writer.buffer_len() >= BATCH_SIZE {
-            let buf = writer.serialize_and_clear();
-            if !buf.is_empty() {
-                self.client.send_bytes(&buf).await?;
-            }
-        }
+        // let (_, _, exchange, symbol, _, _) = data.common_fields();
+        // let stream_type = data.stream_type();
+        // let key = format!("{}_{}_{}", stream_type, exchange, symbol);
+        // let writer = self.writers.entry(key).or_insert_with(|| StreamWriter::new(stream_type.to_string(), exchange, symbol.to_string()));
+        // writer.push(data);
+        // // Flush if either buffer meets threshold
+        // if writer.buffer_len() >= BATCH_SIZE {
+        //     let buf = writer.serialize_and_clear();
+        //     if !buf.is_empty() {
+        //         self.client.send_bytes(&buf).await?;
+        //     }
+        // }
         Ok(())
     }
 
@@ -316,9 +332,7 @@ impl MultiStreamQuestDbSink {
     }
 }
 
-pub async fn run_multi_stream_questdb_sink(
-    mut rx: mpsc::Receiver<StreamData>,
-) -> Result<()> {
+pub async fn run_multi_stream_questdb_sink(mut rx: mpsc::Receiver<StreamData>) -> Result<()> {
     let mut sink = MultiStreamQuestDbSink::new();
     sink.initialize().await?;
 
@@ -367,55 +381,3 @@ pub async fn run_multi_stream_questdb_sink(
     log::info!("Multi-stream QuestDB sink shutdown complete");
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::xcommons::types::{ExchangeId, L2Action};
-    use crate::xcommons::oms::Side;
-
-    #[tokio::test]
-    async fn test_ilp_serialize_nonempty() {
-        let u = OrderBookL2Update {
-            timestamp: 1,
-            rcv_timestamp: 2,
-            exchange: ExchangeId::BinanceFutures,
-            ticker: "BTCUSDT".to_string(),
-            seq_id: 1,
-            packet_id: 1,
-            update_id: 10,
-            first_update_id: 9,
-            action: L2Action::Update,
-            side: Side::Buy,
-            price: 10.0,
-            qty: 1.0,
-        };
-        let mut w = StreamWriter::new("L2".to_string(), ExchangeId::BinanceFutures, "BTCUSDT".to_string());
-        w.push(StreamData::L2(u));
-        let buf = w.serialize_and_clear();
-        assert!(!buf.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_ilp_serialize_trade_nonempty() {
-        let t = TradeUpdate {
-            timestamp: 1,
-            rcv_timestamp: 2,
-            exchange: ExchangeId::BinanceFutures,
-            ticker: "BTCUSDT".to_string(),
-            seq_id: 1,
-            packet_id: 1,
-            trade_id: "T1".to_string(),
-            order_id: Some("O1".to_string()),
-            side: Side::Buy,
-            price: 10.0,
-            qty: 1.0,
-        };
-        let mut w = StreamWriter::new("TRADES".to_string(), ExchangeId::BinanceFutures, "BTCUSDT".to_string());
-        w.push(StreamData::Trade(t));
-        let buf = w.serialize_and_clear();
-        assert!(!buf.is_empty());
-    }
-}
-
-

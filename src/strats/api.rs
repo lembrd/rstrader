@@ -6,12 +6,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::app::env::{AppEnvironment, BinanceAccountParams};
-use crate::xcommons::error::Result as AppResult;
-use crate::xcommons::types::{ExchangeId, OrderBookL2Update, StreamData, TradeUpdate, StreamType as CoreStreamType, SubscriptionSpec, OrderBookSnapshot};
-use crate::xcommons::position::Position;
-use crate::xcommons::oms::{XExecution, OrderRequest, OrderResponse};
 use crate::trading::account_state::ExchangeAccountAdapter;
 use crate::xcommons::circuit_breaker::CircuitBreaker;
+use crate::xcommons::error::Result as AppResult;
+use crate::xcommons::oms::{OrderRequest, OrderResponse, XExecution};
+use crate::xcommons::position::Position;
+use crate::xcommons::types::{
+    ExchangeId, OrderBookL2Update, OrderBookSnapshot, StreamData, StreamType as CoreStreamType,
+    SubscriptionSpec, TradeUpdate,
+};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -32,11 +35,23 @@ pub enum StrategyControl {
 
 #[derive(Debug)]
 pub enum StrategyMessage {
-    MarketDataL2 { sub: SubscriptionId, msg: OrderBookL2Update },
-    MarketDataTrade { sub: SubscriptionId, msg: TradeUpdate },
-    Execution { account_id: i64, exec: XExecution },
-    Position { account_id: i64, market_id: i64, pos: Position },
-    Obs { sub: SubscriptionId, snapshot: OrderBookSnapshot },
+    MarketDataL2 {
+        msg: OrderBookL2Update,
+    },
+    MarketDataTrade {
+        msg: TradeUpdate,
+    },
+    Execution {
+        exec: XExecution,
+    },
+    Position {
+        account_id: i64,
+        market_id: i64,
+        pos: Position,
+    },
+    Obs {
+        snapshot: OrderBookSnapshot,
+    },
     OrderResponse(OrderResponse),
     Control(StrategyControl),
 }
@@ -50,7 +65,9 @@ pub struct StrategyIo<'a> {
 
 impl<'a> StrategyIo<'a> {
     #[inline]
-    pub fn schedule_update(&mut self) { self.update_scheduled = true; }
+    pub fn schedule_update(&mut self) {
+        self.update_scheduled = true;
+    }
 }
 
 #[async_trait]
@@ -60,14 +77,26 @@ pub trait Strategy: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Declare subscriptions and initial timers; no background tasks here
-    async fn configure(&mut self, reg: &mut StrategyRegistrar, ctx: &StrategyContext, cfg: &Self::Config) -> AppResult<()>;
+    async fn configure(
+        &mut self,
+        reg: &mut StrategyRegistrar,
+        ctx: &StrategyContext,
+        cfg: &Self::Config,
+    ) -> AppResult<()>;
 
     /// Typed handlers (sync, executed on the strategy task)
-    fn on_l2(&mut self, _sub: SubscriptionId, _msg: OrderBookL2Update, _io: &mut StrategyIo) {}
-    fn on_trade(&mut self, _sub: SubscriptionId, _msg: TradeUpdate, _io: &mut StrategyIo) {}
-    fn on_execution(&mut self, _account_id: i64, _exec: XExecution, _io: &mut StrategyIo) {}
-    fn on_position(&mut self, _account_id: i64, _market_id: i64, _pos: Position, _io: &mut StrategyIo) {}
-    fn on_obs(&mut self, _sub: SubscriptionId, _snapshot: OrderBookSnapshot, _io: &mut StrategyIo) {}
+    fn on_l2(&mut self, _msg: OrderBookL2Update, _io: &mut StrategyIo) {}
+    fn on_trade(&mut self, _msg: TradeUpdate, _io: &mut StrategyIo) {}
+    fn on_execution(&mut self, _exec: XExecution, _io: &mut StrategyIo) {}
+    fn on_position(
+        &mut self,
+        _account_id: i64,
+        _market_id: i64,
+        _pos: Position,
+        _io: &mut StrategyIo,
+    ) {
+    }
+    fn on_obs(&mut self, _snapshot: OrderBookSnapshot, _io: &mut StrategyIo) {}
     fn on_order_response(&mut self, _resp: OrderResponse, _io: &mut StrategyIo) {}
     fn on_control(&mut self, _c: StrategyControl, _io: &mut StrategyIo) {}
 
@@ -85,8 +114,17 @@ pub struct StrategyRegistrar<'a> {
 }
 
 impl<'a> StrategyRegistrar<'a> {
-    pub fn new(env: &'a dyn AppEnvironment, mailbox_tx: tokio::sync::mpsc::Sender<StrategyMessage>) -> Self {
-        Self { env, mailbox_tx, next_id: 1, pending_subs: Vec::new(), account_params: Vec::new() }
+    pub fn new(
+        env: &'a dyn AppEnvironment,
+        mailbox_tx: tokio::sync::mpsc::Sender<StrategyMessage>,
+    ) -> Self {
+        Self {
+            env,
+            mailbox_tx,
+            next_id: 1,
+            pending_subs: Vec::new(),
+            account_params: Vec::new(),
+        }
     }
 
     pub fn subscribe_l2(&mut self, spec: SubscriptionSpec) -> SubscriptionId {
@@ -120,7 +158,13 @@ impl<'a> StrategyRegistrar<'a> {
         self.account_params.push(params);
     }
 
-    pub fn take_pending(self) -> (tokio::sync::mpsc::Sender<StrategyMessage>, Vec<(SubscriptionId, SubscriptionSpec)>, Vec<BinanceAccountParams>) {
+    pub fn take_pending(
+        self,
+    ) -> (
+        tokio::sync::mpsc::Sender<StrategyMessage>,
+        Vec<(SubscriptionId, SubscriptionSpec)>,
+        Vec<BinanceAccountParams>,
+    ) {
         (self.mailbox_tx, self.pending_subs, self.account_params)
     }
 }
@@ -133,17 +177,21 @@ impl StrategyRunner {
         mut strategy: S,
         ctx: StrategyContext,
         cfg: S::Config,
-    ) -> AppResult<()> where S::Config: serde::Serialize {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<StrategyMessage>(ctx.env.channel_capacity());
+    ) -> AppResult<()>
+    where
+        S::Config: serde::Serialize,
+    {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<StrategyMessage>(ctx.env.channel_capacity());
         let mut registrar = StrategyRegistrar::new(ctx.env.as_ref(), tx);
         strategy.configure(&mut registrar, &ctx, &cfg).await?;
         let (tx, subs, accounts) = registrar.take_pending();
 
         // Build mapping from (stream_type, exchange_id, instrument) -> sub id
-        let mut key_to_subid: HashMap<(CoreStreamType, ExchangeId, String), SubscriptionId> = HashMap::new();
+
         let mut specs: Vec<SubscriptionSpec> = Vec::new();
         for (sid, spec) in subs.into_iter() {
-            key_to_subid.insert((spec.stream_type, spec.exchange, spec.instrument.clone()), sid);
+            // key_to_subid.insert((spec.stream_type, spec.market_id), sid);
             specs.push(spec);
         }
 
@@ -154,40 +202,28 @@ impl StrategyRunner {
             while let Some(sd) = md_rx.recv().await {
                 match sd {
                     StreamData::L2(msg) => {
-                        let key = (CoreStreamType::L2, msg.exchange, msg.ticker.clone());
-                        if let Some(&sid) = key_to_subid.get(&key) {
-                            if let Err(e) = forward_tx.try_send(StrategyMessage::MarketDataL2 { sub: sid, msg }) {
-                                log::warn!("[StrategyRunner] mailbox overflow dropping L2 for {:?}. Error={}", key, e);
-                            }
+                        if let Err(e) = forward_tx.try_send(StrategyMessage::MarketDataL2 { msg }) {
+                            log::warn!(
+                                "[StrategyRunner] mailbox overflow dropping L2 . Error={}",
+                                e
+                            );
                         }
                     }
                     StreamData::Trade(msg) => {
-                        let key = (CoreStreamType::Trade, msg.exchange, msg.ticker.clone());
-                        if let Some(&sid) = key_to_subid.get(&key) {
-                            if let Err(e) = forward_tx.try_send(StrategyMessage::MarketDataTrade { sub: sid, msg }) {
-                                log::warn!("[StrategyRunner] mailbox overflow dropping Trade for {:?}. Error={}", key, e);
-                            }
+                        if let Err(e) =
+                            forward_tx.try_send(StrategyMessage::MarketDataTrade { msg })
+                        {
+                            log::warn!(
+                                "[StrategyRunner] mailbox overflow dropping Trade for  Error={}",
+                                e
+                            );
                         }
                     }
                     StreamData::Obs(snapshot) => {
-                        // For OBS routing, use market_id as key by mapping back to instrument spec key
-                        // Since SubscriptionSpec is keyed by (stream_type, exchange, instrument), and OBS now carries only market_id,
-                        // we route OBS broadly by iterating keys and matching market_id via XMarketId.
-                        // Fast path: try to find a unique sub with same market_id computed from its spec.
-                        let mut routed = false;
-                        for ((stype, ex, instr), sid) in key_to_subid.iter() {
-                            if *stype != CoreStreamType::Obs { continue; }
-                            let mid = crate::xcommons::xmarket_id::XMarketId::make(*ex, instr);
-                            if mid == snapshot.market_id {
-                                if let Err(e) = forward_tx.try_send(StrategyMessage::Obs { sub: *sid, snapshot: snapshot.clone() }) {
-                                    log::warn!("[StrategyRunner] mailbox overflow dropping OBS for market_id={}. Error={}", snapshot.market_id, e);
-                                }
-                                routed = true;
-                                break;
-                            }
-                        }
-                        if !routed {
-                            log::debug!("[StrategyRunner] no OBS subscription found for market_id={}", snapshot.market_id);
+                        if let Err(e) = forward_tx.try_send(StrategyMessage::Obs {
+                            snapshot: snapshot.clone(),
+                        }) {
+                            log::warn!("[StrategyRunner] mailbox overflow dropping OBS for market_id={}. Error={}", snapshot.market_id, e);
                         }
                     }
                 }
@@ -197,22 +233,33 @@ impl StrategyRunner {
         // Emit StrategyStart event with full serialized config (environment-wide, once per process)
         {
             // Init Postgres pool once
-            let db_url = std::env::var("DATABASE_URL")
-                .map_err(|e| crate::xcommons::error::AppError::config(format!("DATABASE_URL missing: {}", e)))?;
-            let cfg_pg: tokio_postgres::Config = db_url
-                .parse()
-                .map_err(|e| crate::xcommons::error::AppError::config(format!("pg url parse: {}", e)))?;
+            let db_url = std::env::var("DATABASE_URL").map_err(|e| {
+                crate::xcommons::error::AppError::config(format!("DATABASE_URL missing: {}", e))
+            })?;
+            let cfg_pg: tokio_postgres::Config = db_url.parse().map_err(|e| {
+                crate::xcommons::error::AppError::config(format!("pg url parse: {}", e))
+            })?;
             let mgr = deadpool_postgres::Manager::from_config(
                 cfg_pg,
                 tokio_postgres::NoTls,
-                deadpool_postgres::ManagerConfig { recycling_method: deadpool_postgres::RecyclingMethod::Fast },
+                deadpool_postgres::ManagerConfig {
+                    recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+                },
             );
-            let pool = deadpool_postgres::Pool::builder(mgr).max_size(4).build().unwrap();
+            let pool = deadpool_postgres::Pool::builder(mgr)
+                .max_size(4)
+                .build()
+                .unwrap();
             let strategy_id: i64 = std::env::var("STRATEGY_ID")
-                .map_err(|e| crate::xcommons::error::AppError::config(format!("STRATEGY_ID missing: {}", e)))?
+                .map_err(|e| {
+                    crate::xcommons::error::AppError::config(format!("STRATEGY_ID missing: {}", e))
+                })?
                 .parse()
-                .map_err(|e| crate::xcommons::error::AppError::config(format!("STRATEGY_ID parse: {}", e)))?;
-            let body = serde_json::to_value(&cfg).unwrap_or(serde_json::json!({"error":"serialize"}));
+                .map_err(|e| {
+                    crate::xcommons::error::AppError::config(format!("STRATEGY_ID parse: {}", e))
+                })?;
+            let body =
+                serde_json::to_value(&cfg).unwrap_or(serde_json::json!({"error":"serialize"}));
             let mut ev = crate::trading::tradelog::build::event_base(
                 crate::trading::tradelog::LogEventType::StrategyStart,
                 "strategy",
@@ -226,29 +273,40 @@ impl StrategyRunner {
         // Start account runners and forward executions/positions into strategy mailbox
         let mut order_txs: HashMap<i64, tokio::sync::mpsc::Sender<OrderRequest>> = HashMap::new();
         if !accounts.is_empty() {
-            use crate::trading::account_state::{AccountState, PostgresExecutionsDatastore};
             use crate::exchanges::binance_account::BinanceFuturesAccountAdapter;
+            use crate::trading::account_state::{AccountState, PostgresExecutionsDatastore};
             use crate::xcommons::xmarket_id::XMarketId;
 
             // Init Postgres pool (use env DATABASE_URL)
-            let db_url = std::env::var("DATABASE_URL")
-                .map_err(|e| crate::xcommons::error::AppError::config(format!("DATABASE_URL missing: {}", e)))?;
-            let cfg_pg: tokio_postgres::Config = db_url
-                .parse()
-                .map_err(|e| crate::xcommons::error::AppError::config(format!("pg url parse: {}", e)))?;
+            let db_url = std::env::var("DATABASE_URL").map_err(|e| {
+                crate::xcommons::error::AppError::config(format!("DATABASE_URL missing: {}", e))
+            })?;
+            let cfg_pg: tokio_postgres::Config = db_url.parse().map_err(|e| {
+                crate::xcommons::error::AppError::config(format!("pg url parse: {}", e))
+            })?;
             let mgr = deadpool_postgres::Manager::from_config(
                 cfg_pg,
                 tokio_postgres::NoTls,
-                deadpool_postgres::ManagerConfig { recycling_method: deadpool_postgres::RecyclingMethod::Fast },
+                deadpool_postgres::ManagerConfig {
+                    recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+                },
             );
-            let pool = deadpool_postgres::Pool::builder(mgr).max_size(16).build().unwrap();
+            let pool = deadpool_postgres::Pool::builder(mgr)
+                .max_size(16)
+                .build()
+                .unwrap();
 
             // Start TradeLog worker for strategy runner using STRATEGY_ID env var (set by strategy configure)
             let strategy_id: i64 = std::env::var("STRATEGY_ID")
-                .map_err(|e| crate::xcommons::error::AppError::config(format!("STRATEGY_ID missing: {}", e)))?
+                .map_err(|e| {
+                    crate::xcommons::error::AppError::config(format!("STRATEGY_ID missing: {}", e))
+                })?
                 .parse()
-                .map_err(|e| crate::xcommons::error::AppError::config(format!("STRATEGY_ID parse: {}", e)))?;
-            let tradelog = crate::trading::tradelog::TradeLogService::start(pool.clone(), strategy_id);
+                .map_err(|e| {
+                    crate::xcommons::error::AppError::config(format!("STRATEGY_ID parse: {}", e))
+                })?;
+            let tradelog =
+                crate::trading::tradelog::TradeLogService::start(pool.clone(), strategy_id);
 
             for params in accounts.into_iter() {
                 let adapter = std::sync::Arc::new(BinanceFuturesAccountAdapter::new(
@@ -260,7 +318,9 @@ impl StrategyRunner {
                     Some(tradelog.clone()),
                 ));
                 let rec_mode = match params.recovery_mode.as_deref() {
-                    Some("exit") | Some("Exit") => crate::trading::account_state::RecoveryMode::Exit,
+                    Some("exit") | Some("Exit") => {
+                        crate::trading::account_state::RecoveryMode::Exit
+                    }
                     _ => crate::trading::account_state::RecoveryMode::Restore,
                 };
                 for symbol in params.symbols.iter().cloned() {
@@ -298,9 +358,9 @@ impl StrategyRunner {
                                     res = exec_rx.recv(), if exec_open => {
                                         match res {
                                             Ok(exec) => {
-                                                if ftx.send(StrategyMessage::Execution { account_id, exec: exec.clone() }).await.is_err() {
+                                                if ftx.send(StrategyMessage::Execution { exec: exec.clone() }).await.is_err() {
                                                     log::warn!("[StrategyRunner] dropping execution: mailbox closed");
-                                                } 
+                                                }
                                             }
                                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                                 log::warn!("[StrategyRunner] exec_rx lagged, skipped {} messages", skipped);
@@ -315,7 +375,7 @@ impl StrategyRunner {
                                             Ok((mid, pos)) => {
                                                 if ftx.send(StrategyMessage::Position { account_id, market_id: mid, pos: pos.clone() }).await.is_err() {
                                                     log::warn!("[StrategyRunner] dropping position: mailbox closed (market_id={})", mid);
-                                                } 
+                                                }
                                             }
                                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                                 log::warn!("[StrategyRunner] pos_rx lagged, skipped {} messages", skipped);
@@ -344,7 +404,9 @@ impl StrategyRunner {
                                     }
                                     else => break,
                                 }
-                                if !exec_open && !pos_open && !resp_open { break; }
+                                if !exec_open && !pos_open && !resp_open {
+                                    break;
+                                }
                             }
                         });
                         // Bridge order requests to exchange adapter API; spawn per-request to allow concurrency
@@ -357,16 +419,24 @@ impl StrategyRunner {
                                 tokio::spawn(async move {
                                     match adapter_req.send_request(req).await {
                                         Ok(resp) => {
-                                            if let Err(e) = ftx2.try_send(StrategyMessage::OrderResponse(resp)) {
+                                            if let Err(e) =
+                                                ftx2.try_send(StrategyMessage::OrderResponse(resp))
+                                            {
                                                 log::warn!("[StrategyRunner] mailbox overflow dropping OrderResponse. Error={}", e);
                                             }
                                         }
                                         Err(e) => {
                                             use crate::xcommons::oms::OrderResponseStatus;
                                             let (req_id, cl_opt) = match req_copy {
-                                                crate::xcommons::oms::OrderRequest::Post(p) => (p.req_id, Some(p.cl_ord_id)),
-                                                crate::xcommons::oms::OrderRequest::Cancel(c) => (c.req_id, c.cl_ord_id),
-                                                crate::xcommons::oms::OrderRequest::CancelAll(a) => (a.req_id, None),
+                                                crate::xcommons::oms::OrderRequest::Post(p) => {
+                                                    (p.req_id, Some(p.cl_ord_id))
+                                                }
+                                                crate::xcommons::oms::OrderRequest::Cancel(c) => {
+                                                    (c.req_id, c.cl_ord_id)
+                                                }
+                                                crate::xcommons::oms::OrderRequest::CancelAll(
+                                                    a,
+                                                ) => (a.req_id, None),
                                             };
                                             let now = crate::xcommons::types::time::now_micros();
                                             let fail = crate::xcommons::oms::OrderResponse {
@@ -379,14 +449,22 @@ impl StrategyRunner {
                                                 exec: None,
                                             };
                                             log::error!("[StrategyRunner] send_request error for {}: {} (broadcasting failure)", market_id, e);
-                                            let _ = ftx2.try_send(StrategyMessage::OrderResponse(fail));
+                                            let _ =
+                                                ftx2.try_send(StrategyMessage::OrderResponse(fail));
                                         }
                                     }
                                 });
                             }
                         });
-                        if let Err(e) = account.run_market(market_id, start_epoch_ts, fee_bps, contract_size).await {
-                            log::error!("[StrategyRunner] run_market error for {}: {} (exiting)", symbol, e);
+                        if let Err(e) = account
+                            .run_market(market_id, start_epoch_ts, fee_bps, contract_size)
+                            .await
+                        {
+                            log::error!(
+                                "[StrategyRunner] run_market error for {}: {} (exiting)",
+                                symbol,
+                                e
+                            );
                             // Fatal on initialization failure
                             std::process::exit(1);
                         }
@@ -396,11 +474,24 @@ impl StrategyRunner {
         }
 
         // Single-threaded dispatch loop with mailbox draining and deferred updates
-        let mut io = StrategyIo { env: ctx.env.as_ref(), order_txs, update_scheduled: false };
+        let mut io = StrategyIo {
+            env: ctx.env.as_ref(),
+            order_txs,
+            update_scheduled: false,
+        };
         // Circuit breaker for repeated order errors (system-level guard)
-        let order_error_threshold: u32 = std::env::var("ORDER_ERROR_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
-        let order_error_timeout_secs: u64 = std::env::var("ORDER_ERROR_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
-        let order_error_breaker = CircuitBreaker::new(order_error_threshold, Duration::from_secs(order_error_timeout_secs));
+        let order_error_threshold: u32 = std::env::var("ORDER_ERROR_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        let order_error_timeout_secs: u64 = std::env::var("ORDER_ERROR_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        let order_error_breaker = CircuitBreaker::new(
+            order_error_threshold,
+            Duration::from_secs(order_error_timeout_secs),
+        );
         // Warn on every benign failure (no rate limiting)
         loop {
             let first = match rx.recv().await {
@@ -410,19 +501,23 @@ impl StrategyRunner {
 
             let mut handle_msg = |msg: StrategyMessage| {
                 match msg {
-                    StrategyMessage::MarketDataL2 { sub, msg } => strategy.on_l2(sub, msg, &mut io),
-                    StrategyMessage::MarketDataTrade { sub, msg } => strategy.on_trade(sub, msg, &mut io),
-                    StrategyMessage::Execution { account_id, exec } => {
+                    StrategyMessage::MarketDataL2 { msg } => strategy.on_l2(msg, &mut io),
+                    StrategyMessage::MarketDataTrade { msg } => strategy.on_trade(msg, &mut io),
+                    StrategyMessage::Execution { exec } => {
                         if exec.exec_type == crate::xcommons::oms::ExecutionType::XOrderRejected {
                             log::warn!(
                                 "[StrategyRunner] benign execution: XOrderRejected (cl_ord_id={}, native_ord_id={})",
                                 exec.cl_ord_id, exec.native_ord_id
                             );
                         }
-                        strategy.on_execution(account_id, exec, &mut io)
-                    },
-                    StrategyMessage::Position { account_id, market_id, pos } => strategy.on_position(account_id, market_id, pos, &mut io),
-                    StrategyMessage::Obs { sub, snapshot } => strategy.on_obs(sub, snapshot, &mut io),
+                        strategy.on_execution(exec, &mut io)
+                    }
+                    StrategyMessage::Position {
+                        account_id,
+                        market_id,
+                        pos,
+                    } => strategy.on_position(account_id, market_id, pos, &mut io),
+                    StrategyMessage::Obs { snapshot } => strategy.on_obs(snapshot, &mut io),
                     StrategyMessage::OrderResponse(r) => {
                         // Forward to strategy first
                         let status = r.status;
@@ -450,15 +545,24 @@ impl StrategyRunner {
                                 order_error_breaker.record_failure();
                                 let cnt = order_error_breaker.failure_count();
                                 let thr = order_error_threshold;
-                                log::error!("[StrategyRunner] order error recorded (count={}/{}).", cnt, thr);
-                                if order_error_breaker.state() == crate::xcommons::circuit_breaker::CircuitState::Open {
-                                    log::error!("[StrategyRunner] too many order errors (>= {}). Exiting.", thr);
+                                log::error!(
+                                    "[StrategyRunner] order error recorded (count={}/{}).",
+                                    cnt,
+                                    thr
+                                );
+                                if order_error_breaker.state()
+                                    == crate::xcommons::circuit_breaker::CircuitState::Open
+                                {
+                                    log::error!(
+                                        "[StrategyRunner] too many order errors (>= {}). Exiting.",
+                                        thr
+                                    );
                                     std::process::exit(2);
                                 }
                             }
                             _ => {}
                         }
-                    },
+                    }
                     StrategyMessage::Control(c) => strategy.on_control(c, &mut io),
                 }
             };

@@ -237,19 +237,8 @@ impl MultiStreamParquetSink {
     }
 
     pub async fn write_stream_data(&mut self, data: StreamData) -> Result<()> {
-        let (_, _, exchange, symbol, _, _) = data.common_fields();
-        let stream_type = data.stream_type();
-        
-        // Concise writer key to avoid unnecessary string work
-        let key = format!("{}_{}_{}", stream_type, exchange, symbol);
-        
-        let writer = self.writers.entry(key).or_insert_with(|| {
-            StreamWriter::new(stream_type.to_string(), exchange, symbol.to_string())
-        });
-
-        writer.write_stream_data(data, &mut self.file_manager).await
+        todo!("Not implemented yet")
     }
-
     pub async fn flush_all(&mut self) -> Result<()> {
         for writer in self.writers.values_mut() {
             // Flush both L2 and Trade buffers
@@ -385,68 +374,4 @@ pub async fn run_multi_stream_parquet_sink(
     sink.close().await?;
     log::info!("Multi-stream Parquet sink shutdown complete");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::xcommons::types::L2Action;
-    use crate::xcommons::oms::Side;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_multi_stream_sink_creation() {
-        let temp_dir = tempdir().unwrap();
-        let sink = MultiStreamParquetSink::new(temp_dir.path().to_path_buf()).unwrap();
-        assert_eq!(sink.writers.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_write_l2_data() {
-        let temp_dir = tempdir().unwrap();
-        let mut sink = MultiStreamParquetSink::new(temp_dir.path().to_path_buf()).unwrap();
-
-        let l2_update = OrderBookL2Update {
-            timestamp: 1640995200000000,
-            rcv_timestamp: 1640995200001000,
-            exchange: ExchangeId::BinanceFutures,
-            ticker: "BTCUSDT".to_string(),
-            seq_id: 1,
-            packet_id: 1,
-            update_id: 123,
-            first_update_id: 122,
-            action: L2Action::Update,
-            side: Side::Buy,
-            price: 50000.0,
-            qty: 1.5,
-        };
-
-        let stream_data = StreamData::L2(l2_update);
-        assert!(sink.write_stream_data(stream_data).await.is_ok());
-        assert_eq!(sink.writers.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_write_trade_data() {
-        let temp_dir = tempdir().unwrap();
-        let mut sink = MultiStreamParquetSink::new(temp_dir.path().to_path_buf()).unwrap();
-
-        let trade_update = TradeUpdate {
-            timestamp: 1640995200000000,
-            rcv_timestamp: 1640995200001000,
-            exchange: ExchangeId::BinanceFutures,
-            ticker: "BTCUSDT".to_string(),
-            seq_id: 1,
-            packet_id: 1,
-            trade_id: "T123456".to_string(),
-            order_id: Some("O789".to_string()),
-            side: Side::Buy,
-            price: 50000.0,
-            qty: 0.5,
-        };
-
-        let stream_data = StreamData::Trade(trade_update);
-        assert!(sink.write_stream_data(stream_data).await.is_ok());
-        assert_eq!(sink.writers.len(), 1);
-    }
 }

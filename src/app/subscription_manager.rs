@@ -35,9 +35,10 @@ impl SubscriptionManager {
                     let bids = ob.top_bids(10);
                     let asks = ob.top_asks(10);
                     let snapshot = OrderBookSnapshot {
-                        market_id: crate::xcommons::xmarket_id::XMarketId::make(u.exchange, &u.ticker),
+                        market_id: u.market_id,
                         last_update_id: u.update_id,
                         timestamp: u.timestamp,
+                        rcv_timestamp: u.rcv_timestamp,
                         sequence: u.seq_id,
                         bids,
                         asks,

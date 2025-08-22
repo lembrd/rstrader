@@ -1,21 +1,21 @@
 #![allow(dead_code)]
+
+use std::hash::{Hash, Hasher};
+use crate::xcommons::oms::{self, Side};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use crate::xcommons::oms;
 use std::time::SystemTime;
 
 /// Unified data structure for L2 order book updates
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBookL2Update {
     // Common fields (as per project specification)
-    pub timestamp: i64,       // Exchange timestamp (microseconds UTC)
-    pub rcv_timestamp: i64,   // Local receive timestamp (microseconds UTC)
+    pub timestamp: i64,     // Exchange timestamp (microseconds UTC)
+    pub rcv_timestamp: i64, // Local receive timestamp (microseconds UTC)
     /// Unified market id for quick matching; prefer this in new code
     pub market_id: i64,
-    pub exchange: ExchangeId, // Exchange identifier
-    pub ticker: String,       // Instrument symbol (e.g., "BTCUSDT")
-    pub seq_id: i64,          // Local monotonic sequence ID
-    pub packet_id: i64,       // Network packet grouping ID
+    pub seq_id: i64,    // Local monotonic sequence ID
+    pub packet_id: i64, // Network packet grouping ID
 
     // L2 specific fields
     pub update_id: i64,       // Exchange-specific update ID (Binance lastUpdateId)
@@ -24,95 +24,88 @@ pub struct OrderBookL2Update {
     pub side: oms::Side,      // BUY (bid) / SELL (ask)
     pub price: f64,           // Price level
     pub qty: f64,             // Quantity (0 = delete level)
+
+
+}
+impl Hash for OrderBookL2Update {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.timestamp.hash(state);
+        self.market_id.hash(state);
+        self.update_id.hash(state);
+        self.first_update_id.hash(state);
+        self.action.hash(state);
+        self.side.hash(state);
+
+        let h_price1 = (self.price * 1e9).round() as i64;
+        let h_price2 = (self.price * 1e9).round() as i64;
+        let h_qty1 = (self.qty * 1e-3).round() as i64;
+        let h_qty2 = (self.qty * 1e-3).round() as i64;
+
+        h_price1.hash(state);
+        h_price2.hash(state);
+        h_qty1.hash(state);
+        h_qty2.hash(state);
+    }
 }
 
 /// Builder for OrderBookL2Update to eliminate code duplication
-pub struct OrderBookL2UpdateBuilder {
-    timestamp: i64,
-    rcv_timestamp: i64,
-    exchange: ExchangeId,
-    ticker: String,
-    seq_id: i64,
-    packet_id: i64,
-    update_id: i64,
-    first_update_id: i64,
-}
+// pub struct OrderBookL2UpdateBuilder {
+//     timestamp: i64,
+//     rcv_timestamp: i64,
+//     market_id: i64,
+//     seq_id: i64,
+//     packet_id: i64,
+//     update_id: i64,
+//     first_update_id: i64,
+// }
 
-impl OrderBookL2UpdateBuilder {
-    /// Create a new builder with required common fields
-    pub fn new(
-        timestamp: i64,
-        rcv_timestamp: i64,
-        exchange: ExchangeId,
-        ticker: String,
-        seq_id: i64,
-        packet_id: i64,
-        update_id: i64,
-        first_update_id: i64,
-    ) -> Self {
-        Self {
-            timestamp,
-            rcv_timestamp,
-            exchange,
-            ticker,
-            seq_id,
-            packet_id,
-            update_id,
-            first_update_id,
-        }
-    }
+// impl OrderBookL2UpdateBuilder {
+//     /// Create a new builder with required common fields
+//     pub fn new(
+//         timestamp: i64,
+//         rcv_timestamp: i64,
+//         market_id: i64,
+//         seq_id: i64,
+//         packet_id: i64,
+//         update_id: i64,
+//         first_update_id: i64,
+//     ) -> Self {
+//         Self {
+//             timestamp,
+//             rcv_timestamp,
+//             market_id: market_id,
+//             seq_id,
+//             packet_id,
+//             update_id: update_id,
+//             first_update_id: first_update_id,
+//         }
+//     }
 
-    /// Build a bid update
-    pub fn build_bid(self, price: f64, qty: f64) -> OrderBookL2Update {
-        let market_id = crate::xcommons::xmarket_id::XMarketId::make(self.exchange, &self.ticker);
-        OrderBookL2Update {
-            timestamp: self.timestamp,
-            rcv_timestamp: self.rcv_timestamp,
-            market_id,
-            exchange: self.exchange,
-            ticker: self.ticker,
-            seq_id: self.seq_id,
-            packet_id: self.packet_id,
-            update_id: self.update_id,
-            first_update_id: self.first_update_id,
-            action: if qty == 0.0 {
-                L2Action::Delete
-            } else {
-                L2Action::Update
-            },
-            side: oms::Side::Buy,
-            price,
-            qty,
-        }
-    }
+//     pub fn build_side(self, price: f64, qty: f64, side:Side) -> OrderBookL2Update {
 
-    /// Build an ask update
-    pub fn build_ask(self, price: f64, qty: f64) -> OrderBookL2Update {
-        let market_id = crate::xcommons::xmarket_id::XMarketId::make(self.exchange, &self.ticker);
-        OrderBookL2Update {
-            timestamp: self.timestamp,
-            rcv_timestamp: self.rcv_timestamp,
-            market_id,
-            exchange: self.exchange,
-            ticker: self.ticker,
-            seq_id: self.seq_id,
-            packet_id: self.packet_id,
-            update_id: self.update_id,
-            first_update_id: self.first_update_id,
-            action: if qty == 0.0 {
-                L2Action::Delete
-            } else {
-                L2Action::Update
-            },
-            side: oms::Side::Sell,
-            price,
-            qty,
-        }
-    }
-}
+//         OrderBookL2Update {
+//             timestamp: self.timestamp,
+//             rcv_timestamp: self.rcv_timestamp,
+//             market_id: self.market_id,
+//             seq_id: self.seq_id,
+//             packet_id: self.packet_id,
+//             update_id: self.update_id,
+//             first_update_id: self.first_update_id,
+//             action: if qty == 0.0 {
+//                 L2Action::Delete
+//             } else {
+//                 L2Action::Update
+//             },
+//             side: side,
+//             price,
+//             qty,
+//         }
+//     }
+
+// }
 
 /// L2 order book action types
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Hash)]
 pub enum L2Action {
     Update = 1,
     Delete = 2,
@@ -120,81 +113,95 @@ pub enum L2Action {
 /// Trade update data structure for trade stream types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeUpdate {
-    // Common fields (matching L2 structure)
-    pub timestamp: i64,       // Exchange timestamp (microseconds UTC)
-    pub rcv_timestamp: i64,   // Local receive timestamp (microseconds UTC)
-    pub exchange: ExchangeId, // Exchange identifier
-    pub ticker: String,       // Instrument symbol (e.g., "BTCUSDT")
-    pub seq_id: i64,          // Local monotonic sequence ID
-    pub packet_id: i64,       // Network packet grouping ID
+    pub timestamp: i64,     // Exchange timestamp (microseconds UTC)
+    pub rcv_timestamp: i64, // Local receive timestamp (microseconds UTC)
 
-    // Trade specific fields
-    pub trade_id: String,     // Exchange-specific trade ID
-    pub order_id: Option<String>, // Order ID if available
-    pub side: oms::Side,      // BUY/SELL/UNKNOWN (direction of taker)
-    pub price: f64,           // Trade execution price
-    pub qty: f64,             // Trade quantity
+    pub market_id: i64,
+
+    pub seq_id: i64,    // Local monotonic sequence ID
+    pub packet_id: i64, // Network packet grouping ID
+
+    pub trade_id: String, // Exchange-specific trade ID
+    pub side: Side,       // BUY/SELL/UNKNOWN (direction of taker)
+    pub price: f64,       // Trade execution price
+    pub qty: f64,         // Trade quantity
+}
+
+impl Hash for TradeUpdate {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.timestamp.hash(state);
+        self.market_id.hash(state);
+
+        self.trade_id.hash(state);
+        self.side.hash(state);
+
+        let h_price1 = (self.price * 1e9).round() as i64;
+        let h_price2 = (self.price * 1e9).round() as i64;
+        let h_qty1 = (self.qty * 1e-3).round() as i64;
+        let h_qty2 = (self.qty * 1e-3).round() as i64;
+
+        h_price1.hash(state);
+        h_price2.hash(state);
+        h_qty1.hash(state);
+        h_qty2.hash(state);
+    }
 }
 
 // TradeSide unified into crate::oms::Side
 
 /// Builder for TradeUpdate to maintain consistency with L2 pattern
-pub struct TradeUpdateBuilder {
-    timestamp: i64,
-    rcv_timestamp: i64,
-    exchange: ExchangeId,
-    ticker: String,
-    seq_id: i64,
-    packet_id: i64,
-    trade_id: String,
-    order_id: Option<String>,
-}
+// pub struct TradeUpdateBuilder {
+//     timestamp: i64,
+//     rcv_timestamp: i64,
+//     market_id: i64,
+//     seq_id: i64,
+//     packet_id: i64,
+//     trade_id: String,
+// }
 
-impl TradeUpdateBuilder {
-    /// Create a new trade builder with required common fields
-    pub fn new(
-        timestamp: i64,
-        rcv_timestamp: i64,
-        exchange: ExchangeId,
-        ticker: String,
-        seq_id: i64,
-        packet_id: i64,
-        trade_id: String,
-        order_id: Option<String>,
-    ) -> Self {
-        Self {
-            timestamp,
-            rcv_timestamp,
-            exchange,
-            ticker,
-            seq_id,
-            packet_id,
-            trade_id,
-            order_id,
-        }
-    }
+// impl TradeUpdateBuilder {
+//     /// Create a new trade builder with required common fields
+//     pub fn new(
+//         timestamp: i64,
+//         rcv_timestamp: i64,
+//         market_id: i64,
+//         seq_id: i64,
+//         packet_id: i64,
+//         trade_id: String,
+//     ) -> Self {
+//         Self {
+//             timestamp,
+//             rcv_timestamp,
+//             market_id,
+//             seq_id,
+//             packet_id,
+//             trade_id,
+//         }
+//     }
 
-    /// Build a trade update
-    pub fn build(self, side: oms::Side, price: f64, qty: f64, _is_buyer_maker: bool) -> TradeUpdate {
-        TradeUpdate {
-            timestamp: self.timestamp,
-            rcv_timestamp: self.rcv_timestamp,
-            exchange: self.exchange,
-            ticker: self.ticker,
-            seq_id: self.seq_id,
-            packet_id: self.packet_id,
-            trade_id: self.trade_id,
-            order_id: self.order_id,
-            side,
-            price,
-            qty,
-        }
-    }
-}
+//     /// Build a trade update
+//     pub fn build(self, side: oms::Side, price: f64, qty: f64, _is_buyer_maker: bool) -> TradeUpdate {
+//         TradeUpdate {
+//             timestamp: self.timestamp,
+//             rcv_timestamp: self.rcv_timestamp,
+//             market_id: self.market_id,
+//             seq_id: self.seq_id,
+//             packet_id: self.packet_id,
+//             trade_id: self.trade_id,
+//             side,
+//             price,
+//             qty,
+//         }
+//     }
+// }
 
 /// Enum to identify stream types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
-pub enum StreamType { L2, Trade, Obs }
+pub enum StreamType {
+    L2,
+    Trade,
+    Obs,
+}
 /// Unified enum for different stream data types
 #[derive(Debug, Clone)]
 pub enum StreamData {
@@ -214,30 +221,26 @@ impl StreamData {
     }
 
     /// Get common fields for any stream type
-    pub fn common_fields(&self) -> (i64, i64, ExchangeId, &str, i64, i64) {
+    pub fn common_fields(&self) -> (i64, i64, i64, i64, i64) {
         match self {
             StreamData::L2(update) => (
                 update.timestamp,
                 update.rcv_timestamp,
-                update.exchange,
-                &update.ticker,
+                update.market_id,
                 update.seq_id,
                 update.packet_id,
             ),
             StreamData::Trade(update) => (
                 update.timestamp,
                 update.rcv_timestamp,
-                update.exchange,
-                &update.ticker,
+                update.market_id,
                 update.seq_id,
                 update.packet_id,
             ),
             StreamData::Obs(snapshot) => (
                 snapshot.timestamp,
-                snapshot.timestamp,
-                // Derive exchange id from market id high 8 bits
-                unsafe { std::mem::transmute::<u8, ExchangeId>(((snapshot.market_id as u64) >> 56) as u8) },
-                "",
+                snapshot.rcv_timestamp,
+                snapshot.market_id,
                 snapshot.sequence,
                 0,
             ),
@@ -252,7 +255,10 @@ impl FromStr for StreamType {
             "L2" => Ok(StreamType::L2),
             "TRADES" | "TRADE" => Ok(StreamType::Trade),
             "OBS" => Ok(StreamType::Obs),
-            other => Err(format!("Invalid stream type '{}'. Supported: L2, TRADES", other)),
+            other => Err(format!(
+                "Invalid stream type '{}'. Supported: L2, TRADES",
+                other
+            )),
         }
     }
 }
@@ -285,7 +291,10 @@ impl FromStr for ExchangeId {
             "OKX_SWAP" => Ok(ExchangeId::OkxSwap),
             "OKX_SPOT" => Ok(ExchangeId::OkxSpot),
             "DERIBIT" => Ok(ExchangeId::Deribit),
-            other => Err(format!("Invalid exchange '{}'. Supported: BINANCE_FUTURES, OKX_SWAP, OKX_SPOT, DERIBIT", other)),
+            other => Err(format!(
+                "Invalid exchange '{}'. Supported: BINANCE_FUTURES, OKX_SWAP, OKX_SPOT, DERIBIT",
+                other
+            )),
         }
     }
 }
@@ -297,18 +306,29 @@ pub struct SubscriptionSpec {
     pub exchange: ExchangeId,
     pub instrument: String,
     pub max_connections: Option<usize>,
+    pub market_id: i64,
 }
 
 impl SubscriptionSpec {
     /// Parse subscription format: stream_type:exchange@instrument[connections]
     pub fn parse(input: &str) -> Result<Self, String> {
         let parts: Vec<&str> = input.split(':').collect();
-        if parts.len() != 2 { return Err(format!("Invalid format '{}'. Expected 'stream_type:exchange@instrument[connections]'", input)); }
+        if parts.len() != 2 {
+            return Err(format!(
+                "Invalid format '{}'. Expected 'stream_type:exchange@instrument[connections]'",
+                input
+            ));
+        }
 
         let stream_type = StreamType::from_str(parts[0])?;
         let exchange_instrument = parts[1];
         let ex_parts: Vec<&str> = exchange_instrument.split('@').collect();
-        if ex_parts.len() != 2 { return Err(format!("Invalid format '{}'. Expected 'exchange@instrument' after ':'", exchange_instrument)); }
+        if ex_parts.len() != 2 {
+            return Err(format!(
+                "Invalid format '{}'. Expected 'exchange@instrument' after ':'",
+                exchange_instrument
+            ));
+        }
         let exchange = ExchangeId::from_str(ex_parts[0])?;
         let instrument_raw = ex_parts[1].trim();
 
@@ -316,26 +336,52 @@ impl SubscriptionSpec {
             if instrument_raw.ends_with(']') {
                 let base = &instrument_raw[..idx];
                 let inside = &instrument_raw[idx + 1..instrument_raw.len() - 1];
-                if base.is_empty() { return Err("Instrument cannot be empty".to_string()); }
-                let n: usize = inside.parse().map_err(|_| format!("Invalid connections value '{}' in '{}'", inside, input))?;
-                if n == 0 { return Err("Connections value must be > 0".to_string()); }
+                if base.is_empty() {
+                    return Err("Instrument cannot be empty".to_string());
+                }
+                let n: usize = inside.parse().map_err(|_| {
+                    format!("Invalid connections value '{}' in '{}'", inside, input)
+                })?;
+                if n == 0 {
+                    return Err("Connections value must be > 0".to_string());
+                }
                 (base.to_string(), Some(n))
-            } else { (instrument_raw.to_string(), None) }
-        } else { (instrument_raw.to_string(), None) };
+            } else {
+                (instrument_raw.to_string(), None)
+            }
+        } else {
+            (instrument_raw.to_string(), None)
+        };
 
-        if instrument.is_empty() { return Err("Instrument cannot be empty".to_string()); }
+        if instrument.is_empty() {
+            return Err("Instrument cannot be empty".to_string());
+        }
 
-        Ok(SubscriptionSpec { stream_type, exchange, instrument, max_connections })
+        let xmarket_id = crate::xcommons::xmarket_id::XMarketId::make(exchange, &instrument);
+
+        Ok(SubscriptionSpec {
+            stream_type,
+            exchange,
+            instrument,
+            max_connections,
+            market_id: xmarket_id,
+        })
     }
 
     pub fn parse_multiple(input: &str) -> Result<Vec<Self>, String> {
-        if input.trim().is_empty() { return Err("Subscriptions string cannot be empty".to_string()); }
+        if input.trim().is_empty() {
+            return Err("Subscriptions string cannot be empty".to_string());
+        }
         let mut v = Vec::new();
         for s in input.split(',') {
             let t = s.trim();
-            if !t.is_empty() { v.push(Self::parse(t)?); }
+            if !t.is_empty() {
+                v.push(Self::parse(t)?);
+            }
         }
-        if v.is_empty() { return Err("No valid subscriptions found".to_string()); }
+        if v.is_empty() {
+            return Err("No valid subscriptions found".to_string());
+        }
         Ok(v)
     }
 }
@@ -368,16 +414,16 @@ pub enum ConnectionStatus {
 pub struct RawMessage {
     pub exchange_id: ExchangeId,
     pub data: Vec<u8>,
-    pub timestamp: SystemTime,
+    pub rcv_timestamp: i64,
 }
 
 /// Order book snapshot from REST API (compact; uses integer market id)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBookSnapshot {
-    /// Unified market id ([exchange:8][symbol_hash:56])
     pub market_id: i64,
     pub last_update_id: i64,
     pub timestamp: i64,
+    pub rcv_timestamp: i64,
     pub sequence: i64,
     pub bids: Vec<PriceLevel>,
     pub asks: Vec<PriceLevel>,
@@ -479,11 +525,15 @@ impl Metrics {
             transform_time_count: 0,
             overhead_time_count: 0,
             packet_count: 0,
-            latency_histograms: crate::metrics::LatencyHistograms::new(crate::metrics::HistogramBounds::default()),
+            latency_histograms: crate::metrics::LatencyHistograms::new(
+                crate::metrics::HistogramBounds::default(),
+            ),
         }
     }
 
-    pub fn enable_histograms(&mut self, _bounds: crate::metrics::HistogramBounds) { /* no-op */ }
+    pub fn enable_histograms(&mut self, _bounds: crate::metrics::HistogramBounds) {
+        /* no-op */
+    }
 
     pub fn increment_received(&mut self) {
         self.messages_received += 1;
@@ -556,7 +606,8 @@ impl Metrics {
             None => self.avg_transform_time_us = Some(transform_time_us as f64),
         }
 
-        self.latency_histograms.record_transform_time(transform_time_us);
+        self.latency_histograms
+            .record_transform_time(transform_time_us);
     }
 
     pub fn update_overhead_time(&mut self, overhead_time_us: u64) {
@@ -570,7 +621,8 @@ impl Metrics {
             None => self.avg_overhead_time_us = Some(overhead_time_us as f64),
         }
 
-        self.latency_histograms.record_overhead_time(overhead_time_us);
+        self.latency_histograms
+            .record_overhead_time(overhead_time_us);
     }
 
     pub fn update_message_complexity(

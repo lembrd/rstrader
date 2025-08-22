@@ -2,19 +2,22 @@
 use tokio::sync::mpsc;
 
 use crate::xcommons::error::{AppError, Result};
-use crate::xcommons::types::{Metrics, OrderBookL2Update, RawMessage, time};
-// Exchange-specific processors now implement ExchangeProcessor trait
+use crate::xcommons::types::{time, Metrics, OrderBookL2Update, RawMessage};
+
 use crate::xcommons::types::ExchangeId;
 
 /// Stream processor for transforming raw messages to unified format
 /// Now uses trait-based architecture for exchange-specific processing
 pub struct StreamProcessor {
-    processor: Box<dyn crate::exchanges::ExchangeProcessor<Error = crate::xcommons::error::AppError>>,
+    processor:
+        Box<dyn crate::exchanges::ExchangeProcessor<Error = crate::xcommons::error::AppError>>,
 }
 
 impl StreamProcessor {
     pub fn new(
-        processor: Box<dyn crate::exchanges::ExchangeProcessor<Error = crate::xcommons::error::AppError>>,
+        processor: Box<
+            dyn crate::exchanges::ExchangeProcessor<Error = crate::xcommons::error::AppError>,
+        >,
     ) -> Self {
         Self { processor }
     }
@@ -30,13 +33,9 @@ impl StreamProcessor {
         let message_bytes = raw_msg.data.len() as u32;
 
         // Delegate to exchange-specific processor
-        let updates = self.processor.process_message(
-            raw_msg,
-            symbol,
-            rcv_timestamp,
-            packet_id,
-            message_bytes,
-        )?;
+        let updates = self
+            .processor
+            .process_message(raw_msg, symbol, packet_id, message_bytes)?;
 
         Ok(updates)
     }
@@ -96,9 +95,20 @@ impl MetricsReporter {
             );
 
             // Publish updated snapshot and per-stream latencies via universal helper (sink-agnostic)
-            let exchange_lbl = match self.exchange { Some(e) => e, None => ExchangeId::BinanceFutures };
-            let stream_lbl = self.stream_type.clone().unwrap_or_else(|| "Unknown".to_string());
-            crate::metrics::publish_stream_metrics(&stream_lbl, exchange_lbl, &self.symbol, metrics);
+            let exchange_lbl = match self.exchange {
+                Some(e) => e,
+                None => ExchangeId::BinanceFutures,
+            };
+            let stream_lbl = self
+                .stream_type
+                .clone()
+                .unwrap_or_else(|| "Unknown".to_string());
+            crate::metrics::publish_stream_metrics(
+                &stream_lbl,
+                exchange_lbl,
+                &self.symbol,
+                metrics,
+            );
             self.last_report = std::time::Instant::now();
         }
     }
@@ -176,7 +186,10 @@ mod tests {
         // Basic sanity check - processor should be created successfully
         // Basic sanity check - processor should be created successfully
         // Basic sanity check - processor should be created successfully
-        assert_eq!(processor.metrics().messages_processed, processor.metrics().messages_processed);
+        assert_eq!(
+            processor.metrics().messages_processed,
+            processor.metrics().messages_processed
+        );
     }
 
     #[test]

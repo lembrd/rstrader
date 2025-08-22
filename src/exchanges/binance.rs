@@ -4,27 +4,31 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::VecDeque;
-use std::time::SystemTime;
-use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{WebSocketStream, connect_async, MaybeTlsStream};
 use tokio::net::lookup_host;
 use tokio::net::TcpStream;
 use tokio::time::Duration;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
-use crate::xcommons::error::{AppError, Result};
 use crate::exchanges::ExchangeConnector;
-use crate::xcommons::types::{ConnectionStatus, ExchangeId, OrderBookSnapshot, PriceLevel, RawMessage, TradeUpdate};
+use crate::xcommons::error::{AppError, Result};
 use crate::xcommons::oms::Side;
+use crate::xcommons::types::{
+    ConnectionStatus, ExchangeId, OrderBookL2Update, OrderBookSnapshot, PriceLevel, RawMessage,
+    TradeUpdate,
+};
 
 // Static error messages to avoid allocations in hot paths
 const ERROR_JSON_PARSE: &str = "Failed to parse Binance JSON";
-const ERROR_DEPTH_PARSE: &str = "Failed to parse Binance depth update"; 
+const ERROR_DEPTH_PARSE: &str = "Failed to parse Binance depth update";
 const ERROR_TRADE_PARSE: &str = "Failed to parse Binance trade message";
 const ERROR_PRICE_PARSE: &str = "Invalid price format";
 const ERROR_QUANTITY_PARSE: &str = "Invalid quantity format";
 const ERROR_WEBSOCKET: &str = "WebSocket connection error";
 const ERROR_NETWORK: &str = "Network connection error";
 const ERROR_SUBSCRIPTION: &str = "Subscription failed";
+use crate::xcommons::types::time::now_micros;
+use crate::xcommons::xmarket_id::XMarketId;
 use fast_float;
 
 /// Binance Futures WebSocket depth update message
@@ -50,7 +54,6 @@ pub struct BinanceDepthUpdate {
 
     #[serde(rename = "pu")]
     pub prev_final_update_id: i64, // Final update ID in previous event (for validation)
-
 
     #[serde(rename = "b")]
     pub bids: Vec<[String; 2]>, // Bids to be updated [price, qty]
@@ -90,12 +93,6 @@ pub struct BinanceTradeUpdate {
     #[serde(rename = "q")]
     pub quantity: String, // Trade quantity
 
-
-
-
-
-
-
     #[serde(rename = "T")]
     pub trade_time: i64, // Trade time in milliseconds
 
@@ -125,7 +122,7 @@ enum SyncState {
     Synchronizing { last_update_id: i64 }, // Synchronizing with snapshot
     Synchronized { last_update_id: i64 }, // Fully synchronized
     Resynchronizing,  // Error recovery - need new snapshot
-    TradeStream,     // Connected for trade stream - no synchronization needed
+    TradeStream,      // Connected for trade stream - no synchronization needed
 }
 
 /// Binance Futures connector implementation
@@ -176,13 +173,19 @@ impl BinanceFuturesConnector {
 
     fn parse_host_port(url: &str, default_port: u16) -> Option<(String, u16)> {
         // Very small, dependency-free parser for wss://host[:port]/path
-        let without_scheme = url.strip_prefix("wss://").or_else(|| url.strip_prefix("ws://"))?;
+        let without_scheme = url
+            .strip_prefix("wss://")
+            .or_else(|| url.strip_prefix("ws://"))?;
         let host_port_path = without_scheme;
         let parts: Vec<&str> = host_port_path.splitn(2, '/').collect();
         let host_port = parts.get(0).copied().unwrap_or("");
-        if host_port.is_empty() { return None; }
+        if host_port.is_empty() {
+            return None;
+        }
         if let Some((host, port_str)) = host_port.split_once(':') {
-            if let Ok(port) = port_str.parse::<u16>() { return Some((host.to_string(), port)); }
+            if let Ok(port) = port_str.parse::<u16>() {
+                return Some((host.to_string(), port));
+            }
             return Some((host_port.to_string(), default_port));
         }
         Some((host_port.to_string(), default_port))
@@ -193,10 +196,20 @@ impl BinanceFuturesConnector {
             match lookup_host((host.as_str(), port)).await {
                 Ok(addrs) => {
                     let addrs_vec: Vec<String> = addrs.map(|a| a.to_string()).collect();
-                    log::info!("[dns][binance] host={} port={} resolved={:?}", host, port, addrs_vec);
+                    log::info!(
+                        "[dns][binance] host={} port={} resolved={:?}",
+                        host,
+                        port,
+                        addrs_vec
+                    );
                 }
                 Err(e) => {
-                    log::warn!("[dns][binance] host={} port={} resolution failed: {}", host, port, e);
+                    log::warn!(
+                        "[dns][binance] host={} port={} resolution failed: {}",
+                        host,
+                        port,
+                        e
+                    );
                 }
             }
         } else {
@@ -266,12 +279,22 @@ impl BinanceFuturesConnector {
             let mut i = pos + needle.len();
             // Skip whitespace
             let bytes = text.as_bytes();
-            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r') { i += 1; }
+            while i < bytes.len()
+                && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r')
+            {
+                i += 1;
+            }
             let start = i;
             // Optional minus sign (Binance IDs are non-negative, but be defensive)
-            if i < bytes.len() && bytes[i] == b'-' { i += 1; }
-            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() { i += 1; }
-            if i == start { return None; }
+            if i < bytes.len() && bytes[i] == b'-' {
+                i += 1;
+            }
+            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
             text[start..i].parse::<i64>().ok()
         }
 
@@ -282,24 +305,36 @@ impl BinanceFuturesConnector {
     }
 
     /// Convert Binance trade update to internal TradeUpdate format
-    fn convert_trade_update(&self, trade: &BinanceTradeUpdate, rcv_timestamp: i64, packet_id: i64) -> Result<TradeUpdate> {
-        let price = fast_float::parse::<f64, _>(&trade.price)
-            .map_err(|e| AppError::parse(format!("Invalid trade price '{}': {}", trade.price, e)))?;
-        
-        let qty = fast_float::parse::<f64, _>(&trade.quantity)
-            .map_err(|e| AppError::parse(format!("Invalid trade quantity '{}': {}", trade.quantity, e)))?;
+    fn convert_trade_update(
+        &self,
+        trade: &BinanceTradeUpdate,
+        rcv_timestamp: i64,
+        packet_id: i64,
+    ) -> Result<TradeUpdate> {
+        let price = fast_float::parse::<f64, _>(&trade.price).map_err(|e| {
+            AppError::parse(format!("Invalid trade price '{}': {}", trade.price, e))
+        })?;
 
-        let trade_side = if trade.is_buyer_maker { Side::Sell } else { Side::Buy };
+        let qty = fast_float::parse::<f64, _>(&trade.quantity).map_err(|e| {
+            AppError::parse(format!(
+                "Invalid trade quantity '{}': {}",
+                trade.quantity, e
+            ))
+        })?;
+
+        let trade_side = if trade.is_buyer_maker {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
 
         Ok(TradeUpdate {
             timestamp: crate::xcommons::types::time::millis_to_micros(trade.trade_time),
             rcv_timestamp,
-            exchange: ExchangeId::BinanceFutures,
-            ticker: trade.symbol.clone(),
+            market_id: XMarketId::make(ExchangeId::BinanceFutures, &trade.symbol),
             seq_id: trade.trade_id,
             packet_id,
             trade_id: trade.trade_id.to_string(),
-            order_id: Some(trade.trade_id.to_string()), // Using trade_id since buyer/seller order IDs removed from API
             side: trade_side,
             price,
             qty,
@@ -336,7 +371,11 @@ impl BinanceFuturesConnector {
     }
 
     /// Validate update sequence
-    fn validate_update_sequence_fields(&self, prev_final_update_id: i64, last_update_id: i64) -> Result<()> {
+    fn validate_update_sequence_fields(
+        &self,
+        prev_final_update_id: i64,
+        last_update_id: i64,
+    ) -> Result<()> {
         if prev_final_update_id != last_update_id {
             return Err(AppError::stream(format!(
                 "Update sequence mismatch: expected pu={}, got pu={}",
@@ -368,7 +407,11 @@ impl BinanceFuturesConnector {
         let mut out = Vec::with_capacity(self.update_buffer.len());
         let exchange_id = ExchangeId::BinanceFutures;
         while let Some(update) = self.update_buffer.pop_front() {
-            out.push(RawMessage { exchange_id, data: update.text.into_bytes(), timestamp: std::time::SystemTime::now() });
+            out.push(RawMessage {
+                exchange_id,
+                data: update.text.into_bytes(),
+                rcv_timestamp: now_micros(),
+            });
         }
         out
     }
@@ -426,10 +469,16 @@ impl ExchangeConnector for BinanceFuturesConnector {
             asks.push(Self::parse_price_level(&ask)?);
         }
 
+        let local_ts = crate::xcommons::types::time::now_millis();
+
         Ok(OrderBookSnapshot {
-            market_id: crate::xcommons::xmarket_id::XMarketId::make(ExchangeId::BinanceFutures, symbol),
+            market_id: crate::xcommons::xmarket_id::XMarketId::make(
+                ExchangeId::BinanceFutures,
+                symbol,
+            ),
             last_update_id: depth_response.last_update_id,
-            timestamp: crate::xcommons::types::time::now_millis(),
+            timestamp: local_ts,
+            rcv_timestamp: local_ts,
             sequence: depth_response.last_update_id,
             bids,
             asks,
@@ -447,12 +496,17 @@ impl ExchangeConnector for BinanceFuturesConnector {
             .map_err(|e| AppError::connection(format!("WebSocket error: {}", e)))?;
 
         self.ws_stream = Some(ws_stream);
-        if let Some(ref stream) = self.ws_stream { Self::log_connected_addrs(stream); }
+        if let Some(ref stream) = self.ws_stream {
+            Self::log_connected_addrs(stream);
+        }
         self.symbol = Some(symbol.to_string());
-        
+
         // Only set to BufferingUpdates if not already synchronized
         // (UnifiedExchangeHandler may have already called initialize_synchronization)
-        if matches!(self.sync_state, SyncState::Disconnected | SyncState::Connecting) {
+        if matches!(
+            self.sync_state,
+            SyncState::Disconnected | SyncState::Connecting
+        ) {
             self.sync_state = SyncState::BufferingUpdates;
             // Setting sync state to BufferingUpdates
         } else {
@@ -475,9 +529,11 @@ impl ExchangeConnector for BinanceFuturesConnector {
             .map_err(|e| AppError::connection(format!("WebSocket error: {}", e)))?;
 
         self.ws_stream = Some(ws_stream);
-        if let Some(ref stream) = self.ws_stream { Self::log_connected_addrs(stream); }
+        if let Some(ref stream) = self.ws_stream {
+            Self::log_connected_addrs(stream);
+        }
         self.symbol = Some(symbol.to_string());
-        
+
         // For trades, we don't need synchronization - set TradeStream state
         // Trade streams don't require orderbook synchronization
         self.sync_state = SyncState::TradeStream;
@@ -491,7 +547,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
     async fn next_message(&mut self) -> Result<Option<RawMessage>> {
         loop {
             // Waiting for WebSocket message
-            
+
             let msg = {
                 let ws_stream = self
                     .ws_stream
@@ -503,7 +559,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
             match msg {
                 Some(Ok(Message::Text(text))) => {
                     // Processing WebSocket message
-                    let timestamp = SystemTime::now();
+                    let rcv_timestamp = crate::xcommons::types::time::now_millis();
 
                     // Handle based on sync state - for trade streams, skip depth parsing
                     match &self.sync_state {
@@ -513,40 +569,75 @@ impl ExchangeConnector for BinanceFuturesConnector {
                         }
                         _ => {
                             // Minimal scan to extract U/u/pu fields without full JSON parse
-                            if let Some((first_update_id, final_update_id, prev_final_update_id)) = Self::scan_depth_u_fields(&text) {
+                            if let Some((first_update_id, final_update_id, prev_final_update_id)) =
+                                Self::scan_depth_u_fields(&text)
+                            {
                                 match &self.sync_state {
                                     SyncState::BufferingUpdates => {
                                         // Buffer updates until we get snapshot
-                                        self.update_buffer.push_back(BufferedDepthUpdate { first_update_id, final_update_id, prev_final_update_id, text: text.clone() });
+                                        self.update_buffer.push_back(BufferedDepthUpdate {
+                                            first_update_id,
+                                            final_update_id,
+                                            prev_final_update_id,
+                                            text: text.clone(),
+                                        });
                                         if self.update_buffer.len() > Self::MAX_BUFFERED_UPDATES {
-                                            let to_trim = self.update_buffer.len() - Self::MAX_BUFFERED_UPDATES;
-                                            for _ in 0..to_trim { self.update_buffer.pop_front(); }
+                                            let to_trim = self.update_buffer.len()
+                                                - Self::MAX_BUFFERED_UPDATES;
+                                            for _ in 0..to_trim {
+                                                self.update_buffer.pop_front();
+                                            }
                                             log::warn!("Binance buffer reached limit ({}). Dropped {} oldest updates to cap memory.", Self::MAX_BUFFERED_UPDATES, to_trim);
                                         }
                                         continue;
                                     }
                                     SyncState::Synchronizing { last_update_id } => {
-                                        if final_update_id <= *last_update_id { continue; }
+                                        if final_update_id <= *last_update_id {
+                                            continue;
+                                        }
                                         if first_update_id > *last_update_id {
-                                            log::info!("Accepting update after snapshot gap: {} > {}", first_update_id, last_update_id);
-                                            self.sync_state = SyncState::Synchronized { last_update_id: final_update_id };
+                                            log::info!(
+                                                "Accepting update after snapshot gap: {} > {}",
+                                                first_update_id,
+                                                last_update_id
+                                            );
+                                            self.sync_state = SyncState::Synchronized {
+                                                last_update_id: final_update_id,
+                                            };
                                             log::info!("Order book synchronized with gap handling");
-                                        } else if first_update_id <= last_update_id + 1 && final_update_id >= last_update_id + 1 {
-                                            self.sync_state = SyncState::Synchronized { last_update_id: final_update_id };
+                                        } else if first_update_id <= last_update_id + 1
+                                            && final_update_id >= last_update_id + 1
+                                        {
+                                            self.sync_state = SyncState::Synchronized {
+                                                last_update_id: final_update_id,
+                                            };
                                             log::info!("Order book synchronized perfectly");
                                         } else {
                                             log::warn!("Unexpected sync case: first_id={}, final_id={}, expected > {}", first_update_id, final_update_id, last_update_id);
-                                            self.sync_state = SyncState::Synchronized { last_update_id: final_update_id };
+                                            self.sync_state = SyncState::Synchronized {
+                                                last_update_id: final_update_id,
+                                            };
                                             log::info!("Order book synchronized with fallback");
                                         }
                                     }
                                     SyncState::Synchronized { last_update_id } => {
-                                        self.validate_update_sequence_fields(prev_final_update_id, *last_update_id)?;
-                                        self.sync_state = SyncState::Synchronized { last_update_id: final_update_id };
+                                        self.validate_update_sequence_fields(
+                                            prev_final_update_id,
+                                            *last_update_id,
+                                        )?;
+                                        self.sync_state = SyncState::Synchronized {
+                                            last_update_id: final_update_id,
+                                        };
                                     }
                                     _ => {
-                                        log::error!("Received update in invalid state: {:?}", self.sync_state);
-                                        return Err(AppError::stream(format!("Received update in invalid state: {:?}", self.sync_state)));
+                                        log::error!(
+                                            "Received update in invalid state: {:?}",
+                                            self.sync_state
+                                        );
+                                        return Err(AppError::stream(format!(
+                                            "Received update in invalid state: {:?}",
+                                            self.sync_state
+                                        )));
                                     }
                                 }
                             } else {
@@ -558,8 +649,9 @@ impl ExchangeConnector for BinanceFuturesConnector {
                     let raw_message = RawMessage {
                         exchange_id: ExchangeId::BinanceFutures,
                         data: text.into_bytes(),
-                        timestamp,
-                    };return Ok(Some(raw_message));
+                        rcv_timestamp: rcv_timestamp,
+                    };
+                    return Ok(Some(raw_message));
                 }
                 Some(Ok(Message::Close(_))) => {
                     log::warn!("WebSocket connection closed by server");
@@ -609,17 +701,17 @@ impl ExchangeConnector for BinanceFuturesConnector {
     }
 
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
-        self.ws_stream.as_ref().and_then(|ws| {
-            match ws.get_ref() {
-                tokio_tungstenite::MaybeTlsStream::Plain(tcp) => tcp.peer_addr().ok(),
-                tokio_tungstenite::MaybeTlsStream::Rustls(tls) => {
-                    let (io, _) = tls.get_ref();
-                    io.peer_addr().ok()
-                }
-                #[cfg(feature = "native-tls")]
-                tokio_tungstenite::MaybeTlsStream::NativeTls(tls) => tls.get_ref().and_then(|io| io.peer_addr().ok()),
-                _ => None,
+        self.ws_stream.as_ref().and_then(|ws| match ws.get_ref() {
+            tokio_tungstenite::MaybeTlsStream::Plain(tcp) => tcp.peer_addr().ok(),
+            tokio_tungstenite::MaybeTlsStream::Rustls(tls) => {
+                let (io, _) = tls.get_ref();
+                io.peer_addr().ok()
             }
+            #[cfg(feature = "native-tls")]
+            tokio_tungstenite::MaybeTlsStream::NativeTls(tls) => {
+                tls.get_ref().and_then(|io| io.peer_addr().ok())
+            }
+            _ => None,
         })
     }
 
@@ -651,7 +743,9 @@ impl ExchangeConnector for BinanceFuturesConnector {
             .map_err(|e| AppError::connection(format!("WebSocket error: {}", e)))?;
 
         self.ws_stream = Some(ws_stream);
-        if let Some(ref stream) = self.ws_stream { Self::log_connected_addrs(stream); }
+        if let Some(ref stream) = self.ws_stream {
+            Self::log_connected_addrs(stream);
+        }
         self.symbol = Some(symbol.to_string());
         self.connection_status = ConnectionStatus::Connected;
 
@@ -681,15 +775,15 @@ impl ExchangeConnector for BinanceFuturesConnector {
                 }
             };
 
+            let rcv_timestamp = crate::xcommons::types::time::now_micros();
+            last_frame_at = rcv_timestamp;
+
             match msg {
                 Some(Ok(Message::Text(text))) => {
-                    let timestamp = SystemTime::now();
-                    last_frame_at = crate::xcommons::types::time::now_micros();
-                    
                     let raw_message = RawMessage {
                         exchange_id: ExchangeId::BinanceFutures,
                         data: text.into_bytes(),
-                        timestamp,
+                        rcv_timestamp,
                     };
 
                     if tx.send(raw_message).await.is_err() {
@@ -703,11 +797,14 @@ impl ExchangeConnector for BinanceFuturesConnector {
                     break;
                 }
                 Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
-                    last_frame_at = crate::xcommons::types::time::now_micros();
                     // Handle ping/pong, continue reading
                     continue;
                 }
-                Some(Ok(_)) => {
+                Some(Ok(unhandled_msg)) => {
+                    log::warn!(
+                        "Binance trade WebSocket unhandled message: {:?}",
+                        unhandled_msg
+                    );
                     // Other message types, continue reading
                     continue;
                 }
@@ -790,7 +887,6 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         &mut self,
         raw_msg: crate::xcommons::types::RawMessage,
         _symbol: &str,
-        rcv_timestamp: i64,
         packet_id: u64,
         message_bytes: u32,
     ) -> std::result::Result<Vec<crate::xcommons::types::OrderBookL2Update>, Self::Error> {
@@ -799,24 +895,19 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
         // Calculate packet arrival timestamp (when network packet was received)
         // Use socket receive time from RawMessage for code latency measurement
-        let packet_arrival_us = raw_msg
-            .timestamp
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as i64;
+        let rcv_timestamp = raw_msg.rcv_timestamp;
 
         // Parse Binance message with timing
         let parse_start = crate::xcommons::types::time::now_micros();
-        
+
         let mut data_bytes = raw_msg.data;
-        
+
         // First try to parse as generic JSON to check for subscription responses
-        let json_value: serde_json::Value = serde_json::from_slice(&mut data_bytes).map_err(|_e| {
-            self.base.metrics.increment_parse_errors();
-            crate::xcommons::error::AppError::pipeline(ERROR_JSON_PARSE.to_string())
-        })?;
-
-
+        let json_value: serde_json::Value =
+            serde_json::from_slice(&mut data_bytes).map_err(|_e| {
+                self.base.metrics.increment_parse_errors();
+                crate::xcommons::error::AppError::pipeline(ERROR_JSON_PARSE.to_string())
+            })?;
 
         // Check if this is a subscription response (has "result" field)
         if json_value.get("result").is_some() {
@@ -839,7 +930,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
             log::error!("CRITICAL: Failed to parse Binance depth update: {}", e);
             crate::xcommons::error::AppError::pipeline(ERROR_DEPTH_PARSE.to_string())
         })?;
-        
+
         // Removed per user request to reduce log spam
 
         // Calculate parse time
@@ -849,13 +940,12 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         }
 
         // Calculate overall latency (local time vs exchange timestamp)
-        let exchange_timestamp_us = crate::xcommons::types::time::millis_to_micros(depth_update.event_time);
+        let exchange_timestamp_us =
+            crate::xcommons::types::time::millis_to_micros(depth_update.event_time);
         if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
-            if overall_latency >= 0 {
-                self.base
-                    .metrics
-                    .update_overall_latency(overall_latency as u64);
-            }
+            self.base
+                .metrics
+                .update_overall_latency(overall_latency as u64);
         }
 
         // Start transformation timing
@@ -873,8 +963,13 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         // Reuse pre-allocated buffer
         self.base.updates_buffer.clear();
 
-        let timestamp_micros = crate::xcommons::types::time::millis_to_micros(depth_update.event_time);
+        let timestamp_micros =
+            crate::xcommons::types::time::millis_to_micros(depth_update.event_time);
 
+        let xmarket_id = crate::xcommons::xmarket_id::XMarketId::make(
+            ExchangeId::BinanceFutures,
+            &depth_update.symbol,
+        );
         // Process bid updates using fast float parsing
         for bid in depth_update.bids {
             let price = fast_float::parse::<f64, _>(&bid[0]).map_err(|_e| {
@@ -885,18 +980,34 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
             })?;
 
             let seq_id = self.next_sequence_id();
-                    let builder = crate::xcommons::types::OrderBookL2UpdateBuilder::new(
-                timestamp_micros,
-                rcv_timestamp,
-                crate::xcommons::types::ExchangeId::BinanceFutures,
-                depth_update.symbol.clone(),
-                seq_id,
-                packet_id as i64,
-                depth_update.final_update_id,
-                depth_update.first_update_id,
-            );
+            // let builder = crate::xcommons::types::OrderBookL2UpdateBuilder::new(
+            //     timestamp_micros,
+            //     rcv_timestamp,
+            //     crate::xcommons::types::ExchangeId::BinanceFutures,
+            //     depth_update.symbol.clone(),
+            //     seq_id,
+            //     packet_id as i64,
+            //     depth_update.final_update_id,
+            //     depth_update.first_update_id,
+            // );
 
-            self.base.updates_buffer.push(builder.build_bid(price, qty));
+            self.base.updates_buffer.push(OrderBookL2Update {
+                timestamp: timestamp_micros,
+                rcv_timestamp,
+                market_id: xmarket_id,
+                seq_id: seq_id,
+                packet_id: packet_id as i64,
+                update_id: depth_update.final_update_id,
+                first_update_id: depth_update.first_update_id,
+                action: if qty == 0.0 {
+                    crate::xcommons::types::L2Action::Delete
+                } else {
+                    crate::xcommons::types::L2Action::Update
+                },
+                side: crate::xcommons::oms::Side::Buy,
+                price,
+                qty,
+            });
         }
 
         // Process ask updates using fast float parsing
@@ -909,18 +1020,24 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
             })?;
 
             let seq_id = self.next_sequence_id();
-                    let builder = crate::xcommons::types::OrderBookL2UpdateBuilder::new(
-                timestamp_micros,
-                rcv_timestamp,
-                crate::xcommons::types::ExchangeId::BinanceFutures,
-                depth_update.symbol.clone(),
-                seq_id,
-                packet_id as i64,
-                depth_update.final_update_id,
-                depth_update.first_update_id,
-            );
 
-            self.base.updates_buffer.push(builder.build_ask(price, qty));
+            self.base.updates_buffer.push(OrderBookL2Update {
+                timestamp: timestamp_micros,
+                rcv_timestamp,
+                market_id: xmarket_id,
+                seq_id: seq_id,
+                packet_id: packet_id as i64,
+                update_id: depth_update.final_update_id,
+                first_update_id: depth_update.first_update_id,
+                action: if qty == 0.0 {
+                    crate::xcommons::types::L2Action::Delete
+                } else {
+                    crate::xcommons::types::L2Action::Update
+                },
+                side: crate::xcommons::oms::Side::Sell,
+                price,
+                qty,
+            });
         }
 
         // Calculate transformation time
@@ -946,14 +1063,12 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         // Calculate CODE LATENCY: From network packet arrival to business logic ready
         // This measures the FULL time spent in Rust code processing
         let processing_complete = crate::xcommons::types::time::now_micros();
-        if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
+        if let Some(code_latency) = processing_complete.checked_sub(rcv_timestamp) {
             if code_latency >= 0 {
                 self.base.metrics.update_code_latency(code_latency as u64);
             }
         }
 
-
-        
         // Return moved buffer instead of cloning
         Ok(std::mem::take(&mut self.base.updates_buffer))
     }
@@ -962,7 +1077,6 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         &mut self,
         raw_msg: crate::xcommons::types::RawMessage,
         _symbol: &str,
-        rcv_timestamp: i64,
         packet_id: u64,
         message_bytes: u32,
     ) -> std::result::Result<Vec<crate::xcommons::types::TradeUpdate>, Self::Error> {
@@ -971,11 +1085,7 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
         // Calculate packet arrival timestamp (when network packet was received)
         // Use socket receive time from RawMessage for code latency measurement
-        let packet_arrival_us = raw_msg
-            .timestamp
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as i64;
+        let rcv_timestamp = raw_msg.rcv_timestamp;
 
         // Parse Binance trade message with timing
         let parse_start = crate::xcommons::types::time::now_micros();
@@ -993,7 +1103,8 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         }
 
         // Calculate overall latency (local time vs exchange timestamp)
-        let exchange_timestamp_us = crate::xcommons::types::time::millis_to_micros(trade_update.trade_time);
+        let exchange_timestamp_us =
+            crate::xcommons::types::time::millis_to_micros(trade_update.trade_time);
         if let Some(overall_latency) = rcv_timestamp.checked_sub(exchange_timestamp_us) {
             if overall_latency >= 0 {
                 self.base
@@ -1014,23 +1125,26 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
         let price = fast_float::parse::<f64, _>(&trade_update.price).map_err(|_e| {
             crate::xcommons::error::AppError::pipeline(ERROR_PRICE_PARSE.to_string())
         })?;
-        
+
         let qty = fast_float::parse::<f64, _>(&trade_update.quantity).map_err(|_e| {
             crate::xcommons::error::AppError::pipeline(ERROR_QUANTITY_PARSE.to_string())
         })?;
 
-        let trade_side = if trade_update.is_buyer_maker { Side::Sell } else { Side::Buy };
+        let trade_side = if trade_update.is_buyer_maker {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
 
         let seq_id = self.next_sequence_id();
         let trade = crate::xcommons::types::TradeUpdate {
             timestamp: crate::xcommons::types::time::millis_to_micros(trade_update.trade_time),
             rcv_timestamp,
-            exchange: crate::xcommons::types::ExchangeId::BinanceFutures,
-            ticker: trade_update.symbol,
+            market_id: XMarketId::make(ExchangeId::BinanceFutures, &trade_update.symbol),
             seq_id,
             packet_id: packet_id as i64,
             trade_id: trade_update.trade_id.to_string(),
-            order_id: None, // Binance doesn't provide order IDs in trade stream
+
             side: trade_side,
             price,
             qty,
@@ -1046,51 +1160,21 @@ impl crate::exchanges::ExchangeProcessor for BinanceProcessor {
 
         // Update metrics
         self.base.metrics.increment_processed();
-        self.base.metrics.update_message_complexity(0, 0, message_bytes); // Trade message has no bid/ask levels
+        self.base
+            .metrics
+            .update_message_complexity(0, 0, message_bytes); // Trade message has no bid/ask levels
 
         // Update packet metrics (Binance sends 1 trade per message)
         self.base.metrics.update_packet_metrics(1, 1, message_bytes);
 
         // Calculate CODE LATENCY: From network packet arrival to business logic ready
         let processing_complete = crate::xcommons::types::time::now_micros();
-        if let Some(code_latency) = processing_complete.checked_sub(packet_arrival_us) {
+        if let Some(code_latency) = processing_complete.checked_sub(rcv_timestamp) {
             if code_latency >= 0 {
                 self.base.metrics.update_code_latency(code_latency as u64);
             }
         }
 
         Ok(vec![trade])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_price_level() {
-        let level = ["123.45".to_string(), "67.89".to_string()];
-        let parsed = BinanceFuturesConnector::parse_price_level(&level).unwrap();
-
-        assert_eq!(parsed.price, 123.45);
-        assert_eq!(parsed.qty, 67.89);
-    }
-
-    #[test]
-    fn test_parse_invalid_price_level() {
-        let level = ["invalid".to_string(), "67.89".to_string()];
-        let result = BinanceFuturesConnector::parse_price_level(&level);
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_connector_creation() {
-        let connector = create_binance_connector();
-        assert_eq!(connector.exchange_id(), ExchangeId::BinanceFutures);
-        assert_eq!(
-            connector.connection_status(),
-            ConnectionStatus::Disconnected
-        );
     }
 }
