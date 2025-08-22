@@ -9,8 +9,9 @@ use crate::app::env::{AppEnvironment, BinanceAccountParams};
 use crate::trading::account_state::ExchangeAccountAdapter;
 use crate::xcommons::circuit_breaker::CircuitBreaker;
 use crate::xcommons::error::Result as AppResult;
-use crate::xcommons::oms::{OrderRequest, OrderResponse, XExecution};
+use crate::xcommons::oms::{OrderRequest, OrderResponse, TracingTimeStamps, XExecution};
 use crate::xcommons::position::Position;
+use crate::xcommons::types::time::now_micros;
 use crate::xcommons::types::{
     ExchangeId, OrderBookL2Update, OrderBookSnapshot, StreamData, StreamType as CoreStreamType,
     SubscriptionSpec, TradeUpdate,
@@ -22,8 +23,8 @@ pub struct StrategyContext {
     pub env: Arc<dyn AppEnvironment>,
 }
 
-#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
-pub struct SubscriptionId(pub u32);
+// #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+// pub struct SubscriptionId(pub u32);
 
 #[derive(Debug)]
 pub enum StrategyControl {
@@ -61,12 +62,35 @@ pub struct StrategyIo<'a> {
     pub order_txs: std::collections::HashMap<i64, tokio::sync::mpsc::Sender<OrderRequest>>, // market_id -> tx
     // Set by strategies to request a deferred update() after the current mailbox drain
     update_scheduled: bool,
+    tracing_context: Option<TracingTimeStamps>,
 }
 
 impl<'a> StrategyIo<'a> {
     #[inline]
     pub fn schedule_update(&mut self) {
         self.update_scheduled = true;
+    }
+
+    pub fn set_tracing_context(&mut self, ctx: TracingTimeStamps) {
+        self.tracing_context = Some(ctx);
+    }
+
+    pub fn send_request(&mut self, req: OrderRequest) {
+        let mid = req.get_market_id();
+
+        if let Some(tx) = self.order_txs.get(&mid) {
+            let patched_req = if let Some(ctx) = self.tracing_context.clone() {
+                req.with_tracing(ctx)
+            } else {
+                req
+            };
+
+            if let Err(e) = tx.try_send(patched_req) {
+                log::warn!("[StrategyIo] order request dropped (market_id={})", mid);
+            }
+        } else {
+            log::warn!("[StrategyIo] order request dropped (market_id={})", mid);
+        }
     }
 }
 
@@ -108,8 +132,8 @@ pub trait Strategy: Send + Sync {
 pub struct StrategyRegistrar<'a> {
     env: &'a dyn AppEnvironment,
     mailbox_tx: tokio::sync::mpsc::Sender<StrategyMessage>,
-    next_id: u32,
-    pending_subs: Vec<(SubscriptionId, SubscriptionSpec)>,
+    // next_id: u32,
+    pending_subs: Vec<SubscriptionSpec>,
     account_params: Vec<BinanceAccountParams>,
 }
 
@@ -121,38 +145,40 @@ impl<'a> StrategyRegistrar<'a> {
         Self {
             env,
             mailbox_tx,
-            next_id: 1,
+            // next_id: 1,
             pending_subs: Vec::new(),
             account_params: Vec::new(),
         }
     }
-
-    pub fn subscribe_l2(&mut self, spec: SubscriptionSpec) -> SubscriptionId {
-        let id = SubscriptionId(self.next_id);
-        self.next_id += 1;
-        self.pending_subs.push((id, spec));
-        id
+    pub fn subscribe(&mut self, spec: SubscriptionSpec) {
+        self.pending_subs.push(spec);
     }
-
-    pub fn subscribe_trades(&mut self, spec: SubscriptionSpec) -> SubscriptionId {
-        let id = SubscriptionId(self.next_id);
-        self.next_id += 1;
-        self.pending_subs.push((id, spec));
-        id
-    }
-
-    pub fn subscribe_obs(&mut self, spec: SubscriptionSpec) -> SubscriptionId {
-        // Keep OBS logical type here; environment will convert to L2 for execution and emit OBS snapshots
-        let id = SubscriptionId(self.next_id);
-        self.next_id += 1;
-        self.pending_subs.push((id, spec));
-        id
-    }
-
-    pub fn set_timer(&mut self, _every: std::time::Duration) {
-        // Placeholder: timers can be implemented by spawning a tokio interval that posts Control::Timer
-        let _ = &self.env; // keep for future use
-    }
+    // pub fn subscribe_l2(&mut self, spec: SubscriptionSpec) -> SubscriptionId {
+    //     let id = SubscriptionId(self.next_id);
+    //     self.next_id += 1;
+    //     self.pending_subs.push((id, spec));
+    //     id
+    // }
+    //
+    // pub fn subscribe_trades(&mut self, spec: SubscriptionSpec) -> SubscriptionId {
+    //     let id = SubscriptionId(self.next_id);
+    //     self.next_id += 1;
+    //     self.pending_subs.push((id, spec));
+    //     id
+    // }
+    //
+    // pub fn subscribe_obs(&mut self, spec: SubscriptionSpec) -> SubscriptionId {
+    //     // Keep OBS logical type here; environment will convert to L2 for execution and emit OBS snapshots
+    //     let id = SubscriptionId(self.next_id);
+    //     self.next_id += 1;
+    //     self.pending_subs.push((id, spec));
+    //     id
+    // }
+    //
+    // pub fn set_timer(&mut self, _every: std::time::Duration) {
+    //     // Placeholder: timers can be implemented by spawning a tokio interval that posts Control::Timer
+    //     let _ = &self.env; // keep for future use
+    // }
 
     pub fn subscribe_binance_futures_accounts(&mut self, params: BinanceAccountParams) {
         self.account_params.push(params);
@@ -162,7 +188,7 @@ impl<'a> StrategyRegistrar<'a> {
         self,
     ) -> (
         tokio::sync::mpsc::Sender<StrategyMessage>,
-        Vec<(SubscriptionId, SubscriptionSpec)>,
+        Vec<SubscriptionSpec>,
         Vec<BinanceAccountParams>,
     ) {
         (self.mailbox_tx, self.pending_subs, self.account_params)
@@ -189,14 +215,14 @@ impl StrategyRunner {
 
         // Build mapping from (stream_type, exchange_id, instrument) -> sub id
 
-        let mut specs: Vec<SubscriptionSpec> = Vec::new();
-        for (sid, spec) in subs.into_iter() {
-            // key_to_subid.insert((spec.stream_type, spec.market_id), sid);
-            specs.push(spec);
-        }
+        // let mut specs: Vec<SubscriptionSpec> = Vec::new();
+        // for spec in subs.into_iter() {
+        // key_to_subid.insert((spec.stream_type, spec.market_id), sid);
+        // specs.push(spec);
+        // }
 
         // Start subscriptions via environment and forward to strategy mailbox
-        let mut md_rx = ctx.env.start_subscriptions(specs);
+        let mut md_rx = ctx.env.start_subscriptions(subs);
         let forward_tx = tx.clone();
         tokio::spawn(async move {
             while let Some(sd) = md_rx.recv().await {
@@ -478,7 +504,9 @@ impl StrategyRunner {
             env: ctx.env.as_ref(),
             order_txs,
             update_scheduled: false,
+            tracing_context: None,
         };
+
         // Circuit breaker for repeated order errors (system-level guard)
         let order_error_threshold: u32 = std::env::var("ORDER_ERROR_THRESHOLD")
             .ok()
@@ -492,6 +520,9 @@ impl StrategyRunner {
             order_error_threshold,
             Duration::from_secs(order_error_timeout_secs),
         );
+
+        let mut _tracing_context: Option<TracingTimeStamps> = None;
+
         // Warn on every benign failure (no rate limiting)
         loop {
             let first = match rx.recv().await {
@@ -500,25 +531,64 @@ impl StrategyRunner {
             };
 
             let mut handle_msg = |msg: StrategyMessage| {
+                // let old_status = io.update_scheduled;
                 match msg {
-                    StrategyMessage::MarketDataL2 { msg } => strategy.on_l2(msg, &mut io),
-                    StrategyMessage::MarketDataTrade { msg } => strategy.on_trade(msg, &mut io),
+                    StrategyMessage::MarketDataL2 { msg } => {
+                        let _tc = TracingTimeStamps::new(crate::xcommons::oms::TRACE_MSG_L2, msg.timestamp, msg.rcv_timestamp);
+                        strategy.on_l2(msg, &mut io);
+                        if _tracing_context.is_none() && io.update_scheduled {
+                            _tracing_context = Some(_tc);
+                        }
+                    }
+                    StrategyMessage::MarketDataTrade { msg } => {
+                        let _tc = TracingTimeStamps::new(crate::xcommons::oms::TRACE_MSG_MTRADE, msg.timestamp, msg.rcv_timestamp);
+                        strategy.on_trade(msg, &mut io);
+                        if _tracing_context.is_none() && io.update_scheduled {
+                            _tracing_context = Some(_tc);
+                        }
+
+                    },
                     StrategyMessage::Execution { exec } => {
+                        let _tc = TracingTimeStamps::new(crate::xcommons::oms::TRACE_MSG_EXEC, exec.timestamp, exec.rcv_timestamp);
+
                         if exec.exec_type == crate::xcommons::oms::ExecutionType::XOrderRejected {
                             log::warn!(
                                 "[StrategyRunner] benign execution: XOrderRejected (cl_ord_id={}, native_ord_id={})",
                                 exec.cl_ord_id, exec.native_ord_id
                             );
                         }
-                        strategy.on_execution(exec, &mut io)
+                        strategy.on_execution(exec, &mut io);
+
+                        if _tracing_context.is_none() && io.update_scheduled {
+                            _tracing_context = Some(_tc);
+                        }
                     }
+
                     StrategyMessage::Position {
                         account_id,
                         market_id,
                         pos,
-                    } => strategy.on_position(account_id, market_id, pos, &mut io),
-                    StrategyMessage::Obs { snapshot } => strategy.on_obs(snapshot, &mut io),
+                    } => {
+
+                        let _tc = TracingTimeStamps::new(crate::xcommons::oms::TRACE_MSG_POSITION, 0, now_micros());
+                        strategy.on_position(account_id, market_id, pos, &mut io);
+
+                        if _tracing_context.is_none() && io.update_scheduled {
+                            _tracing_context = Some(_tc);
+                        }
+                    }
+
+                    StrategyMessage::Obs { snapshot } => {
+                        let _tc = TracingTimeStamps::new(crate::xcommons::oms::TRACE_MSG_OBS, snapshot.timestamp, snapshot.rcv_timestamp);
+
+                        strategy.on_obs(snapshot, &mut io);
+
+                        if _tracing_context.is_none() && io.update_scheduled {
+                            _tracing_context = Some(_tc);
+                        }
+                    }
                     StrategyMessage::OrderResponse(r) => {
+                        let _tc = TracingTimeStamps::new(crate::xcommons::oms::TRACE_MSG_ORDER_RESPONSE, r.timestamp, r.rcv_timestamp);
                         // Forward to strategy first
                         let status = r.status;
                         let cl = r.cl_ord_id;
@@ -562,8 +632,19 @@ impl StrategyRunner {
                             }
                             _ => {}
                         }
+                        if _tracing_context.is_none() && io.update_scheduled {
+                            _tracing_context = Some(_tc);
+                        }
                     }
-                    StrategyMessage::Control(c) => strategy.on_control(c, &mut io),
+                    StrategyMessage::Control(c) => {
+                        let _tc = TracingTimeStamps::new(crate::xcommons::oms::TRACE_MSG_UNKNOWN, 0, now_micros());
+                        strategy.on_control(c, &mut io);
+
+                        if _tracing_context.is_none() && io.update_scheduled {
+                            _tracing_context = Some(_tc);
+                        }
+
+                    }
                 }
             };
 
@@ -578,7 +659,13 @@ impl StrategyRunner {
             }
 
             if io.update_scheduled {
+
+                io.tracing_context = _tracing_context.take();
+
+
                 strategy.update(&mut io);
+
+                io.tracing_context = None;
                 io.update_scheduled = false;
             }
         }

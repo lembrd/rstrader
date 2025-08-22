@@ -1,28 +1,31 @@
 use async_trait::async_trait;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use base64::{engine::general_purpose, Engine as _};
+use ed25519_dalek::pkcs8::DecodePrivateKey;
+use ed25519_dalek::{Signer, SigningKey};
+use futures_util::{SinkExt, StreamExt};
 use hex::encode as hex_encode;
+use hmac::{Hmac, Mac};
 use reqwest::Client;
+use serde::Deserialize;
+use sha2::Sha256;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use futures_util::{StreamExt, SinkExt};
-use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
-use base64::{engine::general_purpose, Engine as _};
-use ed25519_dalek::{SigningKey, Signer};
-use ed25519_dalek::pkcs8::DecodePrivateKey;
 
 use crate::trading::account_state::ExchangeAccountAdapter;
-use crate::trading::tradelog::{TradeLogHandle, LogEventType};
 use crate::trading::tradelog::build as tlog;
+use crate::trading::tradelog::{LogEventType, TradeLogHandle};
 use crate::xcommons::error::{AppError, Result};
-use crate::xcommons::oms::{ExecutionType, OrderStatus, Side, TimeInForce, OrderMode, XExecution};
-use crate::xcommons::oms::{OrderRequest, OrderResponse, OrderResponseStatus, PostRequest, CancelRequest, CancelAllRequest};
+use crate::xcommons::oms::{
+    CancelAllRequest, CancelRequest, OrderRequest, OrderResponse, OrderResponseStatus, PostRequest,
+};
+use crate::xcommons::oms::{ExecutionType, OrderMode, OrderStatus, Side, TimeInForce, XExecution};
+use crate::xcommons::types::time::now_micros;
 use crate::xcommons::types::ExchangeId;
 use crate::xcommons::xmarket_id::XMarketId;
-use tokio::time::{sleep, Duration};
-use tokio::sync::{mpsc as tmpsc, oneshot, Mutex};
 use std::sync::Arc;
+use tokio::sync::{mpsc as tmpsc, oneshot, Mutex};
+use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 
 pub struct BinanceFuturesAccountAdapter {
@@ -53,11 +56,25 @@ impl BinanceFuturesAccountAdapter {
         }
     }
     fn extract_error_fields(v: &serde_json::Value) -> (Option<String>, Option<String>) {
-        let code = v.get("error").and_then(|e| e.get("code")).map(|c| c.to_string());
-        let msg = v.get("error").and_then(|e| e.get("msg")).and_then(|m| m.as_str()).map(|s| s.to_string());
+        let code = v
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .map(|c| c.to_string());
+        let msg = v
+            .get("error")
+            .and_then(|e| e.get("msg"))
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string());
         (code, msg)
     }
-    pub fn new(api_key: String, secret: String, symbols: Vec<String>, ws_pubkey: Option<String>, ws_secret: Option<String>, tradelog: Option<TradeLogHandle>) -> Self {
+    pub fn new(
+        api_key: String,
+        secret: String,
+        symbols: Vec<String>,
+        ws_pubkey: Option<String>,
+        ws_secret: Option<String>,
+        tradelog: Option<TradeLogHandle>,
+    ) -> Self {
         let market_to_symbol = symbols
             .iter()
             .map(|s| (XMarketId::make(ExchangeId::BinanceFutures, s), s.clone()))
@@ -100,10 +117,12 @@ impl BinanceFuturesAccountAdapter {
                     if let Some(pos) = der.windows(2).position(|w| w == [0x04, 0x20]) {
                         let start = pos + 2;
                         if der.len() >= start + 32 {
-                            let seed: [u8; 32] = der[start..start+32].try_into().unwrap();
+                            let seed: [u8; 32] = der[start..start + 32].try_into().unwrap();
                             Ok(SigningKey::from_bytes(&seed))
                         } else {
-                            Err(AppError::config("ed25519 pkcs8: missing 32-byte seed".to_string()))
+                            Err(AppError::config(
+                                "ed25519 pkcs8: missing 32-byte seed".to_string(),
+                            ))
                         }
                     } else {
                         Err(AppError::config("ed25519 pkcs8: parse failure".to_string()))
@@ -111,18 +130,26 @@ impl BinanceFuturesAccountAdapter {
                 }
             }
         } else if key_src.trim().len() >= 64 && key_src.chars().all(|c| c.is_ascii_hexdigit()) {
-            let sk_bytes = hex::decode(key_src.trim()).map_err(|e| AppError::config(format!("ed25519 secret hex decode: {}", e)))?;
-            let arr: [u8; 32] = sk_bytes.as_slice().try_into().map_err(|_| AppError::config("ed25519 key length".to_string()))?;
+            let sk_bytes = hex::decode(key_src.trim())
+                .map_err(|e| AppError::config(format!("ed25519 secret hex decode: {}", e)))?;
+            let arr: [u8; 32] = sk_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| AppError::config("ed25519 key length".to_string()))?;
             Ok(SigningKey::from_bytes(&arr))
         } else {
             let raw = base64::engine::general_purpose::STANDARD
                 .decode(key_src.trim())
                 .map_err(|e| AppError::config(format!("ed25519 base64 decode: {}", e)))?;
             if raw.len() == 32 {
-                let arr: [u8; 32] = raw.as_slice().try_into().map_err(|_| AppError::config("ed25519 key length".to_string()))?;
+                let arr: [u8; 32] = raw
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| AppError::config("ed25519 key length".to_string()))?;
                 Ok(SigningKey::from_bytes(&arr))
             } else {
-                SigningKey::from_pkcs8_der(&raw).map_err(|e| AppError::config(format!("ed25519 pkcs8: {}", e)))
+                SigningKey::from_pkcs8_der(&raw)
+                    .map_err(|e| AppError::config(format!("ed25519 pkcs8: {}", e)))
             }
         }
     }
@@ -133,7 +160,6 @@ impl BinanceFuturesAccountAdapter {
         let sig = mac.finalize().into_bytes();
         hex_encode(sig)
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -146,23 +172,43 @@ struct TradeReqMeta {
 }
 
 impl BinanceFuturesAccountAdapter {
-    async fn ws_api_request(&self, method: &str, mut params: serde_json::Map<String, serde_json::Value>, meta: Option<TradeReqMeta>) -> Result<serde_json::Value> {
+    async fn ws_api_request(
+        &self,
+        method: &str,
+        mut params: serde_json::Map<String, serde_json::Value>,
+        meta: Option<TradeReqMeta>,
+    ) -> Result<serde_json::Value> {
         // Sign: sort params and sign with Ed25519 base64; we assume `secret` is PEM-encoded Ed25519 key material
         let timestamp = chrono::Utc::now().timestamp_millis();
         params.insert("timestamp".to_string(), serde_json::Value::from(timestamp));
         // Prefer explicit ed25519 apiKey for WS if provided; otherwise fall back to REST key
-        let ws_key = self.ws_pubkey.clone().unwrap_or_else(|| self.api_key.clone());
+        let ws_key = self
+            .ws_pubkey
+            .clone()
+            .unwrap_or_else(|| self.api_key.clone());
         params.insert("apiKey".to_string(), serde_json::Value::from(ws_key));
-        let mut items: Vec<(String, String)> = params.iter().map(|(k,v)| (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string())).collect();
-        items.sort_by(|a,b| a.0.cmp(&b.0));
-        let payload = items.iter().map(|(k,v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
+        let mut items: Vec<(String, String)> = params
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string()))
+            .collect();
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        let payload = items
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&");
         // Use pre-parsed signing key if available
-        let signing_key = self.ws_signing_key.as_ref().ok_or_else(|| AppError::config("ed25519_secret missing in config".to_string()))?;
+        let signing_key = self
+            .ws_signing_key
+            .as_ref()
+            .ok_or_else(|| AppError::config("ed25519_secret missing in config".to_string()))?;
         let sig = signing_key.sign(payload.as_bytes());
         let sig_b64 = general_purpose::STANDARD.encode(sig.to_bytes());
-        params.insert("signature".to_string(), serde_json::Value::from(sig_b64.clone()));
+        params.insert(
+            "signature".to_string(),
+            serde_json::Value::from(sig_b64.clone()),
+        );
 
-        
         // Prefer caller-provided req_id (from meta) to correlate request/response across layers
         let req_id = if let Some(rid) = meta.as_ref().and_then(|m| m.req_id) {
             format!("xtrader-{}", rid)
@@ -178,9 +224,18 @@ impl BinanceFuturesAccountAdapter {
         // Debug sanitized params
         if log::log_enabled!(log::Level::Debug) {
             let mut sanitized = params.clone();
-            if let Some(v) = sanitized.get_mut("signature") { *v = serde_json::Value::String("***".to_string()); }
-            if let Some(v) = sanitized.get_mut("apiKey") { *v = serde_json::Value::String("***".to_string()); }
-            log::debug!("[Binance WS-API] method={} req_id={} params={}", method, req_id, serde_json::to_string(&sanitized).unwrap_or_default());
+            if let Some(v) = sanitized.get_mut("signature") {
+                *v = serde_json::Value::String("***".to_string());
+            }
+            if let Some(v) = sanitized.get_mut("apiKey") {
+                *v = serde_json::Value::String("***".to_string());
+            }
+            log::debug!(
+                "[Binance WS-API] method={} req_id={} params={}",
+                method,
+                req_id,
+                serde_json::to_string(&sanitized).unwrap_or_default()
+            );
         }
 
         // Persistent connection path
@@ -213,20 +268,29 @@ impl BinanceFuturesAccountAdapter {
                 let mut map = handle.pending.lock().await;
                 map.insert(req_id.clone(), tx_once2);
             }
-            handle.send_tx.send(req.to_string()).await.map_err(|e| AppError::connection(format!("ws api send: {}", e)))?;
+            handle
+                .send_tx
+                .send(req.to_string())
+                .await
+                .map_err(|e| AppError::connection(format!("ws api send: {}", e)))?;
             let v = tokio::time::timeout(Duration::from_secs(7), rx_once2)
                 .await
                 .map_err(|_| AppError::connection("ws api timeout".to_string()))?
                 .map_err(|_| AppError::connection("ws api closed".to_string()))?;
             let rcv_us = chrono::Utc::now().timestamp_micros();
             if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
-                prom.set_ws_api_last_rtt_us("BINANCE_FUTURES", method, (rcv_us - send_start_us) as u64);
+                prom.set_ws_api_last_rtt_us(
+                    "BINANCE_FUTURES",
+                    method,
+                    (rcv_us - send_start_us) as u64,
+                );
                 prom.inc_ws_api_request_outcome("BINANCE_FUTURES", method, "ok");
             }
             // Log response (exact JSON)
             if let Some(tlh) = self.tradelog.as_ref() {
                 if let Some(meta) = meta.as_ref() {
-                    let mut ev = tlog::event_base(LogEventType::ApiResponse, "binance_wsapi", v.clone());
+                    let mut ev =
+                        tlog::event_base(LogEventType::ApiResponse, "binance_wsapi", v.clone());
                     ev.req_id = meta.req_id;
                     ev.cl_ord_id = meta.cl_ord_id;
                     ev.market_id = meta.market_id;
@@ -262,7 +326,8 @@ impl BinanceFuturesAccountAdapter {
         // Log response (exact JSON)
         if let Some(tlh) = self.tradelog.as_ref() {
             if let Some(meta) = meta.as_ref() {
-                let mut ev = tlog::event_base(LogEventType::ApiResponse, "binance_wsapi", v.clone());
+                let mut ev =
+                    tlog::event_base(LogEventType::ApiResponse, "binance_wsapi", v.clone());
                 ev.req_id = meta.req_id;
                 ev.cl_ord_id = meta.cl_ord_id;
                 ev.market_id = meta.market_id;
@@ -278,15 +343,20 @@ impl BinanceFuturesAccountAdapter {
 
     fn extract_result(v: serde_json::Value) -> Result<serde_json::Value> {
         if let Some(status) = v.get("status").and_then(|s| s.as_i64()) {
-            if status == 200 { Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null)) }
-            else { Err(AppError::connection(format!("ws api error: {}", v))) }
+            if status == 200 {
+                Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
+            } else {
+                Err(AppError::connection(format!("ws api error: {}", v)))
+            }
         } else {
             Err(AppError::connection("ws api invalid response".to_string()))
         }
     }
 
     async fn ensure_ws_api(&self) -> Result<WsApiHandle> {
-        if let Some(state) = self.ws_api.lock().await.as_ref() { return Ok(state.handle()); }
+        if let Some(state) = self.ws_api.lock().await.as_ref() {
+            return Ok(state.handle());
+        }
         let state = Self::connect_ws_api().await?;
         let handle = state.handle();
         *self.ws_api.lock().await = Some(state);
@@ -299,11 +369,14 @@ impl BinanceFuturesAccountAdapter {
 
     async fn connect_ws_api() -> Result<WsApiState> {
         let ws_url = "wss://ws-fapi.binance.com/ws-fapi/v1";
-        let (ws, _) = connect_async(ws_url).await.map_err(|e| AppError::connection(format!("ws api connect: {}", e)))?;
+        let (ws, _) = connect_async(ws_url)
+            .await
+            .map_err(|e| AppError::connection(format!("ws api connect: {}", e)))?;
         log::debug!("[Binance WS-API] connected {}", ws_url);
         let (mut write, mut read) = ws.split();
         let (send_tx, mut send_rx) = tmpsc::channel::<String>(1024);
-        let pending: Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let pending_reader = pending.clone();
         // Writer task
         tokio::spawn(async move {
@@ -321,20 +394,35 @@ impl BinanceFuturesAccountAdapter {
                     Some(Ok(Message::Text(txt))) => {
                         log::debug!("[Binance WS-API] recv text: {}", txt);
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                            if let Some(id) = v.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()) {
-                                if let Some(tx) = pending_reader.lock().await.remove(&id) { let _ = tx.send(v); }
+                            if let Some(id) =
+                                v.get("id").and_then(|x| x.as_str()).map(|s| s.to_string())
+                            {
+                                if let Some(tx) = pending_reader.lock().await.remove(&id) {
+                                    let _ = tx.send(v);
+                                }
                             }
                         }
                     }
-                    Some(Ok(Message::Binary(b))) => { log::debug!("[Binance WS-API] recv binary: {} bytes", b.len()); }
+                    Some(Ok(Message::Binary(b))) => {
+                        log::debug!("[Binance WS-API] recv binary: {} bytes", b.len());
+                    }
                     Some(Ok(Message::Ping(_p))) => { /* optional: respond via write if needed */ }
                     Some(Ok(Message::Pong(_p))) => {}
-                    Some(Ok(Message::Close(reason))) => { log::warn!("[Binance WS-API] close: {:?}", reason); break; }
+                    Some(Ok(Message::Close(reason))) => {
+                        log::warn!("[Binance WS-API] close: {:?}", reason);
+                        break;
+                    }
                     Some(Ok(other)) => {
                         log::warn!("[Binance WS-API] unexpected message: {:?}", other);
                     }
-                    Some(Err(e)) => { log::warn!("[Binance WS-API] recv error: {}", e); break; }
-                    None => { log::warn!("[Binance WS-API] stream ended"); break; }
+                    Some(Err(e)) => {
+                        log::warn!("[Binance WS-API] recv error: {}", e);
+                        break;
+                    }
+                    None => {
+                        log::warn!("[Binance WS-API] stream ended");
+                        break;
+                    }
                 }
             }
         });
@@ -342,11 +430,30 @@ impl BinanceFuturesAccountAdapter {
     }
 
     async fn post_order(&self, p: &PostRequest) -> Result<OrderResponse> {
+        //// todododo
+        let mut tracing_context = p.tracing.clone();
+
         // Use WS API order.place per docs
-        let symbol = self.market_to_symbol.get(&p.market_id).ok_or_else(|| AppError::config("unknown market_id".to_string()))?.clone();
-        let side = match p.side { Side::Buy => "BUY", Side::Sell => "SELL", Side::Unknown => "BUY" };
-        let tif = match p.tif { TimeInForce::TifImmediateOrCancel => "IOC", TimeInForce::TifFillOrKill => "FOK", _ => "GTC" };
-        let order_type = match p.ord_mode { OrderMode::MLimit => "LIMIT", OrderMode::MMarket => "MARKET", _ => "LIMIT" };
+        let symbol = self
+            .market_to_symbol
+            .get(&p.market_id)
+            .ok_or_else(|| AppError::config("unknown market_id".to_string()))?
+            .clone();
+        let side = match p.side {
+            Side::Buy => "BUY",
+            Side::Sell => "SELL",
+            Side::Unknown => "BUY",
+        };
+        let tif = match p.tif {
+            TimeInForce::TifImmediateOrCancel => "IOC",
+            TimeInForce::TifFillOrKill => "FOK",
+            _ => "GTC",
+        };
+        let order_type = match p.ord_mode {
+            OrderMode::MLimit => "LIMIT",
+            OrderMode::MMarket => "MARKET",
+            _ => "LIMIT",
+        };
         let mut params = serde_json::Map::new();
         params.insert("symbol".into(), symbol.clone().into());
         params.insert("side".into(), side.into());
@@ -359,10 +466,24 @@ impl BinanceFuturesAccountAdapter {
         // Futures supports reduceOnly flag
         params.insert("reduceOnly".into(), serde_json::Value::Bool(p.reduce_only));
         params.insert("quantity".into(), format!("{:.6}", p.qty).into());
-        params.insert("newClientOrderId".into(), crate::xcommons::oms::clordid::format_xcl(p.cl_ord_id).into());
-        let meta = TradeReqMeta { event_type: LogEventType::RequestOrderNew, req_id: Some(p.req_id), cl_ord_id: Some(p.cl_ord_id), market_id: Some(p.market_id), account_id: Some(p.account_id) };
+        params.insert(
+            "newClientOrderId".into(),
+            crate::xcommons::oms::clordid::format_xcl(p.cl_ord_id).into(),
+        );
+        let meta = TradeReqMeta {
+            event_type: LogEventType::RequestOrderNew,
+            req_id: Some(p.req_id),
+            cl_ord_id: Some(p.cl_ord_id),
+            market_id: Some(p.market_id),
+            account_id: Some(p.account_id),
+        };
+
+        if let Some(ref mut tc) = tracing_context {
+            tc.set_send_ts(now_micros());
+        }
+
         match self.ws_api_request("order.place", params, Some(meta)).await {
-            Ok(_v) => {},
+            Ok(_v) => {}
             Err(e) => {
                 if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
                     prom.inc_ws_api_error_code("BINANCE_FUTURES", "order.place", "error");
@@ -370,35 +491,121 @@ impl BinanceFuturesAccountAdapter {
                 let s = format!("{}", e);
                 if s.contains("\"code\":-5022") {
                     let rcv_timestamp = chrono::Utc::now().timestamp_micros();
-                    return Ok(OrderResponse { req_id: p.req_id, timestamp: rcv_timestamp, rcv_timestamp, cl_ord_id: Some(p.cl_ord_id), native_ord_id: None, status: OrderResponseStatus::FailedPostOnly, exec: None });
-                } else if s.contains("\"code\":-2022") || s.contains("ReduceOnly Order is rejected") {
+                    return Ok(OrderResponse {
+                        req_id: p.req_id,
+                        timestamp: rcv_timestamp,
+                        rcv_timestamp,
+                        cl_ord_id: Some(p.cl_ord_id),
+                        native_ord_id: None,
+                        status: OrderResponseStatus::FailedPostOnly,
+                        exec: None,
+                    });
+                } else if s.contains("\"code\":-2022") || s.contains("ReduceOnly Order is rejected")
+                {
                     // Reduce-only reject: benign race when position closed between decision and post
                     let rcv_timestamp = chrono::Utc::now().timestamp_micros();
-                    return Ok(OrderResponse { req_id: p.req_id, timestamp: rcv_timestamp, rcv_timestamp, cl_ord_id: Some(p.cl_ord_id), native_ord_id: None, status: OrderResponseStatus::FailedPostOnly, exec: None });
+                    return Ok(OrderResponse {
+                        req_id: p.req_id,
+                        timestamp: rcv_timestamp,
+                        rcv_timestamp,
+                        cl_ord_id: Some(p.cl_ord_id),
+                        native_ord_id: None,
+                        status: OrderResponseStatus::FailedPostOnly,
+                        exec: None,
+                    });
                 } else {
                     return Err(e);
                 }
             }
         }
         let rcv_timestamp = chrono::Utc::now().timestamp_micros();
-        Ok(OrderResponse { req_id: p.req_id, timestamp: rcv_timestamp, rcv_timestamp, cl_ord_id: Some(p.cl_ord_id), native_ord_id: None, status: OrderResponseStatus::Ok, exec: None })
+        // if let Some(tc) = tracing_context {
+        //     let code_latency = tc.send_ts - tc.rcv_ts;
+        //     let before_strategy = tc.proc_ts - tc.rcv_ts;
+        //     let req_network_latency = rcv_timestamp - tc.send_ts;
+        //     let rcv_network_latency = tc.rcv_ts - tc.initial_exchange_ts;
+
+        //     // Log or record metrics
+        //     log::info!("Order latencies[{}] - Total: {}μs, req_net: {}μs, rcv_net: {}μs before_strategy: {}μs code_latency: {}μs",
+        //     tc.initial_message,rcv_timestamp - tc.initial_exchange_ts, req_network_latency, rcv_network_latency, before_strategy, code_latency);
+
+        //     // You could also store these in metrics/prometheus here
+        //     if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+        //         // Record each latency metric in the Prometheus histograms
+        //         prom.observe_order_latencies(
+        //             "BINANCE_FUTURES",
+        //             &symbol,
+        //             code_latency as u64,
+        //             before_strategy as u64,
+        //             req_network_latency as u64,
+        //             rcv_network_latency as u64,
+        //         );
+        //     }
+        // }
+
+        // todo and here also need to have access to _tc if its defined
+        Ok(OrderResponse {
+            req_id: p.req_id,
+            timestamp: rcv_timestamp,
+            rcv_timestamp,
+            cl_ord_id: Some(p.cl_ord_id),
+            native_ord_id: None,
+            status: OrderResponseStatus::Ok,
+            exec: None,
+        })
     }
 
     async fn cancel_order(&self, c: &CancelRequest) -> Result<OrderResponse> {
-        let symbol = self.market_to_symbol.get(&c.market_id).ok_or_else(|| AppError::config("unknown market_id".to_string()))?.clone();
+
+        let mut tracing_context = c.tracing.clone();
+
+        let symbol = self
+            .market_to_symbol
+            .get(&c.market_id)
+            .ok_or_else(|| AppError::config("unknown market_id".to_string()))?
+            .clone();
+
         let mut params = serde_json::Map::new();
-        params.insert("symbol".into(), symbol.into());
-        if let Some(cl) = c.cl_ord_id { params.insert("origClientOrderId".into(), crate::xcommons::oms::clordid::format_xcl(cl).into()); }
-        if let Some(native) = c.native_ord_id.clone() { params.insert("orderId".into(), native.into()); }
-        let meta = TradeReqMeta { event_type: LogEventType::RequestOrderCancel, req_id: Some(c.req_id), cl_ord_id: c.cl_ord_id, market_id: Some(c.market_id), account_id: Some(c.account_id) };
-        match self.ws_api_request("order.cancel", params, Some(meta)).await {
+        params.insert("symbol".into(), symbol.clone().into());
+        if let Some(cl) = c.cl_ord_id {
+            params.insert(
+                "origClientOrderId".into(),
+                crate::xcommons::oms::clordid::format_xcl(cl).into(),
+            );
+        }
+        if let Some(native) = c.native_ord_id.clone() {
+            params.insert("orderId".into(), native.into());
+        }
+        let meta = TradeReqMeta {
+            event_type: LogEventType::RequestOrderCancel,
+            req_id: Some(c.req_id),
+            cl_ord_id: c.cl_ord_id,
+            market_id: Some(c.market_id),
+            account_id: Some(c.account_id),
+        };
+        if let Some(ref mut tc) = tracing_context {
+            tc.set_send_ts(now_micros());
+        }
+
+        match self
+            .ws_api_request("order.cancel", params, Some(meta))
+            .await
+        {
             Ok(_v) => {}
             Err(e) => {
                 let s = e.to_string();
                 // Map unknown order (-2011) to a benign failure response (race condition)
                 if s.contains("-2011") || s.contains("Unknown order") {
                     let rcv_timestamp = chrono::Utc::now().timestamp_micros();
-                    return Ok(OrderResponse { req_id: c.req_id, timestamp: rcv_timestamp, rcv_timestamp, cl_ord_id: c.cl_ord_id, native_ord_id: None, status: OrderResponseStatus::FailedOrderNotFound, exec: None });
+                    return Ok(OrderResponse {
+                        req_id: c.req_id,
+                        timestamp: rcv_timestamp,
+                        rcv_timestamp,
+                        cl_ord_id: c.cl_ord_id,
+                        native_ord_id: None,
+                        status: OrderResponseStatus::FailedOrderNotFound,
+                        exec: None,
+                    });
                 }
                 if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
                     prom.inc_ws_api_error_code("BINANCE_FUTURES", "order.cancel", "error");
@@ -406,17 +613,57 @@ impl BinanceFuturesAccountAdapter {
                 return Err(e);
             }
         }
+
         let rcv_timestamp = chrono::Utc::now().timestamp_micros();
-        Ok(OrderResponse { req_id: c.req_id, timestamp: rcv_timestamp, rcv_timestamp, cl_ord_id: c.cl_ord_id, native_ord_id: None, status: OrderResponseStatus::Ok, exec: None })
+        if let Some(tc) = tracing_context {
+            let code_latency = tc.send_ts - tc.rcv_ts;
+            let before_strategy = tc.proc_ts - tc.rcv_ts;
+            let req_network_latency = rcv_timestamp - tc.send_ts;
+            let rcv_network_latency = tc.rcv_ts - tc.initial_exchange_ts;
+
+            // Log or record metrics
+            log::info!("CANCEL latencies[{}] - Total: {}μs, req_net: {}μs, rcv_net: {}μs before_strategy: {}μs code_latency: {}μs",
+            tc.initial_message,rcv_timestamp - tc.initial_exchange_ts, req_network_latency, rcv_network_latency, before_strategy, code_latency);
+
+            // You could also store these in metrics/prometheus here
+            if let Some(prom) = crate::metrics::PROM_EXPORTER.get() {
+                // Record each latency metric in the Prometheus histograms
+                prom.observe_order_latencies(
+                    "BINANCE_FUTURES",
+                    &symbol,
+                    code_latency as u64,
+                    before_strategy as u64,
+                    req_network_latency as u64,
+                    rcv_network_latency as u64,
+                );
+            }
+        }
+
+        Ok(OrderResponse {
+            req_id: c.req_id,
+            timestamp: rcv_timestamp,
+            rcv_timestamp,
+            cl_ord_id: c.cl_ord_id,
+            native_ord_id: None,
+            status: OrderResponseStatus::Ok,
+            exec: None,
+        })
     }
 
     async fn cancel_all(&self, a: &CancelAllRequest) -> Result<OrderResponse> {
         // Per strategy spec: Use REST for cancel-all; WS doesn't support cancelAll
-        let symbol = self.market_to_symbol.get(&a.market_id).ok_or_else(|| AppError::config("unknown market_id".to_string()))?.clone();
+        let symbol = self
+            .market_to_symbol
+            .get(&a.market_id)
+            .ok_or_else(|| AppError::config("unknown market_id".to_string()))?
+            .clone();
         let timestamp = chrono::Utc::now().timestamp_millis();
         let query = format!("symbol={}&timestamp={}", symbol, timestamp);
         let sig = self.sign_query(&query);
-        let url = format!("{}/fapi/v1/allOpenOrders?{}&signature={}", self.base_url, query, sig);
+        let url = format!(
+            "{}/fapi/v1/allOpenOrders?{}&signature={}",
+            self.base_url, query, sig
+        );
         // Build HTTP request log body (without credentials/signature)
         let http_body_req = serde_json::json!({
             "transport": "http",
@@ -425,14 +672,19 @@ impl BinanceFuturesAccountAdapter {
             "query": { "symbol": symbol, "timestamp": timestamp },
         });
         if let Some(tlh) = self.tradelog.as_ref() {
-            let mut ev = tlog::event_base(LogEventType::RequestCancelAll, "binance_http", http_body_req);
+            let mut ev = tlog::event_base(
+                LogEventType::RequestCancelAll,
+                "binance_http",
+                http_body_req,
+            );
             ev.req_id = Some(a.req_id);
             ev.market_id = Some(a.market_id);
             ev.account_id = Some(a.account_id);
             tlh.log(ev).await;
         }
 
-        let resp = self.rest
+        let resp = self
+            .rest
             .delete(url)
             .header("X-MBX-APIKEY", &self.api_key)
             .send()
@@ -441,22 +693,44 @@ impl BinanceFuturesAccountAdapter {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         // Try parse JSON; if empty, use empty object
-        let resp_json: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({"raw": text}));
+        let resp_json: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({"raw": text}));
         if let Some(tlh) = self.tradelog.as_ref() {
-            let mut ev = tlog::event_base(LogEventType::ApiResponse, "binance_http", resp_json.clone());
+            let mut ev =
+                tlog::event_base(LogEventType::ApiResponse, "binance_http", resp_json.clone());
             ev.req_id = Some(a.req_id);
             ev.market_id = Some(a.market_id);
             ev.account_id = Some(a.account_id);
             let (code, msg) = Self::extract_error_fields(&resp_json);
-            ev.error_code = code.or_else(|| if !status.is_success() { Some(status.as_u16().to_string()) } else { None });
-            ev.error_message = msg.or_else(|| if !status.is_success() { Some(text.clone()) } else { None });
+            ev.error_code = code.or_else(|| {
+                if !status.is_success() {
+                    Some(status.as_u16().to_string())
+                } else {
+                    None
+                }
+            });
+            ev.error_message = msg.or_else(|| {
+                if !status.is_success() {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            });
             tlh.log(ev).await;
         }
         if !status.is_success() {
             return Err(AppError::io(format!("cancelAll http {}: {}", status, text)));
         }
         let rcv_timestamp = chrono::Utc::now().timestamp_micros();
-        Ok(OrderResponse { req_id: a.req_id, timestamp: rcv_timestamp, rcv_timestamp, cl_ord_id: None, native_ord_id: None, status: OrderResponseStatus::Ok, exec: None })
+        Ok(OrderResponse {
+            req_id: a.req_id,
+            timestamp: rcv_timestamp,
+            rcv_timestamp,
+            cl_ord_id: None,
+            native_ord_id: None,
+            status: OrderResponseStatus::Ok,
+            exec: None,
+        })
     }
 }
 
@@ -472,73 +746,133 @@ struct WsApiState {
 }
 
 impl WsApiState {
-    fn handle(&self) -> WsApiHandle { WsApiHandle { send_tx: self.send_tx.clone(), pending: self.pending.clone() } }
+    fn handle(&self) -> WsApiHandle {
+        WsApiHandle {
+            send_tx: self.send_tx.clone(),
+            pending: self.pending.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct UserTrade {
-    #[serde(rename = "symbol")] symbol: String,
-    #[serde(rename = "id")] id: i64,
-    #[serde(rename = "orderId")] order_id: i64,
-    #[serde(rename = "price")] price: String,
-    #[serde(rename = "qty")] qty: String,
-    #[serde(rename = "quoteQty")] quote_qty: String,
-    #[serde(rename = "realizedPnl")] realized_pnl: String,
-    #[serde(rename = "commission")] commission: Option<String>,
-    #[serde(rename = "commissionAsset")] commission_asset: Option<String>,
-    #[serde(rename = "side")] side: String,
-    #[serde(rename = "buyer")] buyer: bool,
-    #[serde(rename = "maker")] maker: bool,
-    #[serde(rename = "time")] time_ms: i64,
+    #[serde(rename = "symbol")]
+    symbol: String,
+    #[serde(rename = "id")]
+    id: i64,
+    #[serde(rename = "orderId")]
+    order_id: i64,
+    #[serde(rename = "price")]
+    price: String,
+    #[serde(rename = "qty")]
+    qty: String,
+    #[serde(rename = "quoteQty")]
+    quote_qty: String,
+    #[serde(rename = "realizedPnl")]
+    realized_pnl: String,
+    #[serde(rename = "commission")]
+    commission: Option<String>,
+    #[serde(rename = "commissionAsset")]
+    commission_asset: Option<String>,
+    #[serde(rename = "side")]
+    side: String,
+    #[serde(rename = "buyer")]
+    buyer: bool,
+    #[serde(rename = "maker")]
+    maker: bool,
+    #[serde(rename = "time")]
+    time_ms: i64,
 }
 
 #[derive(Debug, Deserialize)]
-struct ListenKeyResp { #[serde(rename = "listenKey")] listen_key: String }
+struct ListenKeyResp {
+    #[serde(rename = "listenKey")]
+    listen_key: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct WsRoot {
-    #[serde(rename = "e")] event_type: Option<String>,
-    #[serde(rename = "E")] event_time: Option<i64>,
-    #[serde(rename = "o")] order: Option<WsOrderUpdate>,
+    #[serde(rename = "e")]
+    event_type: Option<String>,
+    #[serde(rename = "E")]
+    event_time: Option<i64>,
+    #[serde(rename = "o")]
+    order: Option<WsOrderUpdate>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct WsOrderUpdate {
-    #[serde(rename = "s")] symbol: String,
-    #[serde(rename = "i")] order_id: i64,
-    #[serde(rename = "c")] client_order_id: Option<String>,
-    #[serde(rename = "S")] side: String,
-    #[serde(rename = "o")] order_type: String,
-    #[serde(rename = "f")] tif: String,
-    #[serde(rename = "x")] exec_type: String,
-    #[serde(rename = "X")] order_status: String,
-    #[serde(rename = "l")] last_filled_qty: String,
-    #[serde(rename = "L")] last_filled_price: String,
-    #[serde(rename = "t")] trade_id: i64,
-    #[serde(rename = "T")] trade_time_ms: i64,
-    #[serde(rename = "m")] is_maker: bool,
-    #[serde(rename = "n")] commission: Option<String>,
-    #[serde(rename = "N")] commission_asset: Option<String>,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "i")]
+    order_id: i64,
+    #[serde(rename = "c")]
+    client_order_id: Option<String>,
+    #[serde(rename = "S")]
+    side: String,
+    #[serde(rename = "o")]
+    order_type: String,
+    #[serde(rename = "f")]
+    tif: String,
+    #[serde(rename = "x")]
+    exec_type: String,
+    #[serde(rename = "X")]
+    order_status: String,
+    #[serde(rename = "l")]
+    last_filled_qty: String,
+    #[serde(rename = "L")]
+    last_filled_price: String,
+    #[serde(rename = "t")]
+    trade_id: i64,
+    #[serde(rename = "T")]
+    trade_time_ms: i64,
+    #[serde(rename = "m")]
+    is_maker: bool,
+    #[serde(rename = "n")]
+    commission: Option<String>,
+    #[serde(rename = "N")]
+    commission_asset: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct WsTradeLite {
-    #[serde(rename = "s")] symbol: String,
-    #[serde(rename = "S")] side: String,
-    #[serde(rename = "p")] order_price: Option<String>,
-    #[serde(rename = "L")] last_price: Option<String>,
-    #[serde(rename = "l")] last_qty: String,
-    #[serde(rename = "t")] trade_id: i64,
-    #[serde(rename = "i")] order_id: i64,
-    #[serde(rename = "T")] trade_time_ms: i64,
-    #[serde(rename = "m")] is_maker: bool,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "S")]
+    side: String,
+    #[serde(rename = "p")]
+    order_price: Option<String>,
+    #[serde(rename = "L")]
+    last_price: Option<String>,
+    #[serde(rename = "l")]
+    last_qty: String,
+    #[serde(rename = "t")]
+    trade_id: i64,
+    #[serde(rename = "i")]
+    order_id: i64,
+    #[serde(rename = "T")]
+    trade_time_ms: i64,
+    #[serde(rename = "m")]
+    is_maker: bool,
 }
 
 #[async_trait]
 impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
-    async fn fetch_historical(&self, account_id: i64, market_id: i64, gt_ts: i64, _gt_seq: Option<i64>) -> Result<Vec<XExecution>> {
-        let symbol = self.market_to_symbol.get(&market_id).ok_or_else(|| AppError::config(format!("unknown market_id {}", market_id)))?.clone();
-        let gt_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(gt_ts).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+    async fn fetch_historical(
+        &self,
+        account_id: i64,
+        market_id: i64,
+        gt_ts: i64,
+        _gt_seq: Option<i64>,
+    ) -> Result<Vec<XExecution>> {
+        let symbol = self
+            .market_to_symbol
+            .get(&market_id)
+            .ok_or_else(|| AppError::config(format!("unknown market_id {}", market_id)))?
+            .clone();
+        let gt_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(gt_ts)
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_else(|| "invalid".to_string());
         log::info!(
             "[BinanceFuturesAccountAdapter] fetch_historical account_id={} market_id={} symbol={} gt_ts(us)={} ({}) (start_ms={})",
             account_id, market_id, symbol, gt_ts, gt_rfc, (gt_ts/1000)+1
@@ -553,37 +887,70 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
             let mut page_start = window_start_ms;
             loop {
                 let timestamp = chrono::Utc::now().timestamp_millis();
-                let query = format!("symbol={}&startTime={}&endTime={}&limit={}&timestamp={}", symbol, page_start, window_end_ms, limit, timestamp);
+                let query = format!(
+                    "symbol={}&startTime={}&endTime={}&limit={}&timestamp={}",
+                    symbol, page_start, window_end_ms, limit, timestamp
+                );
                 let sig = self.sign_query(&query);
-                let url = format!("{}/fapi/v1/userTrades?{}&signature={}", self.base_url, query, sig);
-                log::debug!("[BinanceFuturesAccountAdapter] userTrades url: {}", url.replace(&self.api_key, "***"));
-                let resp = self.rest.get(url)
+                let url = format!(
+                    "{}/fapi/v1/userTrades?{}&signature={}",
+                    self.base_url, query, sig
+                );
+                log::debug!(
+                    "[BinanceFuturesAccountAdapter] userTrades url: {}",
+                    url.replace(&self.api_key, "***")
+                );
+                let resp = self
+                    .rest
+                    .get(url)
                     .header("X-MBX-APIKEY", &self.api_key)
-                    .send().await.map_err(|e| AppError::io(format!("binance userTrades: {}", e)))?;
+                    .send()
+                    .await
+                    .map_err(|e| AppError::io(format!("binance userTrades: {}", e)))?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let body = resp.bytes().await.unwrap_or_default();
                     let txt = String::from_utf8_lossy(&body);
                     return Err(AppError::io(format!("userTrades http {}: {}", status, txt)));
                 }
-                let text = resp.text().await.map_err(|e| AppError::io(format!("userTrades text: {}", e)))?;
+                let text = resp
+                    .text()
+                    .await
+                    .map_err(|e| AppError::io(format!("userTrades text: {}", e)))?;
                 if log::log_enabled!(log::Level::Debug) {
                     log::debug!("[BinanceFuturesAccountAdapter] userTrades raw: {}", text);
                 }
-                let trades: Vec<UserTrade> = serde_json::from_str(&text).map_err(|e| AppError::parse(format!("userTrades json: {}", e)))?;
-                let win_start_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(window_start_ms).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
-                let win_end_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(window_end_ms).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".to_string());
+                let trades: Vec<UserTrade> = serde_json::from_str(&text)
+                    .map_err(|e| AppError::parse(format!("userTrades json: {}", e)))?;
+                let win_start_rfc =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(window_start_ms)
+                        .map(|d| d.to_rfc3339())
+                        .unwrap_or_else(|| "invalid".to_string());
+                let win_end_rfc =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(window_end_ms)
+                        .map(|d| d.to_rfc3339())
+                        .unwrap_or_else(|| "invalid".to_string());
                 log::info!(
                     "[BinanceFuturesAccountAdapter] userTrades page count={} window=[{} ({}) .. {} ({})] page_start={}",
                     trades.len(), window_start_ms, win_start_rfc, window_end_ms, win_end_rfc, page_start
                 );
-                if trades.is_empty() { break; }
+                if trades.is_empty() {
+                    break;
+                }
                 for tr in trades.iter() {
                     let price: f64 = tr.price.parse().unwrap_or(0.0);
                     let qty: f64 = tr.qty.parse().unwrap_or(0.0);
                     let ts_us = tr.time_ms * 1000;
-                    let side = match tr.side.as_str() { "BUY" => Side::Buy, "SELL" => Side::Sell, _ => Side::Unknown };
-                    let fee: f64 = tr.commission.as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let side = match tr.side.as_str() {
+                        "BUY" => Side::Buy,
+                        "SELL" => Side::Sell,
+                        _ => Side::Unknown,
+                    };
+                    let fee: f64 = tr
+                        .commission
+                        .as_deref()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0);
                     let exec = XExecution {
                         timestamp: ts_us,
                         rcv_timestamp: ts_us,
@@ -607,7 +974,9 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                         metadata: {
                             let mut m = std::collections::HashMap::new();
                             m.insert("symbol".to_string(), symbol.clone());
-                            if let Some(asset) = tr.commission_asset.clone() { m.insert("fee_asset".to_string(), asset); }
+                            if let Some(asset) = tr.commission_asset.clone() {
+                                m.insert("fee_asset".to_string(), asset);
+                            }
                             m
                         },
                         is_taker: !tr.maker,
@@ -615,8 +984,13 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                     out.push(exec);
                 }
                 if trades.len() == limit as usize {
-                    page_start = trades.last().map(|t| t.time_ms + 1).unwrap_or(page_start + 1);
-                    if page_start <= window_end_ms { continue; }
+                    page_start = trades
+                        .last()
+                        .map(|t| t.time_ms + 1)
+                        .unwrap_or(page_start + 1);
+                    if page_start <= window_end_ms {
+                        continue;
+                    }
                 }
                 break;
             }
@@ -625,7 +999,11 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
         Ok(out)
     }
 
-    async fn subscribe_live(&self, account_id: i64, market_id: i64) -> Result<mpsc::Receiver<XExecution>> {
+    async fn subscribe_live(
+        &self,
+        account_id: i64,
+        market_id: i64,
+    ) -> Result<mpsc::Receiver<XExecution>> {
         let symbol = self
             .market_to_symbol
             .get(&market_id)
@@ -649,10 +1027,12 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
                 .send()
                 .await;
             let listen_key = match resp {
-                Ok(resp) if resp.status().is_success() => match resp.json::<ListenKeyResp>().await {
-                    Ok(j) => j.listen_key,
-                    Err(_) => return,
-                },
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<ListenKeyResp>().await {
+                        Ok(j) => j.listen_key,
+                        Err(_) => return,
+                    }
+                }
                 _ => return,
             };
             log::info!("[BinanceFuturesAccountAdapter] obtained listenKey");
@@ -685,7 +1065,9 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
             }
 
             let ws_url = format!("{}/ws/{}", ws_base, listen_key);
-            let Ok((mut ws, _)) = connect_async(&ws_url).await else { return; };
+            let Ok((mut ws, _)) = connect_async(&ws_url).await else {
+                return;
+            };
             let mut last_frame_at = chrono::Utc::now().timestamp_millis();
             let idle_timeout_ms: i64 = 180_000; // 180s watchdog
             let mut watchdog = tokio::time::interval(Duration::from_millis(5_000));
@@ -920,6 +1302,3 @@ impl ExchangeAccountAdapter for BinanceFuturesAccountAdapter {
         }
     }
 }
-
-
-

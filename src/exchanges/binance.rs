@@ -469,7 +469,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
             asks.push(Self::parse_price_level(&ask)?);
         }
 
-        let local_ts = crate::xcommons::types::time::now_millis();
+        let local_ts = crate::xcommons::types::time::now_micros();
 
         Ok(OrderBookSnapshot {
             market_id: XMarketId::make(

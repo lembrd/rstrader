@@ -1,5 +1,7 @@
+use crate::xcommons::types::time::now_micros;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::borrow::Cow;
 
 /// Side enumeration for orders and executions
 #[repr(i8)]
@@ -75,7 +77,9 @@ impl OrderStatus {
     pub fn is_alive(&self) -> bool {
         matches!(
             self,
-            OrderStatus::OStatusNew | OrderStatus::OStatusPartiallyFilled | OrderStatus::OStatusReplaced
+            OrderStatus::OStatusNew
+                | OrderStatus::OStatusPartiallyFilled
+                | OrderStatus::OStatusReplaced
         )
     }
 }
@@ -182,6 +186,47 @@ pub struct XExecution {
     pub is_taker: bool,
 }
 
+pub const TRACE_MSG_L2: &str = "L2";
+pub const TRACE_MSG_OBS: &str = "OBS";
+pub const TRACE_MSG_EXEC: &str = "EXEC";
+pub const TRACE_MSG_UNKNOWN: &str = "UNKNOWN";
+pub const TRACE_MSG_MTRADE: &str = "MTRADE";
+pub const TRACE_MSG_POSITION: &str = "POSITION";
+pub const TRACE_MSG_ORDER_RESPONSE: &str = "ORDER_RESPONSE";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TracingTimeStamps {
+    pub initial_message: Cow<'static, str>,
+    pub initial_exchange_ts: i64,
+    pub rcv_ts: i64,
+    pub proc_ts: i64,
+    pub send_ts: i64,
+}
+impl TracingTimeStamps {
+    /// Create new tracing timestamps with initial exchange timestamp
+    pub fn new(message: &'static str, initial_exchange_ts: i64, rcv_ts: i64) -> Self {
+        Self {
+            initial_message: Cow::Borrowed(message),
+            initial_exchange_ts,
+            rcv_ts,
+            proc_ts: now_micros(),
+            send_ts: 0,
+        }
+    }
+
+    pub fn set_rcv_ts(&mut self, rcv_ts: i64) -> &mut Self {
+        self.rcv_ts = rcv_ts;
+        self
+    }
+    pub fn set_proc_ts(&mut self, proc_ts: i64) -> &mut Self {
+        self.proc_ts = proc_ts;
+        self
+    }
+    pub fn set_send_ts(&mut self, send_ts: i64) -> &mut Self {
+        self.send_ts = send_ts;
+        self
+    }
+}
 /// New order request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostRequest {
@@ -210,6 +255,8 @@ pub struct PostRequest {
     pub reduce_only: bool,
     /// Default: none
     pub metadata: HashMap<String, String>,
+
+    pub tracing: Option<TracingTimeStamps>,
 }
 
 /// Cancel request (one of cl_ord_id or native_ord_id must be provided)
@@ -227,6 +274,8 @@ pub struct CancelRequest {
     pub cl_ord_id: Option<i64>,
     /// Optional exchange native order ID
     pub native_ord_id: Option<String>,
+
+    pub tracing: Option<TracingTimeStamps>,
 }
 
 /// Amend request (one of cl_ord_id or native_ord_id must be provided; at least one of new_qty/new_price)
@@ -301,6 +350,8 @@ pub struct CancelAllRequest {
 
     pub market_id: i64,
     pub account_id: i64,
+
+    pub tracing: Option<TracingTimeStamps>,
 }
 
 /// Unified order request enum for strategy → account API
@@ -311,4 +362,20 @@ pub enum OrderRequest {
     CancelAll(CancelAllRequest),
 }
 
-
+impl OrderRequest {
+    pub fn get_market_id(&self) -> i64 {
+        match self {
+            OrderRequest::Post(x) => x.market_id,
+            OrderRequest::Cancel(x) => x.market_id,
+            OrderRequest::CancelAll(x) => x.market_id,
+        }
+    }
+    pub fn with_tracing(mut self, tracing_context: TracingTimeStamps) -> Self {
+        match &mut self {
+            OrderRequest::Post(req) => req.tracing = Some(tracing_context),
+            OrderRequest::Cancel(req) => req.tracing = Some(tracing_context),
+            OrderRequest::CancelAll(req) => req.tracing = Some(tracing_context),
+        }
+        self
+    }
+}

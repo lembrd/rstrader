@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
-use std::hash::{Hash, Hasher};
 use crate::xcommons::oms::{self, Side};
 use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
+use std::sync::LazyLock;
 use std::time::SystemTime;
 
 /// Unified data structure for L2 order book updates
@@ -24,8 +25,6 @@ pub struct OrderBookL2Update {
     pub side: oms::Side,      // BUY (bid) / SELL (ask)
     pub price: f64,           // Price level
     pub qty: f64,             // Quantity (0 = delete level)
-
-
 }
 impl Hash for OrderBookL2Update {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -558,8 +557,12 @@ impl Metrics {
     }
 
     pub fn update_code_latency(&mut self, latency_us: u64) {
-        self.last_code_latency_us = Some(latency_us);
         self.code_latency_count += 1;
+        if self.code_latency_count < 5 {
+            return;
+        }
+
+        self.last_code_latency_us = Some(latency_us);
 
         // Update rolling average (simple moving average with weight 0.1 for new values)
         match self.avg_code_latency_us {
@@ -571,8 +574,11 @@ impl Metrics {
     }
 
     pub fn update_overall_latency(&mut self, latency_us: u64) {
-        self.last_overall_latency_us = Some(latency_us);
         self.overall_latency_count += 1;
+        if self.overall_latency_count < 5 {
+            return;
+        }
+        self.last_overall_latency_us = Some(latency_us);
 
         // Update rolling average (simple moving average with weight 0.1 for new values)
         match self.avg_overall_latency_us {
@@ -584,9 +590,11 @@ impl Metrics {
     }
 
     pub fn update_parse_time(&mut self, parse_time_us: u64) {
+        if self.parse_time_count < 5 {
+            return;
+        }
         self.last_parse_time_us = Some(parse_time_us);
         self.parse_time_count += 1;
-
         match self.avg_parse_time_us {
             Some(avg) => self.avg_parse_time_us = Some(avg * 0.9 + parse_time_us as f64 * 0.1),
             None => self.avg_parse_time_us = Some(parse_time_us as f64),
@@ -596,9 +604,11 @@ impl Metrics {
     }
 
     pub fn update_transform_time(&mut self, transform_time_us: u64) {
-        self.last_transform_time_us = Some(transform_time_us);
         self.transform_time_count += 1;
-
+        if self.transform_time_count < 5 {
+            return;
+        }
+        self.last_transform_time_us = Some(transform_time_us);
         match self.avg_transform_time_us {
             Some(avg) => {
                 self.avg_transform_time_us = Some(avg * 0.9 + transform_time_us as f64 * 0.1)
@@ -611,8 +621,11 @@ impl Metrics {
     }
 
     pub fn update_overhead_time(&mut self, overhead_time_us: u64) {
-        self.last_overhead_time_us = Some(overhead_time_us);
         self.overhead_time_count += 1;
+        if self.overhead_time_count < 5 {
+            return;
+        }
+        self.last_overhead_time_us = Some(overhead_time_us);
 
         match self.avg_overhead_time_us {
             Some(avg) => {
@@ -745,17 +758,17 @@ impl std::fmt::Display for Metrics {
         // Add new packet metrics
         if self.packet_count > 0 {
             write!(f, ", avg_packet_size: {:.0}B", self.avg_packet_size_bytes)?;
-            write!(
-                f,
-                ", avg_md_entries: {:.1}/pkt",
-                self.market_data_entries_per_packet
-            )?;
-            write!(f, ", avg_msgs: {:.1}/pkt", self.messages_per_packet)?;
+            // write!(
+            //     f,
+            //     ", avg_md_entries: {:.1}/pkt",
+            //     self.market_data_entries_per_packet
+            // )?;
+            // write!(f, ", avg_msgs: {:.1}/pkt", self.messages_per_packet)?;
         }
 
-        if let Some(throughput) = self.throughput_msgs_per_sec {
-            write!(f, ", throughput: {:.1}msg/s", throughput)?;
-        }
+        // if let Some(throughput) = self.throughput_msgs_per_sec {
+        //     write!(f, ", throughput: {:.1}msg/s", throughput)?;
+        // }
 
         // Non-mutating quantiles read
         let h = &self.latency_histograms;
@@ -774,23 +787,56 @@ impl std::fmt::Display for Metrics {
 }
 
 /// Utility functions for timestamp handling
+use std::time::Instant;
+
+pub struct FXTimer(u64);
+
+
+static APP_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+#[inline]
+pub fn fast_rtimestamp_micros() -> u64 {
+    APP_START.elapsed().as_micros() as u64
+}
+
+impl FXTimer {
+    #[inline]
+    pub fn now() -> Self {
+        static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+        Self(START.elapsed().as_nanos() as u64)
+    }
+
+    #[inline]
+    pub fn elapsed_micros(&self, other: &FXTimer) -> u64 {
+        self.0.saturating_sub(other.0) / 1000
+    }
+
+    #[inline]
+    pub fn elapsed_nanos(&self, other: &FXTimer) -> u64 {
+        self.0.saturating_sub(other.0)
+    }
+}
+
 pub mod time {
+    use chrono::Utc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Get current timestamp in microseconds since Unix epoch
     pub fn now_micros() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_micros() as i64
+        Utc::now().timestamp_micros()
+        // SystemTime::now()
+        //     .duration_since(UNIX_EPOCH)
+        //     .ok()
+        //     .map(|d| d.as_micros() as i64).unwrap_or(0)
     }
 
     /// Get current timestamp in milliseconds since Unix epoch
     pub fn now_millis() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis() as i64
+        Utc::now().timestamp_millis()
+        // SystemTime::now()
+        //     .duration_since(UNIX_EPOCH)
+        //     .ok()
+        //     .map(|d| d.as_millis() as i64).unwrap_or(0)
     }
 
     /// Convert milliseconds to microseconds

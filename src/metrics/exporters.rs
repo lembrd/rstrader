@@ -1,7 +1,7 @@
 //
 
 use std::time::Duration;
-use prometheus::{Encoder, TextEncoder, Registry, IntGauge, Opts, GaugeVec, IntCounterVec};
+use prometheus::{Encoder, TextEncoder, Registry, IntGauge, Opts, GaugeVec, IntCounterVec, HistogramVec, HistogramOpts};
 use cadence::{StatsdClient, NopMetricSink, UdpMetricSink, QueuingMetricSink, Gauged, Counted};
 use std::net::UdpSocket;
 
@@ -80,6 +80,11 @@ pub struct PrometheusExporter {
     transform_p99_us: GaugeVec,
     overhead_p50_us: GaugeVec,
     overhead_p99_us: GaugeVec,
+    // Order latency histograms (microseconds)
+    order_code_latency: HistogramVec,          // code_latency: tc.send_ts - tc.rcv_ts
+    order_before_strategy: HistogramVec,       // before_strategy: tc.proc_ts - tc.rcv_ts
+    order_req_network_latency: HistogramVec,   // req_network_latency: rcv_timestamp - tc.send_ts
+    order_rcv_network_latency: HistogramVec,   // rcv_network_latency: tc.rcv_ts - tc.initial_exchange_ts
     // Strategy-level gauges
     strategy_pnl: GaugeVec,
     strategy_amount: GaugeVec,
@@ -145,6 +150,32 @@ impl PrometheusExporter {
         let overhead_p99_us = GaugeVec::new(Opts::new("overhead_latency_p99_us", "Overhead latency p99 (us)"), &[
             "stream", "exchange", "symbol"
         ]).unwrap();
+        // Order latency histograms with buckets optimized for microsecond measurements
+        let order_latency_buckets = vec![
+            1.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0,
+            1_000.0, 2_500.0, 5_000.0, 7_500.0, 10_000.0, 25_000.0, 50_000.0, 75_000.0,
+            100_000.0, 250_000.0, 500_000.0, 1_000_000.0
+        ];
+        let order_code_latency = HistogramVec::new(
+            HistogramOpts::new("xtrader_order_code_latency_us", "Order code latency (send_ts - rcv_ts) in microseconds")
+                .buckets(order_latency_buckets.clone()),
+            &["exchange", "symbol"]
+        ).unwrap();
+        let order_before_strategy = HistogramVec::new(
+            HistogramOpts::new("xtrader_order_before_strategy_us", "Order processing time before strategy (proc_ts - rcv_ts) in microseconds")
+                .buckets(order_latency_buckets.clone()),
+            &["exchange", "symbol"]
+        ).unwrap();
+        let order_req_network_latency = HistogramVec::new(
+            HistogramOpts::new("xtrader_order_req_network_latency_us", "Order request network latency (rcv_timestamp - send_ts) in microseconds")
+                .buckets(order_latency_buckets.clone()),
+            &["exchange", "symbol"]
+        ).unwrap();
+        let order_rcv_network_latency = HistogramVec::new(
+            HistogramOpts::new("xtrader_order_rcv_network_latency_us", "Order receive network latency (rcv_ts - initial_exchange_ts) in microseconds")
+                .buckets(order_latency_buckets),
+            &["exchange", "symbol"]
+        ).unwrap();
         // Strategy metrics
         let strategy_pnl = GaugeVec::new(Opts::new("strategy_pnl", "Mark-to-market PnL for strategy"), &[
             "strategy", "symbol"
@@ -193,6 +224,10 @@ impl PrometheusExporter {
         registry.register(Box::new(transform_p99_us.clone())).unwrap();
         registry.register(Box::new(overhead_p50_us.clone())).unwrap();
         registry.register(Box::new(overhead_p99_us.clone())).unwrap();
+        registry.register(Box::new(order_code_latency.clone())).unwrap();
+        registry.register(Box::new(order_before_strategy.clone())).unwrap();
+        registry.register(Box::new(order_req_network_latency.clone())).unwrap();
+        registry.register(Box::new(order_rcv_network_latency.clone())).unwrap();
         registry.register(Box::new(strategy_pnl.clone())).unwrap();
         registry.register(Box::new(strategy_amount.clone())).unwrap();
         registry.register(Box::new(strategy_bps.clone())).unwrap();
@@ -214,7 +249,7 @@ impl PrometheusExporter {
         registry.register(Box::new(ws_api_last_rtt_us.clone())).unwrap();
         registry.register(Box::new(ws_api_requests_total.clone())).unwrap();
         registry.register(Box::new(ws_api_errors_total.clone())).unwrap();
-        Self { registry, recv_total, processed_total, parse_errors_total, throughput, code_p50_us, code_p99_us, overall_p50_us, overall_p99_us, parse_p50_us, parse_p99_us, transform_p50_us, transform_p99_us, overhead_p50_us, overhead_p99_us, strategy_pnl, strategy_amount, strategy_bps, strategy_mid_price, strat_tick_to_trade_p50, strat_tick_to_trade_p99, strat_tick_to_cancel_p50, strat_tick_to_cancel_p99, strat_code_p50, strat_code_p99, strat_network_p50, strat_network_p99, strat_post_p50, strat_post_p99, strat_cancel_p50, strat_cancel_p99, strat_post_requests_total, strat_cancel_requests_total, ws_api_last_rtt_us, ws_api_requests_total, ws_api_errors_total }
+        Self { registry, recv_total, processed_total, parse_errors_total, throughput, code_p50_us, code_p99_us, overall_p50_us, overall_p99_us, parse_p50_us, parse_p99_us, transform_p50_us, transform_p99_us, overhead_p50_us, overhead_p99_us, order_code_latency, order_before_strategy, order_req_network_latency, order_rcv_network_latency, strategy_pnl, strategy_amount, strategy_bps, strategy_mid_price, strat_tick_to_trade_p50, strat_tick_to_trade_p99, strat_tick_to_cancel_p50, strat_tick_to_cancel_p99, strat_code_p50, strat_code_p99, strat_network_p50, strat_network_p99, strat_post_p50, strat_post_p99, strat_cancel_p50, strat_cancel_p99, strat_post_requests_total, strat_cancel_requests_total, ws_api_last_rtt_us, ws_api_requests_total, ws_api_errors_total }
     }
 
     pub fn gather(&self) -> String {
@@ -366,6 +401,20 @@ impl PrometheusExporter {
     }
     pub fn inc_ws_api_error_code(&self, exchange: &str, method: &str, code: &str) {
         self.ws_api_errors_total.with_label_values(&[exchange, method, code]).inc();
+    }
+
+    /// Observe order latency metrics in microseconds
+    pub fn observe_order_latencies(&self, exchange: &str, symbol: &str, 
+                                 code_latency: u64, before_strategy: u64, 
+                                 req_network_latency: u64, rcv_network_latency: u64) {
+        self.order_code_latency.with_label_values(&[exchange, symbol])
+            .observe(code_latency as f64);
+        self.order_before_strategy.with_label_values(&[exchange, symbol])
+            .observe(before_strategy as f64);
+        self.order_req_network_latency.with_label_values(&[exchange, symbol])
+            .observe(req_network_latency as f64);
+        self.order_rcv_network_latency.with_label_values(&[exchange, symbol])
+            .observe(rcv_network_latency as f64);
     }
 }
 
